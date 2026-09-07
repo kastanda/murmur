@@ -29,11 +29,17 @@ function withDb() {
   return { db, dbPath, dir, cursorPath: path.join(dir, "cursor"), lockPath: path.join(dir, "lock") };
 }
 
-function insertMessage(db, { msgId, direction = "inbound", sender = "agent-jarvis", text = "hello" }) {
+function insertMessage(db, {
+  msgId,
+  conversationId = "codex:task:test",
+  direction = "inbound",
+  sender = "agent-jarvis",
+  text = "hello",
+}) {
   db.prepare(`
     INSERT INTO local_messages (msg_id, created_at, sender, conversation_id, direction, text)
-    VALUES (?, '2026-08-28T00:00:00.000Z', ?, 'codex:task:test', ?, ?)
-  `).run(msgId, sender, direction, text);
+    VALUES (?, '2026-08-28T00:00:00.000Z', ?, ?, ?, ?)
+  `).run(msgId, sender, conversationId, direction, text);
 }
 
 function drain(ctx, extraEnv = {}) {
@@ -65,7 +71,11 @@ test("node drain emits new inbound rows and advances the cursor", () => {
   const ctx = withDb();
   drain(ctx); // seed
 
-  insertMessage(ctx.db, { msgId: "in-1", text: "first\nline" });
+  insertMessage(ctx.db, {
+    msgId: "in-1",
+    conversationId: "dm:cursor:claude",
+    text: "first\nline",
+  });
   insertMessage(ctx.db, { msgId: "out-1", direction: "outbound", text: "ignore me" });
   insertMessage(ctx.db, { msgId: "in-2", sender: "agent-peer", text: "second" });
 
@@ -73,10 +83,49 @@ test("node drain emits new inbound rows and advances the cursor", () => {
 
   assert.equal(result.status, 2);
   assert.match(result.stderr, /Murmur wake: 2 new inbound message\(s\):/);
-  assert.match(result.stderr, /rowid=1 \[agent-jarvis\] first line/);
-  assert.match(result.stderr, /rowid=3 \[agent-peer\] second/);
+  assert.match(result.stderr, /rowid=1 \[agent-jarvis\] msgId=in-1 conversationId=dm:cursor:claude first line/);
+  assert.match(result.stderr, /rowid=3 \[agent-peer\] msgId=in-2 conversationId=codex:task:test second/);
+  assert.match(result.stderr, /Reply via murmur_send using the same conversationId\./);
   assert.doesNotMatch(result.stderr, /ignore me/);
   assert.equal(fs.readFileSync(ctx.cursorPath, "utf8").trim(), "3");
+});
+
+test("node drain preserves each exact conversation id in a multi-message wake", () => {
+  const ctx = withDb();
+  drain(ctx);
+  insertMessage(ctx.db, { msgId: "in-a", conversationId: "dm:cursor:claude", text: "first" });
+  insertMessage(ctx.db, { msgId: "in-b", conversationId: "channel:review:17", text: "second" });
+
+  const result = drain(ctx);
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /msgId=in-a conversationId=dm:cursor:claude first/);
+  assert.match(result.stderr, /msgId=in-b conversationId=channel:review:17 second/);
+});
+
+test("node drain polling mode keeps inbound selection and wake behavior", () => {
+  const ctx = withDb();
+  fs.writeFileSync(ctx.cursorPath, "0\n");
+  insertMessage(ctx.db, { msgId: "out-1", direction: "outbound", text: "ignore me" });
+  insertMessage(ctx.db, { msgId: "in-1", conversationId: "dm:cursor:claude", text: "wake me" });
+
+  const result = spawnSync(process.execPath, ["--no-warnings", script], {
+    env: {
+      ...process.env,
+      MURMUR_DB: ctx.dbPath,
+      MURMUR_WAKE_CURSOR: ctx.cursorPath,
+      MURMUR_WAKE_LOCK: ctx.lockPath,
+      MURMUR_WAKE_MAX_SECONDS: "1",
+      MURMUR_WAKE_POLL_MS: "10",
+    },
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /msgId=in-1 conversationId=dm:cursor:claude wake me/);
+  assert.doesNotMatch(result.stderr, /ignore me/);
+  assert.equal(fs.readFileSync(ctx.cursorPath, "utf8").trim(), "2");
+  assert.equal(fs.existsSync(ctx.lockPath), false, "poll lock must be released after wake");
 });
 
 test("node drain dedups: the same message does not wake twice", () => {

@@ -96,7 +96,7 @@ function maxInbound(db) {
 
 function newRows(db, since) {
   return db.prepare(
-    `SELECT rowid, sender,
+    `SELECT rowid, sender, msg_id, conversation_id,
             substr(replace(replace(text, char(10), ' '), char(13), ' '), 1, 360) AS snippet
        FROM local_messages
       WHERE direction='inbound' AND rowid > ?
@@ -110,10 +110,12 @@ function emitAndExit(rows) {
   // would then never wake anyone.
   writeCursor(rows[rows.length - 1].rowid);
   releaseLock();
-  const lines = rows.map((r) => `  rowid=${r.rowid} [${r.sender}] ${r.snippet}`);
+  const lines = rows.map(
+    (r) => `  rowid=${r.rowid} [${r.sender}] msgId=${r.msg_id} conversationId=${r.conversation_id} ${r.snippet}`,
+  );
   process.stderr.write(
     `Murmur wake: ${rows.length} new inbound message(s):\n${lines.join("\n")}\n` +
-    `Reply via murmur_send or act on them.\n`,
+    `Reply via murmur_send using the same conversationId.\n`,
   );
   process.exit(2);
 }
