@@ -122,13 +122,44 @@ function emitAndExit(rows) {
 
 // --- single-poller lock (poll mode only) ------------------------------------
 let haveLock = false;
+function lockOwnerPid() {
+  try {
+    const value = readFileSync(LOCK, "utf8").trim();
+    if (!/^\d+$/.test(value)) return null;
+    const pid = Number(value);
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+function lockOwnerIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM means the process exists but cannot be signalled by this user.
+    return !(err instanceof Error && "code" in err && err.code === "ESRCH");
+  }
+}
+
+function reclaimAbandonedLock() {
+  const ownerPid = lockOwnerPid();
+  if (ownerPid !== null) {
+    if (!lockOwnerIsAlive(ownerPid)) rmSync(LOCK, { force: true });
+    return;
+  }
+
+  // Preserve the age fallback for legacy/malformed lock files without a usable PID.
+  try {
+    const age = (Date.now() - statSync(LOCK).mtimeMs) / 1000;
+    if (age > MAX_SECONDS + 120) rmSync(LOCK, { force: true });
+  } catch {}
+}
+
 function acquireLock() {
   try {
-    // stale lock (older than a full lifetime + slack) → take over
-    try {
-      const age = (Date.now() - statSync(LOCK).mtimeMs) / 1000;
-      if (age > MAX_SECONDS + 120) rmSync(LOCK, { force: true });
-    } catch {}
+    reclaimAbandonedLock();
     const fd = openSync(LOCK, "wx"); // fail if exists
     writeSync(fd, `${process.pid}\n`);
     closeSync(fd);
