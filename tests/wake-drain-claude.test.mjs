@@ -26,11 +26,17 @@ function withDb() {
   return { db, dbPath, cursorPath, dir };
 }
 
-function insertMessage(db, { msgId, direction = "inbound", sender = "agent-jarvis", text = "hello" }) {
+function insertMessage(db, {
+  msgId,
+  conversationId = "codex:task:test",
+  direction = "inbound",
+  sender = "agent-jarvis",
+  text = "hello",
+}) {
   db.prepare(`
     INSERT INTO local_messages (msg_id, created_at, sender, conversation_id, direction, text)
-    VALUES (?, '2026-06-20T00:00:00.000Z', ?, 'codex:task:test', ?, ?)
-  `).run(msgId, sender, direction, text);
+    VALUES (?, '2026-06-20T00:00:00.000Z', ?, ?, ?, ?)
+  `).run(msgId, sender, conversationId, direction, text);
 }
 
 function drain({ dbPath, cursorPath }, extraEnv = {}) {
@@ -78,7 +84,11 @@ test("Claude wake drain emits new inbound rows and advances the cursor", () => {
   const ctx = withDb();
   drain(ctx); // seed at an empty tip
 
-  insertMessage(ctx.db, { msgId: "inbound-1", text: "first\nline" });
+  insertMessage(ctx.db, {
+    msgId: "inbound-1",
+    conversationId: "dm:cursor:claude",
+    text: "first\nline",
+  });
   insertMessage(ctx.db, { msgId: "outbound-1", direction: "outbound", text: "ignore me" });
   insertMessage(ctx.db, { msgId: "inbound-2", sender: "agent-peer", text: "second" });
 
@@ -86,10 +96,24 @@ test("Claude wake drain emits new inbound rows and advances the cursor", () => {
 
   assert.equal(result.status, 2);
   assert.match(result.stderr, /Murmur wake: 2 new inbound message\(s\):/);
-  assert.match(result.stderr, /rowid=1 \[agent-jarvis\] first line/);
-  assert.match(result.stderr, /rowid=3 \[agent-peer\] second/);
+  assert.match(result.stderr, /rowid=1 \[agent-jarvis\] msgId=inbound-1 conversationId=dm:cursor:claude first line/);
+  assert.match(result.stderr, /rowid=3 \[agent-peer\] msgId=inbound-2 conversationId=codex:task:test second/);
+  assert.match(result.stderr, /Reply via murmur_send using the same conversationId\./);
   assert.doesNotMatch(result.stderr, /ignore me/);
   assert.equal(fs.readFileSync(ctx.cursorPath, "utf8").trim(), "3");
+});
+
+test("Claude wake drain preserves each exact conversation id in a multi-message wake", () => {
+  const ctx = withDb();
+  drain(ctx);
+  insertMessage(ctx.db, { msgId: "in-a", conversationId: "dm:cursor:claude", text: "first" });
+  insertMessage(ctx.db, { msgId: "in-b", conversationId: "channel:review:17", text: "second" });
+
+  const result = drain(ctx);
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /msgId=in-a conversationId=dm:cursor:claude first/);
+  assert.match(result.stderr, /msgId=in-b conversationId=channel:review:17 second/);
 });
 
 test("Claude wake drain cursor dedup prevents repeat wakes", () => {
