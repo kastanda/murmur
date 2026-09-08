@@ -41,7 +41,7 @@
 import { DatabaseSync } from "node:sqlite";
 import {
   readFileSync, writeFileSync, renameSync, rmSync,
-  openSync, closeSync, writeSync, statSync,
+  statSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -145,12 +145,13 @@ function lockOwnerIsAlive(pid) {
 
 function reclaimAbandonedLock() {
   const ownerPid = lockOwnerPid();
-  if (ownerPid !== null) {
-    if (!lockOwnerIsAlive(ownerPid)) rmSync(LOCK, { force: true });
+  if (ownerPid !== null && !lockOwnerIsAlive(ownerPid)) {
+    rmSync(LOCK, { force: true });
     return;
   }
 
-  // Preserve the age fallback for legacy/malformed lock files without a usable PID.
+  // A PID can be reused by an unrelated process. Preserve a finite recovery ceiling
+  // even when the recorded PID currently appears alive, and for legacy PID-less locks.
   try {
     const age = (Date.now() - statSync(LOCK).mtimeMs) / 1000;
     if (age > MAX_SECONDS + 120) rmSync(LOCK, { force: true });
@@ -160,9 +161,7 @@ function reclaimAbandonedLock() {
 function acquireLock() {
   try {
     reclaimAbandonedLock();
-    const fd = openSync(LOCK, "wx"); // fail if exists
-    writeSync(fd, `${process.pid}\n`);
-    closeSync(fd);
+    writeFileSync(LOCK, `${process.pid}\n`, { flag: "wx" });
     haveLock = true;
     return true;
   } catch {
@@ -170,7 +169,11 @@ function acquireLock() {
   }
 }
 function releaseLock() {
-  if (haveLock) { try { rmSync(LOCK, { force: true }); } catch {} haveLock = false; }
+  if (!haveLock) return;
+  try {
+    if (lockOwnerPid() === process.pid) rmSync(LOCK, { force: true });
+  } catch {}
+  haveLock = false;
 }
 
 // Never exit non-zero on a fault: that would wake the session with a false alarm. But

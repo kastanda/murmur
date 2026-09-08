@@ -209,11 +209,10 @@ test("node drain reclaims a fresh lock left by a killed poller", async () => {
   assert.equal(fs.existsSync(ctx.lockPath), false);
 });
 
-test("node drain does not displace a lock owned by a live pid", () => {
+test("node drain does not displace a fresh lock owned by a live pid", () => {
   const ctx = withDb();
   fs.writeFileSync(ctx.cursorPath, "0\n");
   fs.writeFileSync(ctx.lockPath, `${process.pid}\n`);
-  fs.utimesSync(ctx.lockPath, new Date(0), new Date(0));
   insertMessage(ctx.db, { msgId: "in-1", text: "must wait" });
 
   const completed = spawnSync(process.execPath, ["--no-warnings", script], {
@@ -231,6 +230,79 @@ test("node drain does not displace a lock owned by a live pid", () => {
   assert.equal(completed.stderr, "");
   assert.equal(fs.readFileSync(ctx.lockPath, "utf8").trim(), String(process.pid));
   fs.rmSync(ctx.lockPath, { force: true });
+});
+
+test("node drain reclaims an old lock even when its pid is currently live", () => {
+  const ctx = withDb();
+  fs.writeFileSync(ctx.cursorPath, "0\n");
+  fs.writeFileSync(ctx.lockPath, `${process.pid}\n`);
+  fs.utimesSync(ctx.lockPath, new Date(0), new Date(0));
+  insertMessage(ctx.db, { msgId: "in-1", conversationId: "dm:cursor:claude", text: "pid reused" });
+
+  const result = spawnSync(process.execPath, ["--no-warnings", script], {
+    env: {
+      ...process.env,
+      MURMUR_DB: ctx.dbPath,
+      MURMUR_WAKE_CURSOR: ctx.cursorPath,
+      MURMUR_WAKE_LOCK: ctx.lockPath,
+      MURMUR_WAKE_MAX_SECONDS: "1",
+      MURMUR_WAKE_POLL_MS: "10",
+    },
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /msgId=in-1 conversationId=dm:cursor:claude pid reused/);
+  assert.equal(fs.existsSync(ctx.lockPath), false);
+});
+
+test("node drain reclaims an old legacy lock without a pid", () => {
+  const ctx = withDb();
+  fs.writeFileSync(ctx.cursorPath, "0\n");
+  fs.writeFileSync(ctx.lockPath, "legacy-lock\n");
+  fs.utimesSync(ctx.lockPath, new Date(0), new Date(0));
+  insertMessage(ctx.db, { msgId: "in-1", conversationId: "dm:cursor:claude", text: "legacy recovery" });
+
+  const result = spawnSync(process.execPath, ["--no-warnings", script], {
+    env: {
+      ...process.env,
+      MURMUR_DB: ctx.dbPath,
+      MURMUR_WAKE_CURSOR: ctx.cursorPath,
+      MURMUR_WAKE_LOCK: ctx.lockPath,
+      MURMUR_WAKE_MAX_SECONDS: "1",
+      MURMUR_WAKE_POLL_MS: "10",
+    },
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /msgId=in-1 conversationId=dm:cursor:claude legacy recovery/);
+  assert.equal(fs.existsSync(ctx.lockPath), false);
+});
+
+test("node drain release does not unlink a replacement owner's lock", async () => {
+  const ctx = withDb();
+  ctx.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 2000;");
+  fs.writeFileSync(ctx.cursorPath, "0\n");
+  const poller = startPoller(ctx);
+  await waitForPath(ctx.lockPath);
+  fs.writeFileSync(ctx.lockPath, `${process.pid}\n`);
+  insertMessage(ctx.db, { msgId: "in-1", conversationId: "dm:cursor:claude", text: "replacement owner" });
+
+  const result = await poller.result;
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /msgId=in-1 conversationId=dm:cursor:claude replacement owner/);
+  assert.equal(fs.readFileSync(ctx.lockPath, "utf8").trim(), String(process.pid));
+  fs.rmSync(ctx.lockPath, { force: true });
+});
+
+test("node drain creates its lock with one exclusive write", () => {
+  const source = fs.readFileSync(script, "utf8");
+
+  assert.match(source, /writeFileSync\(LOCK, `\$\{process\.pid\}\\n`, \{ flag: "wx" \}\)/);
+  assert.doesNotMatch(source, /openSync\(LOCK, "wx"\)/);
+  assert.doesNotMatch(source, /writeSync\(fd, `\$\{process\.pid\}\\n`\)/);
 });
 
 test("node drain keeps polling locks isolated per session key", async () => {
