@@ -41,7 +41,7 @@
 import { DatabaseSync } from "node:sqlite";
 import {
   readFileSync, writeFileSync, renameSync, rmSync,
-  openSync, closeSync, writeSync, statSync,
+  statSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -122,16 +122,46 @@ function emitAndExit(rows) {
 
 // --- single-poller lock (poll mode only) ------------------------------------
 let haveLock = false;
+function lockOwnerPid() {
+  try {
+    const value = readFileSync(LOCK, "utf8").trim();
+    if (!/^\d+$/.test(value)) return null;
+    const pid = Number(value);
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+function lockOwnerIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM means the process exists but cannot be signalled by this user.
+    return !(err instanceof Error && "code" in err && err.code === "ESRCH");
+  }
+}
+
+function reclaimAbandonedLock() {
+  const ownerPid = lockOwnerPid();
+  if (ownerPid !== null && !lockOwnerIsAlive(ownerPid)) {
+    rmSync(LOCK, { force: true });
+    return;
+  }
+
+  // A PID can be reused by an unrelated process. Preserve a finite recovery ceiling
+  // even when the recorded PID currently appears alive, and for legacy PID-less locks.
+  try {
+    const age = (Date.now() - statSync(LOCK).mtimeMs) / 1000;
+    if (age > MAX_SECONDS + 120) rmSync(LOCK, { force: true });
+  } catch {}
+}
+
 function acquireLock() {
   try {
-    // stale lock (older than a full lifetime + slack) → take over
-    try {
-      const age = (Date.now() - statSync(LOCK).mtimeMs) / 1000;
-      if (age > MAX_SECONDS + 120) rmSync(LOCK, { force: true });
-    } catch {}
-    const fd = openSync(LOCK, "wx"); // fail if exists
-    writeSync(fd, `${process.pid}\n`);
-    closeSync(fd);
+    reclaimAbandonedLock();
+    writeFileSync(LOCK, `${process.pid}\n`, { flag: "wx" });
     haveLock = true;
     return true;
   } catch {
@@ -139,7 +169,11 @@ function acquireLock() {
   }
 }
 function releaseLock() {
-  if (haveLock) { try { rmSync(LOCK, { force: true }); } catch {} haveLock = false; }
+  if (!haveLock) return;
+  try {
+    if (lockOwnerPid() === process.pid) rmSync(LOCK, { force: true });
+  } catch {}
+  haveLock = false;
 }
 
 // Never exit non-zero on a fault: that would wake the session with a false alarm. But

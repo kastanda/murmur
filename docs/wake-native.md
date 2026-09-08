@@ -72,6 +72,13 @@ Same env and the same per-session cursor as the shell version (`MURMUR_DB`,
 non-polling check (e.g. a PostToolUse hook). Requires Node with `node:sqlite`
 (22.5+).
 
+The Node poller's per-session lock records its owner PID and is created with one
+exclusive write. A subsequent invocation keeps a live owner's lock until the finite
+`MURMUR_WAKE_MAX_SECONDS + 120` age ceiling, immediately reclaims a dead owner's
+lock, and applies the same ceiling to legacy or malformed PID-less locks. Cleanup
+removes the lock only while it still records the current poller's PID. The shell hook
+is one-shot and has no poller lock.
+
 A fault — no store, an unreadable store, no `node:sqlite` — prints one line to stderr
 and exits `0`. Exiting non-zero would wake the session with a false alarm; exiting
 silently is the failure this port exists to remove, so it does neither.

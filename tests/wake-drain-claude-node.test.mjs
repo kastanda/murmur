@@ -2,7 +2,7 @@
 // suite, plus the cases the port itself introduced: a lock, a session key, and faults
 // that must be reported instead of swallowed.
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -53,6 +53,36 @@ function drain(ctx, extraEnv = {}) {
     },
     encoding: "utf8",
   });
+}
+
+function startPoller(ctx, extraEnv = {}) {
+  const child = spawn(process.execPath, ["--no-warnings", script], {
+    env: {
+      ...process.env,
+      MURMUR_DB: ctx.dbPath,
+      MURMUR_WAKE_CURSOR: ctx.cursorPath,
+      MURMUR_WAKE_LOCK: ctx.lockPath,
+      MURMUR_WAKE_MAX_SECONDS: "1",
+      MURMUR_WAKE_POLL_MS: "10",
+      ...extraEnv,
+    },
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const result = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (status, signal) => resolve({ status, signal, stderr }));
+  });
+  return { child, result };
+}
+
+async function waitForPath(filePath, exists = true) {
+  const deadline = Date.now() + 2000;
+  while (fs.existsSync(filePath) !== exists) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${filePath} exists=${exists}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }
 
 test("node drain seeds the cursor to the tip on first run and stays silent", () => {
@@ -126,6 +156,200 @@ test("node drain polling mode keeps inbound selection and wake behavior", () => 
   assert.doesNotMatch(result.stderr, /ignore me/);
   assert.equal(fs.readFileSync(ctx.cursorPath, "utf8").trim(), "2");
   assert.equal(fs.existsSync(ctx.lockPath), false, "poll lock must be released after wake");
+});
+
+test("node drain re-arms immediately for three sequential polling wakes", async () => {
+  const ctx = withDb();
+  ctx.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 2000;");
+  fs.writeFileSync(ctx.cursorPath, "0\n");
+
+  for (let index = 1; index <= 3; index += 1) {
+    const poller = startPoller(ctx);
+    await waitForPath(ctx.lockPath);
+    insertMessage(ctx.db, {
+      msgId: `in-${index}`,
+      conversationId: "dm:cursor:claude",
+      text: `wake ${index}`,
+    });
+
+    const result = await poller.result;
+    assert.equal(result.status, 2, `poller ${index} must wake`);
+    assert.match(result.stderr, new RegExp(`msgId=in-${index} conversationId=dm:cursor:claude wake ${index}`));
+    assert.equal(fs.existsSync(ctx.lockPath), false, `poller ${index} must release its lock`);
+  }
+});
+
+test("node drain reclaims a fresh lock left by a killed poller", async () => {
+  const ctx = withDb();
+  fs.writeFileSync(ctx.cursorPath, "0\n");
+  const crashedPoller = startPoller(ctx, { MURMUR_WAKE_MAX_SECONDS: "3600" });
+  await waitForPath(ctx.lockPath);
+  assert.equal(fs.readFileSync(ctx.lockPath, "utf8").trim(), String(crashedPoller.child.pid));
+  crashedPoller.child.kill("SIGKILL");
+  const crashResult = await crashedPoller.result;
+  assert.equal(crashResult.signal, "SIGKILL");
+  assert.equal(fs.existsSync(ctx.lockPath), true, "abnormal exit must leave the reproduction lock");
+
+  insertMessage(ctx.db, { msgId: "in-1", conversationId: "dm:cursor:claude", text: "after crash" });
+
+  const result = spawnSync(process.execPath, ["--no-warnings", script], {
+    env: {
+      ...process.env,
+      MURMUR_DB: ctx.dbPath,
+      MURMUR_WAKE_CURSOR: ctx.cursorPath,
+      MURMUR_WAKE_LOCK: ctx.lockPath,
+      MURMUR_WAKE_MAX_SECONDS: "3600",
+      MURMUR_WAKE_POLL_MS: "10",
+    },
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /msgId=in-1 conversationId=dm:cursor:claude after crash/);
+  assert.equal(fs.existsSync(ctx.lockPath), false);
+});
+
+test("node drain does not displace a fresh lock owned by a live pid", () => {
+  const ctx = withDb();
+  fs.writeFileSync(ctx.cursorPath, "0\n");
+  fs.writeFileSync(ctx.lockPath, `${process.pid}\n`);
+  insertMessage(ctx.db, { msgId: "in-1", text: "must wait" });
+
+  const completed = spawnSync(process.execPath, ["--no-warnings", script], {
+    env: {
+      ...process.env,
+      MURMUR_DB: ctx.dbPath,
+      MURMUR_WAKE_CURSOR: ctx.cursorPath,
+      MURMUR_WAKE_LOCK: ctx.lockPath,
+      MURMUR_WAKE_MAX_SECONDS: "1",
+      MURMUR_WAKE_POLL_MS: "10",
+    },
+    encoding: "utf8",
+  });
+  assert.equal(completed.status, 0);
+  assert.equal(completed.stderr, "");
+  assert.equal(fs.readFileSync(ctx.lockPath, "utf8").trim(), String(process.pid));
+  fs.rmSync(ctx.lockPath, { force: true });
+});
+
+test("node drain reclaims an old lock even when its pid is currently live", () => {
+  const ctx = withDb();
+  fs.writeFileSync(ctx.cursorPath, "0\n");
+  fs.writeFileSync(ctx.lockPath, `${process.pid}\n`);
+  fs.utimesSync(ctx.lockPath, new Date(0), new Date(0));
+  insertMessage(ctx.db, { msgId: "in-1", conversationId: "dm:cursor:claude", text: "pid reused" });
+
+  const result = spawnSync(process.execPath, ["--no-warnings", script], {
+    env: {
+      ...process.env,
+      MURMUR_DB: ctx.dbPath,
+      MURMUR_WAKE_CURSOR: ctx.cursorPath,
+      MURMUR_WAKE_LOCK: ctx.lockPath,
+      MURMUR_WAKE_MAX_SECONDS: "1",
+      MURMUR_WAKE_POLL_MS: "10",
+    },
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /msgId=in-1 conversationId=dm:cursor:claude pid reused/);
+  assert.equal(fs.existsSync(ctx.lockPath), false);
+});
+
+test("node drain reclaims an old legacy lock without a pid", () => {
+  const ctx = withDb();
+  fs.writeFileSync(ctx.cursorPath, "0\n");
+  fs.writeFileSync(ctx.lockPath, "legacy-lock\n");
+  fs.utimesSync(ctx.lockPath, new Date(0), new Date(0));
+  insertMessage(ctx.db, { msgId: "in-1", conversationId: "dm:cursor:claude", text: "legacy recovery" });
+
+  const result = spawnSync(process.execPath, ["--no-warnings", script], {
+    env: {
+      ...process.env,
+      MURMUR_DB: ctx.dbPath,
+      MURMUR_WAKE_CURSOR: ctx.cursorPath,
+      MURMUR_WAKE_LOCK: ctx.lockPath,
+      MURMUR_WAKE_MAX_SECONDS: "1",
+      MURMUR_WAKE_POLL_MS: "10",
+    },
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /msgId=in-1 conversationId=dm:cursor:claude legacy recovery/);
+  assert.equal(fs.existsSync(ctx.lockPath), false);
+});
+
+test("node drain release does not unlink a replacement owner's lock", async () => {
+  const ctx = withDb();
+  ctx.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 2000;");
+  fs.writeFileSync(ctx.cursorPath, "0\n");
+  const poller = startPoller(ctx);
+  await waitForPath(ctx.lockPath);
+  fs.writeFileSync(ctx.lockPath, `${process.pid}\n`);
+  insertMessage(ctx.db, { msgId: "in-1", conversationId: "dm:cursor:claude", text: "replacement owner" });
+
+  const result = await poller.result;
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /msgId=in-1 conversationId=dm:cursor:claude replacement owner/);
+  assert.equal(fs.readFileSync(ctx.lockPath, "utf8").trim(), String(process.pid));
+  fs.rmSync(ctx.lockPath, { force: true });
+});
+
+test("node drain creates its lock with one exclusive write", () => {
+  const source = fs.readFileSync(script, "utf8");
+
+  assert.match(source, /writeFileSync\(LOCK, `\$\{process\.pid\}\\n`, \{ flag: "wx" \}\)/);
+  assert.doesNotMatch(source, /openSync\(LOCK, "wx"\)/);
+  assert.doesNotMatch(source, /writeSync\(fd, `\$\{process\.pid\}\\n`\)/);
+});
+
+test("node drain keeps polling locks isolated per session key", async () => {
+  const ctx = withDb();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "murmur-node-lock-home-"));
+  fs.writeFileSync(ctx.cursorPath, "0\n");
+  const lockA = path.join(home, ".murmur-wake-lock-aaaaaaaa");
+  const lockB = path.join(home, ".murmur-wake-lock-bbbbbbbb");
+  const commonEnv = {
+    HOME: home,
+    USERPROFILE: home,
+    MURMUR_WAKE_LOCK: "",
+    MURMUR_WAKE_MAX_SECONDS: "0.1",
+    MURMUR_WAKE_POLL_MS: "5",
+  };
+
+  const pollerA = startPoller(ctx, { ...commonEnv, MURMUR_WAKE_SESSION_KEY: "aaaaaaaa-1111" });
+  const pollerB = startPoller(ctx, { ...commonEnv, MURMUR_WAKE_SESSION_KEY: "bbbbbbbb-2222" });
+  await Promise.all([waitForPath(lockA), waitForPath(lockB)]);
+  const [resultA, resultB] = await Promise.all([pollerA.result, pollerB.result]);
+
+  assert.equal(resultA.status, 0);
+  assert.equal(resultB.status, 0);
+  assert.equal(fs.existsSync(lockA), false);
+  assert.equal(fs.existsSync(lockB), false);
+});
+
+test("node drain polling timeout remains silent and releases its lock", () => {
+  const ctx = withDb();
+  fs.writeFileSync(ctx.cursorPath, "0\n");
+
+  const result = spawnSync(process.execPath, ["--no-warnings", script], {
+    env: {
+      ...process.env,
+      MURMUR_DB: ctx.dbPath,
+      MURMUR_WAKE_CURSOR: ctx.cursorPath,
+      MURMUR_WAKE_LOCK: ctx.lockPath,
+      MURMUR_WAKE_MAX_SECONDS: "0.05",
+      MURMUR_WAKE_POLL_MS: "5",
+    },
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(result.stderr, "");
+  assert.equal(fs.existsSync(ctx.lockPath), false);
+  assert.equal(fs.readFileSync(ctx.cursorPath, "utf8").trim(), "0");
 });
 
 test("node drain dedups: the same message does not wake twice", () => {
