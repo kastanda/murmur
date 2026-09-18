@@ -205,6 +205,7 @@ const loadInboundAfter = async (cursor) => {
          rowid as cursor,
          conversation_id as conversationId,
          msg_id as msgId,
+         reply_to_message_id as replyToMessageId,
          sender as "from",
          text,
          created_at as ts
@@ -218,6 +219,7 @@ const loadInboundAfter = async (cursor) => {
     from: row.from,
     text: row.text,
     msgId: row.msgId,
+    ...(row.replyToMessageId ? { replyToMessageId: row.replyToMessageId } : {}),
     conversationId: row.conversationId,
     ts: row.ts,
     cursor: Number(row.cursor),
@@ -294,6 +296,7 @@ const onMessage = async (envelope) => {
   await msgStore.append({
     conversationId: envelope.conversationId,
     msgId: envelope.msgId,
+    ...(envelope.replyToMessageId ? { replyToMessageId: envelope.replyToMessageId } : {}),
     direction: "inbound",
     sender: senderId,
     text: plaintext,
@@ -303,6 +306,7 @@ const onMessage = async (envelope) => {
 
   log("info", "Message received", {
     msgId: envelope.msgId,
+    ...(envelope.replyToMessageId ? { replyToMessageId: envelope.replyToMessageId } : {}),
     from: senderId,
     conversationId: envelope.conversationId,
     textLen: plaintext.length,
@@ -312,6 +316,7 @@ const onMessage = async (envelope) => {
     from: senderId,
     text: plaintext,
     msgId: envelope.msgId,
+    ...(envelope.replyToMessageId ? { replyToMessageId: envelope.replyToMessageId } : {}),
     conversationId: envelope.conversationId,
     ts: new Date().toISOString(),
     cursor: inboundCursorForMsg(envelope.msgId),

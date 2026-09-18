@@ -95,8 +95,12 @@ function maxInbound(db) {
 }
 
 function newRows(db, since) {
+  const hasReplyColumn = db.prepare("PRAGMA table_info(local_messages)").all()
+    .some((column) => column.name === "reply_to_message_id");
+  const replyColumn = hasReplyColumn ? "reply_to_message_id" : "NULL AS reply_to_message_id";
   return db.prepare(
     `SELECT rowid, sender, msg_id, conversation_id,
+            ${replyColumn},
             substr(replace(replace(text, char(10), ' '), char(13), ' '), 1, 360) AS snippet
        FROM local_messages
       WHERE direction='inbound' AND rowid > ?
@@ -111,11 +115,12 @@ function emitAndExit(rows) {
   writeCursor(rows[rows.length - 1].rowid);
   releaseLock();
   const lines = rows.map(
-    (r) => `  rowid=${r.rowid} [${r.sender}] msgId=${r.msg_id} conversationId=${r.conversation_id} ${r.snippet}`,
+    (r) => `  rowid=${r.rowid} [${r.sender}] msgId=${r.msg_id} conversationId=${r.conversation_id}` +
+      `${r.reply_to_message_id ? ` replyToMessageId=${r.reply_to_message_id}` : ""} ${r.snippet}`,
   );
   process.stderr.write(
     `Murmur wake: ${rows.length} new inbound message(s):\n${lines.join("\n")}\n` +
-    `Reply via murmur_send using the same conversationId.\n`,
+    `Reply via murmur_send using the same conversationId. Set replyToMessageId to the inbound msgId.\n`,
   );
   process.exit(2);
 }

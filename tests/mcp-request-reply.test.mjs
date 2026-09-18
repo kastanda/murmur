@@ -5,12 +5,13 @@ import {
   waitForReply,
 } from "../packages/mcp-server/dist/src/request-reply.js";
 
-const reply = (msgId) => ({
+const reply = (msgId, replyToMessageId = "req-1", sender = "agent.b") => ({
   id: msgId,
   conversationId: "conv-1",
   msgId,
   direction: "inbound",
-  sender: "agent.b",
+  sender,
+  replyToMessageId,
   text: "pong",
   createdAt: new Date().toISOString(),
   transport: "nats",
@@ -18,11 +19,30 @@ const reply = (msgId) => ({
 
 // --- buildReplyMatcher -------------------------------------------------------
 
-test("buildReplyMatcher matches same conversation + peer, rejects others", () => {
-  const match = buildReplyMatcher("conv-1", "agent.b");
-  assert.equal(match({ conversationId: "conv-1", senderAgentId: "agent.b" }), true);
-  assert.equal(match({ conversationId: "conv-1", senderAgentId: "agent.c" }), false);
-  assert.equal(match({ conversationId: "conv-2", senderAgentId: "agent.b" }), false);
+test("buildReplyMatcher requires exact reply target and expected sender", () => {
+  const match = buildReplyMatcher("req-1", "agent.b");
+  assert.equal(match({ replyToMessageId: "req-1", senderAgentId: "agent.b" }), true);
+  assert.equal(match({ replyToMessageId: "req-1", senderAgentId: "agent.c" }), false);
+  assert.equal(match({ replyToMessageId: "req-other", senderAgentId: "agent.b" }), false);
+  assert.equal(match({ senderAgentId: "agent.b" }), false);
+});
+
+test("concurrent same-conversation matchers resolve reverse-order replies independently", () => {
+  const matchA = buildReplyMatcher("req-a", "agent.b");
+  const matchB = buildReplyMatcher("req-b", "agent.b");
+  const replies = [
+    { msgId: "reply-b", conversationId: "conv-1", replyToMessageId: "req-b", senderAgentId: "agent.b" },
+    { msgId: "reply-a", conversationId: "conv-1", replyToMessageId: "req-a", senderAgentId: "agent.b" },
+  ];
+  assert.equal(replies.find(matchA)?.msgId, "reply-a");
+  assert.equal(replies.find(matchB)?.msgId, "reply-b");
+});
+
+test("same-conversation, late, wrong-target, and wrong-sender messages do not match", () => {
+  const match = buildReplyMatcher("req-current", "agent.a");
+  assert.equal(match({ conversationId: "conv-1", senderAgentId: "agent.a" }), false);
+  assert.equal(match({ conversationId: "conv-1", replyToMessageId: "req-old", senderAgentId: "agent.a" }), false);
+  assert.equal(match({ conversationId: "conv-1", replyToMessageId: "req-current", senderAgentId: "agent.b" }), false);
 });
 
 // --- A: durability when live-wait is OFF (pure store polling, no signal) ------

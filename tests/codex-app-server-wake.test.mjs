@@ -169,6 +169,35 @@ test("buildTurnStartRequest builds Codex turn/start params", () => {
   assert.match(request.params.input[0].text, /msgId=msg-codex-1/);
 });
 
+test("Codex local reply instruction correlates the response to the inbound msgId", () => {
+  const text = buildCodexTurnText(payload, {
+    murmurRoot: "/work/murmur",
+    dataDir: "/work/.data",
+    storePath: "/work/.data/murmur.db",
+  });
+  assert.match(text, /--reply-to 'msg-codex-1'/);
+  assert.match(text, /--conv 'codex:task:test'/);
+});
+
+test("Codex local reply instruction quotes a msgId containing a shell quote", () => {
+  const text = buildCodexTurnText({ ...payload, msgId: "msg-'quoted" }, {
+    murmurRoot: "/work/murmur",
+    dataDir: "/work/.data",
+    storePath: "/work/.data/murmur.db",
+  });
+  assert.match(text, /--reply-to 'msg-'\\''quoted'/);
+});
+
+test("Codex local reply instruction refuses an uncorrelated reply without msgId", () => {
+  const text = buildCodexTurnText({ ...payload, msgId: "   " }, {
+    murmurRoot: "/work/murmur",
+    dataDir: "/work/.data",
+    storePath: "/work/.data/murmur.db",
+  });
+  assert.doesNotMatch(text, /--reply-to/);
+  assert.match(text, /cannot send a correlated reply/);
+});
+
 test("buildThreadStartParams applies optional channel personality binding", () => {
   const params = buildThreadStartParams({
     model: "gpt-5",

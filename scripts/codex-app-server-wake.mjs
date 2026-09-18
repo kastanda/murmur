@@ -28,6 +28,16 @@ const buildReplyHint = (payload, peer = {}) => {
   const storePath = peer?.storePath;
   if (!murmurRoot || !dataDir || !storePath || !payload?.from) return [];
 
+  const replyToMessageId = typeof payload?.msgId === "string" ? payload.msgId.trim() : "";
+  if (!replyToMessageId) {
+    return [
+      "",
+      "[LOCAL REPLY PATH UNAVAILABLE]",
+      "This inbound message has no msgId, so Murmur cannot send a correlated reply.",
+      "Do not send an uncorrelated reply; report the missing message ID instead.",
+    ];
+  }
+
   const conv = payload.conversationId || "";
   const command = [
     `cd ${shellQuote(murmurRoot)}`,
@@ -36,6 +46,7 @@ const buildReplyHint = (payload, peer = {}) => {
     "node scripts/murmur-shell-send.mjs",
     `--to ${shellQuote(payload.from)}`,
     `--conv ${shellQuote(conv)}`,
+    `--reply-to ${shellQuote(replyToMessageId)}`,
     "--text '<your one-line reply>'",
   ].join(" ");
 
@@ -410,7 +421,7 @@ const sendRelayReply = (peer = {}, payload = {}, finalText = "") => new Promise(
   const script = path.join(peer.murmurRoot, "scripts", "murmur-shell-send.mjs");
   execFile(
     process.execPath,
-    [script, "--to", payload.from, "--conv", payload.conversationId, "--text-file", replyFile],
+    [script, "--to", payload.from, "--conv", payload.conversationId, "--reply-to", payload.msgId, "--text-file", replyFile],
     {
       cwd: peer.murmurRoot,
       env: {

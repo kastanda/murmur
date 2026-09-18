@@ -32,12 +32,17 @@ const execFileAsync = promisify(execFile);
 
 const from = process.env.MURMUR_FROM || "unknown";
 const text = process.env.MURMUR_TEXT || "";
-const msgId = process.env.MURMUR_MSG_ID || "";
+const msgId = (process.env.MURMUR_MSG_ID || "").trim();
 const conversationId = process.env.MURMUR_CONVERSATION_ID || "";
 
 if (!text) {
   console.error("[llm] No text received, skipping");
   process.exit(0);
+}
+
+if (!msgId) {
+  console.error("[llm] Missing MURMUR_MSG_ID; refusing to send an uncorrelated reply");
+  process.exit(2);
 }
 
 // LLM config
@@ -115,10 +120,16 @@ async function callLLM(system, user) {
 
 async function sendReply(targetAgent, message) {
   const scriptDir = path.dirname(new URL(import.meta.url).pathname);
-  const sendScript = path.join(scriptDir, "send-task.mjs");
+  const sendScript = path.join(scriptDir, "murmur-shell-send.mjs");
   
   try {
-    const { stdout, stderr } = await execFileAsync("node", [sendScript, targetAgent, message], {
+    const { stdout, stderr } = await execFileAsync("node", [
+      sendScript,
+      "--to", targetAgent,
+      "--conv", conversationId,
+      "--reply-to", msgId,
+      "--text", message,
+    ], {
       cwd: path.join(scriptDir, ".."),
       timeout: 15000,
       env: { ...process.env, DATA_DIR: process.env.DATA_DIR || ".data" },

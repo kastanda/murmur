@@ -240,11 +240,15 @@ export class WakeDispatchStore {
 
   backfillMissingInbound(now = Date.now()) {
     if (!this.hasLocalMessagesTable()) return 0;
+    const replyColumn = this.hasLocalMessageReplyColumn()
+      ? "reply_to_message_id AS replyToMessageId"
+      : "NULL AS replyToMessageId";
     const baseline = Number(this.db.prepare(`
       SELECT value FROM wake_dispatch_meta WHERE key = 'inbound-baseline-rowid'
     `).get()?.value ?? 0);
     const rows = this.db.prepare(`
       SELECT rowid AS cursor, conversation_id AS conversationId, msg_id AS msgId,
+             ${replyColumn},
              sender AS "from", text, created_at AS ts
       FROM local_messages AS message
       WHERE direction = 'inbound' AND rowid > ?
@@ -255,7 +259,11 @@ export class WakeDispatchStore {
         )
       ORDER BY rowid ASC
     `).all(baseline, this.recipientId, this.recipientId);
-    for (const row of rows) this.enqueue({ ...row, cursor: Number(row.cursor) }, now);
+    for (const row of rows) this.enqueue({
+      ...row,
+      ...(row.replyToMessageId ? { replyToMessageId: row.replyToMessageId } : {}),
+      cursor: Number(row.cursor),
+    }, now);
     return rows.length;
   }
 
@@ -318,6 +326,11 @@ export class WakeDispatchStore {
     return Boolean(this.db.prepare(`
       SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'local_messages'
     `).get());
+  }
+
+  hasLocalMessageReplyColumn() {
+    return this.db.prepare(`PRAGMA table_info(local_messages)`).all()
+      .some((column) => column.name === "reply_to_message_id");
   }
 
   hasMigrationBaseline() {

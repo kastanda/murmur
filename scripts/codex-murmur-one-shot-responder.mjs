@@ -181,9 +181,9 @@ function sendAppendLocal(db, args, inbound, replyText) {
   try {
     db.prepare(`
       INSERT INTO local_messages
-        (id, conversation_id, msg_id, direction, sender, text, created_at, transport)
-      VALUES (?, ?, ?, 'outbound', ?, ?, ?, 'one-shot-test')
-    `).run(replyMsgId, inbound.conversation_id, replyMsgId, args.agentId, replyText, now);
+        (id, conversation_id, msg_id, reply_to_message_id, direction, sender, text, created_at, transport)
+      VALUES (?, ?, ?, ?, 'outbound', ?, ?, ?, 'one-shot-test')
+    `).run(replyMsgId, inbound.conversation_id, replyMsgId, inbound.msg_id, args.agentId, replyText, now);
     db.prepare(`
       INSERT INTO codex_one_shot_processed
         (inbound_msg_id, inbound_rowid, conversation_id, reply_msg_id, status, processed_at, updated_at)
@@ -245,7 +245,7 @@ function sendMurmur(args, inbound, replyText) {
   };
   try {
     writeFileSync(replyFile, replyText, { mode: 0o600 });
-    const res = spawnSync("node", [script, "--to", args.recipient, "--conv", inbound.conversation_id, "--text-file", replyFile], {
+    const res = spawnSync("node", [script, "--to", args.recipient, "--conv", inbound.conversation_id, "--reply-to", inbound.msg_id, "--text-file", replyFile], {
       encoding: "utf8",
       env,
       stdio: ["ignore", "pipe", "pipe"],

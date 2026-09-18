@@ -33,6 +33,7 @@
         "traceId": { "type": "string" },
         "sequence": { "type": "number" },
         "parentMsgId": { "type": "string" },
+        "replyToMessageId": { "type": "string", "minLength": 1 },
         "authToken": { "type": "string", "minLength": 1 },
         "payloadCiphertext": { "type": "string", "minLength": 1 },
         "payloadNonce": { "type": "string", "minLength": 1 },

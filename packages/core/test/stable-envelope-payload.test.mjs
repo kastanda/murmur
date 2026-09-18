@@ -35,6 +35,14 @@ test("stableEnvelopePayload appends authToken ONLY when present (back-compat for
   );
 });
 
+test("stableEnvelopePayload signs replyToMessageId while preserving legacy bytes when absent", () => {
+  assert.ok(!stableEnvelopePayload(ENV).includes("replyToMessageId"));
+  assert.equal(
+    stableEnvelopePayload({ ...ENV, replyToMessageId: "request-1" }),
+    '{"schemaVersion":"1.0","msgId":"m1","conversationId":"c1","senderAgentId":"agent-a","recipients":["agent-b","agent-c"],"createdAt":"2026-06-22T00:00:00.000Z","payloadCiphertext":"ct","payloadNonce":"no","replyToMessageId":"request-1"}',
+  );
+});
+
 test("stableEnvelopePayload excludes the signature field (it is what gets signed)", () => {
   const signed = stableEnvelopePayload(ENV);
   const unsigned = stableEnvelopePayload({ ...ENV, signature: "" });

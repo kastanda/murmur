@@ -25,6 +25,9 @@ export interface EnvelopeV1 {
   traceId?: string;
   sequence?: number;
   parentMsgId?: string;
+  /** Exact message identity this message replies to. Conversation IDs group history;
+   *  they are not request/reply correlation keys. */
+  replyToMessageId?: string;
   /** Optional bearer auth token (`MURMUR-AUTH:...`) authorizing the sender. When present
    *  it is part of the signed payload (so it can't be stripped/swapped) and can be
    *  verified with @murmurv2/federation `verifyAuthToken`. Ingress enforcement (an
@@ -114,6 +117,7 @@ export const stableEnvelopePayload = (envelope: EnvelopeV1): string =>
     createdAt: envelope.createdAt,
     payloadCiphertext: envelope.payloadCiphertext,
     payloadNonce: envelope.payloadNonce,
+    ...(envelope.replyToMessageId !== undefined ? { replyToMessageId: envelope.replyToMessageId } : {}),
     // authToken is appended ONLY when present, in a fixed final position: envelopes
     // without it sign byte-identically to before this field existed (back-compat),
     // and when present it is covered by the signature so it can't be stripped/swapped.
@@ -768,6 +772,7 @@ export interface LocalMessageRecord {
   id: string;
   conversationId: string;
   msgId: string;
+  replyToMessageId?: string;
   direction: "inbound" | "outbound";
   sender: string;
   text: string;
@@ -816,6 +821,7 @@ export class SQLiteMessageStore {
         id TEXT PRIMARY KEY,
         conversation_id TEXT NOT NULL,
         msg_id TEXT NOT NULL,
+        reply_to_message_id TEXT,
         direction TEXT NOT NULL,
         sender TEXT NOT NULL,
         text TEXT NOT NULL,
@@ -838,6 +844,14 @@ export class SQLiteMessageStore {
       CREATE INDEX IF NOT EXISTS idx_message_events_msg ON message_events(msg_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_message_events_conversation ON message_events(conversation_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_message_events_relates ON message_events(relates_to);
+    `);
+    const messageColumns = this.db.prepare(`PRAGMA table_info(local_messages)`).all() as Array<{ name: string }>;
+    if (!messageColumns.some((column) => column.name === "reply_to_message_id")) {
+      this.db.exec(`ALTER TABLE local_messages ADD COLUMN reply_to_message_id TEXT`);
+    }
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_local_messages_reply_to
+      ON local_messages(reply_to_message_id, direction, sender, created_at)
     `);
     secureSqliteFiles(dbPath);
   }
@@ -946,13 +960,14 @@ export class SQLiteMessageStore {
     this.db
       .prepare(
         `INSERT INTO local_messages
-         (id, conversation_id, msg_id, direction, sender, text, created_at, transport)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, conversation_id, msg_id, reply_to_message_id, direction, sender, text, created_at, transport)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         row.id,
         row.conversationId,
         row.msgId,
+        row.replyToMessageId ?? null,
         row.direction,
         row.sender,
         row.text,
@@ -982,6 +997,7 @@ export class SQLiteMessageStore {
            id,
            conversation_id as conversationId,
            msg_id as msgId,
+           reply_to_message_id as replyToMessageId,
            direction,
            sender,
            text,
@@ -994,6 +1010,25 @@ export class SQLiteMessageStore {
       )
       .all(conversationId, afterTimestamp, limit) as unknown as LocalMessageRecord[];
     return rows;
+  }
+
+  async getRepliesTo(replyToMessageId: string, expectedSender: string, limit = 10): Promise<LocalMessageRecord[]> {
+    return this.db.prepare(
+      `SELECT
+         id,
+         conversation_id as conversationId,
+         msg_id as msgId,
+         reply_to_message_id as replyToMessageId,
+         direction,
+         sender,
+         text,
+         created_at as createdAt,
+         transport
+       FROM local_messages
+       WHERE direction = 'inbound' AND reply_to_message_id = ? AND sender = ?
+       ORDER BY created_at ASC, rowid ASC
+       LIMIT ?`,
+    ).all(replyToMessageId, expectedSender, limit) as unknown as LocalMessageRecord[];
   }
 
   /**
@@ -1012,6 +1047,7 @@ export class SQLiteMessageStore {
            id,
            conversation_id as conversationId,
            msg_id as msgId,
+           reply_to_message_id as replyToMessageId,
            direction,
            sender,
            text,
@@ -1034,6 +1070,7 @@ export class SQLiteMessageStore {
            id,
            conversation_id as conversationId,
            msg_id as msgId,
+           reply_to_message_id as replyToMessageId,
            direction,
            sender,
            text,
@@ -1638,6 +1675,7 @@ export const isEnvelopeV1 = (v: unknown): v is EnvelopeV1 => {
     hasOptional("traceId", "string") &&
     hasOptional("sequence", "number") &&
     hasOptional("parentMsgId", "string") &&
+    (o.replyToMessageId === undefined || (typeof o.replyToMessageId === "string" && o.replyToMessageId.length > 0)) &&
     // authToken: optional, but if present must be a non-empty string (a bearer token)
     (o.authToken === undefined || (typeof o.authToken === "string" && o.authToken.length > 0))
   );

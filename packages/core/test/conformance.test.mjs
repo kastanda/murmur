@@ -142,6 +142,7 @@ test("schema and isEnvelopeV1 agree on every structural violation", () => {
     ["missing payloadNonce", without("payloadNonce")],
     ["empty signature (unsigned)", { ...GOOD, signature: "" }],
     ["empty authToken (present but blank)", { ...GOOD, authToken: "" }],
+    ["empty replyToMessageId (present but blank)", { ...GOOD, replyToMessageId: "" }],
   ];
   for (const [label, e] of bad) {
     assert.equal(envelopeOk(e), false, `schema must reject: ${label}`);
@@ -150,7 +151,7 @@ test("schema and isEnvelopeV1 agree on every structural violation", () => {
 });
 
 test("optional fields + forward-compatible unknown fields are accepted by both", () => {
-  const e = { ...GOOD, ttlSeconds: 60, traceId: "t", sequence: 3, parentMsgId: "p", authToken: "MURMUR-AUTH:abc", futureFieldV2: "x" };
+  const e = { ...GOOD, ttlSeconds: 60, traceId: "t", sequence: 3, parentMsgId: "p", replyToMessageId: "request-1", authToken: "MURMUR-AUTH:abc", futureFieldV2: "x" };
   assert.equal(envelopeOk(e), true);
   assert.equal(isEnvelopeV1(e), true);
 });

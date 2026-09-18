@@ -23,6 +23,11 @@ Envelope message payloads are encrypted on the wire; presence frames are intenti
 **shape**, while signature verification and payload decryption are runtime concerns
 (`@murmurv2/security`).
 
+Message identity and grouping are distinct: `msgId` identifies one message,
+`conversationId` groups a logical thread, and optional `replyToMessageId` points to
+the exact message being answered. Request/reply matching uses `replyToMessageId` and
+the expected responder, never conversation or arrival-time heuristics.
+
 ## Envelope lifecycle
 1. Producer builds `EnvelopeV1`
 2. Producer signs envelope and encrypts payload

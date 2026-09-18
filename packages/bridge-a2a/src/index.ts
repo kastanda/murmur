@@ -302,13 +302,14 @@ export class A2AMurmurBridge {
     return reply;
   }
 
-  /** Internal reply (fresh EnvelopeV1 with parentMsgId) or AckV1 -> resolve A2A task. */
+  /** Internal reply (fresh EnvelopeV1 with replyToMessageId) or AckV1 -> resolve A2A task. */
   private async handleInternalReply(raw: string): Promise<void> {
     const parsed: unknown = JSON.parse(raw);
 
     if (isEnvelopeV1(parsed)) {
-      // The agent's answer references the original task via parentMsgId.
-      const key = parsed.parentMsgId ?? parsed.conversationId;
+      // Prefer the strict reply field; parentMsgId remains accepted only for legacy
+      // A2A bridge peers and is not used by murmur_request.
+      const key = parsed.replyToMessageId ?? parsed.parentMsgId;
       const resolve = key ? this.pending.get(key) : undefined;
       if (resolve && key) {
         this.pending.delete(key);

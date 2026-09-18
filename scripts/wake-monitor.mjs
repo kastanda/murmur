@@ -60,6 +60,8 @@ export const createShellHook = ({ command, timeoutMs = 10000, baseEnv = process.
       MURMUR_FROM: payload.from,
       MURMUR_TEXT: payload.text,
       MURMUR_MSG_ID: payload.msgId,
+      MURMUR_REPLY_TO_MESSAGE_ID: payload.msgId,
+      MURMUR_INBOUND_REPLY_TO_MESSAGE_ID: payload.replyToMessageId || "",
       MURMUR_CONVERSATION_ID: payload.conversationId,
       ...(payload.env || {}),
     };
@@ -82,6 +84,7 @@ export const createAuditShellHook = ({ command, timeoutMs = 10000, baseEnv = pro
       MURMUR_FROM: payload.from,
       MURMUR_TEXT: payload.text,
       MURMUR_MSG_ID: payload.msgId,
+      MURMUR_INBOUND_REPLY_TO_MESSAGE_ID: payload.replyToMessageId || "",
       MURMUR_CONVERSATION_ID: payload.conversationId,
       ...(payload.env || {}),
     };

@@ -149,6 +149,7 @@ const asMessage = (r: LocalMessageRecord): Record<string, unknown> => ({
   id: r.id,
   conversationId: r.conversationId,
   msgId: r.msgId,
+  ...(r.replyToMessageId ? { replyToMessageId: r.replyToMessageId } : {}),
   direction: r.direction,
   sender: r.sender,
   text: r.text,
@@ -260,6 +261,10 @@ const handleTool = async (name: string, args: Record<string, unknown>): Promise<
     if (!peer) throw new Error(`unknown peer: ${to} — add to peers in agent-config.json`);
 
     const conversationId = String(args.conversationId ?? `dm:${agentConfig.agentId}:${to}`);
+    const replyToMessageId = args.replyToMessageId === undefined
+      ? undefined
+      : String(args.replyToMessageId).trim();
+    if (replyToMessageId !== undefined && !replyToMessageId) throw new Error("'replyToMessageId' must be non-empty");
     const msgId = randomUUID();
 
     // Encrypt
@@ -277,6 +282,7 @@ const handleTool = async (name: string, args: Record<string, unknown>): Promise<
       senderAgentId: agentConfig.agentId,
       recipients: [to],
       createdAt: new Date().toISOString(),
+      ...(replyToMessageId ? { replyToMessageId } : {}),
       payloadCiphertext: encrypted.ciphertext,
       payloadNonce: encrypted.nonce,
       signature: "",
@@ -295,6 +301,7 @@ const handleTool = async (name: string, args: Record<string, unknown>): Promise<
     await store.append({
       conversationId,
       msgId,
+      ...(replyToMessageId ? { replyToMessageId } : {}),
       direction: "outbound",
       sender: agentConfig.agentId,
       text,
@@ -302,7 +309,7 @@ const handleTool = async (name: string, args: Record<string, unknown>): Promise<
       transport: "nats",
     });
 
-    return { msgId, to, conversationId, status: "queued" };
+    return { msgId, to, conversationId, ...(replyToMessageId ? { replyToMessageId } : {}), status: "queued" };
   }
 
   if (name === "murmur_inbox") {
@@ -382,7 +389,7 @@ const handleTool = async (name: string, args: Record<string, unknown>): Promise<
     // signal-only — the daemon stays the source of truth for decrypt + persistence.
     const graceMs = Number(args.grace_ms ?? 250);
     const deadline = Date.now() + timeoutMs;
-    const matchReply = buildReplyMatcher(conversationId, to);
+    const matchReply = buildReplyMatcher(msgId, to);
 
     const broker = await getWakeBroker();
     // Holder object: the tap is attached inside a callback, so a plain `let` would be
@@ -415,7 +422,7 @@ const handleTool = async (name: string, args: Record<string, unknown>): Promise<
     try {
       reply = await waitForReply({
         checkStore: async () => {
-          const inbound = await store.getInboundAfter(conversationId, sentAt, 1);
+          const inbound = await store.getRepliesTo(msgId, to, 1);
           return inbound.length > 0 ? inbound[0] : null;
         },
         pollMs,
@@ -591,6 +598,7 @@ const tools = [
         to: { type: "string", description: "Recipient agent ID (must be in peers config)" },
         text: { type: "string", description: "Message text (will be encrypted)" },
         conversationId: { type: "string", description: "Optional conversation ID" },
+        replyToMessageId: { type: "string", description: "Exact msgId this message replies to" },
       },
       required: ["to", "text"],
     },
@@ -598,7 +606,7 @@ const tools = [
   {
     name: "murmur_request",
     description:
-      "Send a message and wait for the reply. Combines murmur_send with a durable store-poll, accelerated by a read-only NATS tap so the reply is returned as soon as it lands (falls back to pure polling when NATS is unavailable). The tool blocks until the peer responds or timeout is reached. Ideal for autonomous agent-to-agent conversations.",
+      "Send a message and wait for an exact correlated reply. A valid reply must set replyToMessageId to this request's msgId and come from the targeted peer; conversation and arrival time are not correlation fallbacks. Durable store polling is accelerated by an optional read-only NATS tap.",
     inputSchema: {
       type: "object",
       properties: {

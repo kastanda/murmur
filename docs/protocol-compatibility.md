@@ -22,8 +22,10 @@ discriminated structurally — `presenceVersion: "1.0"` for presence, `kind` for
   other value are rejected (schema + `isEnvelopeV1`).
 - **Forward-compatible reads.** Unknown top-level fields are **permitted and ignored**
   (no `additionalProperties: false`). A future minor MAY add optional fields without
-  bumping `schemaVersion`; older consumers ignore them. Current optional fields:
-  `ttlSeconds`, `traceId`, `sequence`, `parentMsgId`.
+  bumping `schemaVersion`; older consumers ignore them only when they do not alter
+  canonical signing bytes. Current ordinary optional fields are `ttlSeconds`,
+  `traceId`, `sequence`, and `parentMsgId`. Signed extensions require the rollout
+  rules below and are not silently ignorable.
 - **Breaking change ⇒ new version.** Removing/renaming a required field, changing a
   type, or tightening an enum bumps `schemaVersion` (e.g. `2.0`). Consumers gate on it.
 - **Signature/crypto are out of band of the schema.** The schema validates *shape*;
@@ -49,6 +51,7 @@ discriminated structurally — `presenceVersion: "1.0"` for presence, `kind` for
 | `traceId` | — | string | |
 | `sequence` | — | number | |
 | `parentMsgId` | — | string | |
+| `replyToMessageId` | — | string | non-empty; exact parent message for reply correlation |
 | `authToken` | — | string | non-empty if present; bearer (`MURMUR-AUTH:…`) |
 
 **`authToken` is part of the signed payload.** When present it is appended to
@@ -58,6 +61,31 @@ to envelopes from before the field existed (forward/backward compatible). Verifi
 runtime concern (`@murmurv2/federation` `verifyAuthToken`), not a schema constraint;
 ingress enforcement (an `authorizeInbound` helper gated by `MURMUR_ENFORCE_AUTH`) is
 forthcoming in auth/authz #47 PR-D.
+
+`msgId` identifies the current message. `conversationId` groups messages into a
+logical conversation but does not correlate requests and replies.
+`replyToMessageId` identifies the immediate parent message. `murmur_request` matches
+only this exact field plus the expected sender; messages without it remain ordinary
+inbox messages and never satisfy a strict request.
+
+### Signed extension compatibility: `replyToMessageId`
+
+`replyToMessageId` is part of the canonical signed payload when present. An envelope
+without it retains the exact canonical bytes used before this field was introduced.
+An envelope with it requires an upgraded verifier that includes the field in the
+canonical form; an older verifier computes different bytes and rejects the envelope
+as signature-invalid. It is therefore not an unknown optional field that an older
+consumer can safely ignore, and mixed-version interoperability is not promised for
+envelopes that carry it.
+
+Roll out support in this order:
+
+1. Upgrade verifiers/readers on every peer.
+2. Only then enable emitters to send `replyToMessageId`.
+
+The legacy A2A `parentMsgId` fallback is best-effort ancestry metadata, not a
+substitute for strict `replyToMessageId` correlation. `murmur_request` does not use
+that fallback.
 
 ## AckV1
 
