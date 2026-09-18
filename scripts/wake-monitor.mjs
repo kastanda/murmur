@@ -44,7 +44,9 @@ export const normalizeWakeConfig = (config = {}) => {
       cooldownMs: Number.isFinite(Number(dedup.cooldownMs)) ? Number(dedup.cooldownMs) : 300000,
     },
     loopBreaker: {
-      maxWakes: Number.isFinite(Number(loopBreaker.maxWakes)) ? Number(loopBreaker.maxWakes) : 5,
+      // Permit a normal autonomous dialogue while retaining a production safety
+      // ceiling. Deployments can tune the threshold explicitly.
+      maxWakes: Number.isFinite(Number(loopBreaker.maxWakes)) ? Number(loopBreaker.maxWakes) : 20,
       windowMs: Number.isFinite(Number(loopBreaker.windowMs)) ? Number(loopBreaker.windowMs) : 60000,
     },
   };
@@ -52,7 +54,7 @@ export const normalizeWakeConfig = (config = {}) => {
 
 export const createShellHook = ({ command, timeoutMs = 10000, baseEnv = process.env, log = () => {} }) => {
   if (!command) return null;
-  return (payload) => new Promise((resolve) => {
+  return (payload) => new Promise((resolve, reject) => {
     const env = {
       ...baseEnv,
       MURMUR_FROM: payload.from,
@@ -62,7 +64,11 @@ export const createShellHook = ({ command, timeoutMs = 10000, baseEnv = process.
       ...(payload.env || {}),
     };
     execFile("sh", ["-c", command], { env, timeout: timeoutMs }, (err) => {
-      if (err) log("warn", "wake hook failed", { error: err.message, msgId: payload.msgId });
+      if (err) {
+        log("warn", "wake hook failed", { error: err.message, msgId: payload.msgId });
+        reject(err);
+        return;
+      }
       resolve();
     });
   });
@@ -108,6 +114,11 @@ export class WakeMonitor {
     this.leaseGate = options.leaseGate || null;
     this.notify = options.notify || null;
     this.loadBacklogAfter = options.loadBacklogAfter || null;
+    this.dispatchStore = options.dispatchStore || null;
+    this.retry = {
+      maxDelayMs: options.retry?.maxDelayMs ?? 30000,
+      baseDelayMs: options.retry?.baseDelayMs ?? 1000,
+    };
     this.now = options.now || (() => Date.now());
     this.log = options.log || (() => {});
     this.seen = new Map();
@@ -121,6 +132,12 @@ export class WakeMonitor {
 
   async onInbound(payload) {
     if (!this.enabled) return;
+    if (this.dispatchStore) {
+      this.dispatchStore.enqueue(payload, this.now());
+      this.advanceCursor(payload);
+      await this.drain();
+      return;
+    }
     this.enqueue(payload);
     await this.drain();
   }
@@ -137,6 +154,14 @@ export class WakeMonitor {
     if (this.processing) return;
     this.processing = true;
     try {
+      if (this.dispatchStore) {
+        while (true) {
+          const dispatch = this.dispatchStore.claimDue(this.now());
+          if (!dispatch) break;
+          await this.processPayload(dispatch.payload, dispatch);
+        }
+        return;
+      }
       while (true) {
         while (this.queue.length > 0) {
           const payload = this.queue.shift();
@@ -154,33 +179,40 @@ export class WakeMonitor {
     }
   }
 
-  async processPayload(payload) {
+  async processPayload(payload, dispatch = null) {
     const key = this.keyFor(payload);
     const now = this.now();
-    this.pruneSeen(now);
-    const lastWakeAt = this.seen.get(key);
-    if (lastWakeAt !== undefined && now - lastWakeAt < this.cooldownMs) {
-      this.advanceCursor(payload);
-      this.log("info", "WakeMonitor duplicate dropped", { msgId: payload.msgId, conversationId: payload.conversationId });
-      return;
+    if (!dispatch) {
+      this.pruneSeen(now);
+      const lastWakeAt = this.seen.get(key);
+      if (lastWakeAt !== undefined && now - lastWakeAt < this.cooldownMs) {
+        this.advanceCursor(payload);
+        this.log("info", "WakeMonitor duplicate dropped", { msgId: payload.msgId, conversationId: payload.conversationId });
+        return;
+      }
+      this.seen.set(key, now);
     }
-
-    this.seen.set(key, now);
     if (await this.isLoopBreakerBlocked(payload, now)) {
-      this.advanceCursor(payload);
+      if (dispatch) {
+        const suspendedUntil = this.suspendedSenders.get(payload.from || "unknown") ?? now;
+        this.deferDispatch(dispatch, "loop-breaker-suppressed", now, suspendedUntil);
+      }
+      else this.advanceCursor(payload);
       return;
     }
 
     const verdict = await this.audit(payload);
     if (verdict === "deny") {
       this.log("warn", "WakeMonitor audit denied wake", { msgId: payload.msgId, conversationId: payload.conversationId, from: payload.from });
-      this.advanceCursor(payload);
+      if (dispatch) this.dispatchStore.reject(dispatch, "audit-denied", now);
+      else this.advanceCursor(payload);
       return;
     }
     if (verdict === "require_approval") {
-      await this.notify?.(payload, "require_approval");
+      await this.safeNotify(payload, "require_approval");
       this.log("warn", "WakeMonitor audit requires approval", { msgId: payload.msgId, conversationId: payload.conversationId, from: payload.from });
-      this.advanceCursor(payload);
+      if (dispatch) this.deferDispatch(dispatch, "audit-requires-approval", now);
+      else this.advanceCursor(payload);
       return;
     }
 
@@ -202,7 +234,8 @@ export class WakeMonitor {
           ownerSessionId: decision?.ownerSessionId ?? null,
           reason: decision?.reason ?? "non-owner",
         });
-        this.advanceCursor(payload);
+        if (dispatch) this.deferDispatch(dispatch, decision?.reason ?? "lease-deferred", now);
+        else this.advanceCursor(payload);
         return;
       }
       payload.leaseToken = decision.token ?? null;
@@ -211,19 +244,98 @@ export class WakeMonitor {
     try {
       const peer = this.peerFor(payload);
       if (peer.mode === "codex_app_server") {
+        if (dispatch && this.dispatchStore.beginHandoff(dispatch, now) !== 1) {
+          this.handleHandoffClaimLoss(dispatch, now, payload);
+          return;
+        }
         if (!this.injector) throw new Error(`wake-native-injector-missing:${payload.from}`);
         await this.injector(payload, peer);
         this.log("info", "WakeMonitor native wake completed", { msgId: payload.msgId, conversationId: payload.conversationId, mode: peer.mode });
-      } else {
-        if (this.hook) await this.hook(payload);
+      } else if (this.hook) {
+        if (dispatch && this.dispatchStore.beginHandoff(dispatch, now) !== 1) {
+          this.handleHandoffClaimLoss(dispatch, now, payload);
+          return;
+        }
+        await this.hook(payload);
         this.log("info", "WakeMonitor hook completed", { msgId: payload.msgId, conversationId: payload.conversationId });
+      } else {
+        // Stateless/pull agents consume the durable local inbox themselves. No active
+        // wake hook is required and, because no runtime call occurs, no delivery attempt
+        // is spent. `handed_off` here means handed to that local inbox boundary only.
+        this.log("info", "WakeMonitor stateless inbox handoff completed", {
+          msgId: payload.msgId,
+          conversationId: payload.conversationId,
+        });
       }
+      if (dispatch) this.dispatchStore.markHandedOff(dispatch, this.now());
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
       this.log("warn", "WakeMonitor hook error", { error: e.message, msgId: payload.msgId });
+      if (dispatch) await this.failDispatch(dispatch, e.message, this.now(), payload);
     } finally {
       this.advanceCursor(payload);
     }
+  }
+
+  retryDelay(attempts) {
+    return Math.min(this.retry.maxDelayMs, this.retry.baseDelayMs * (2 ** Math.max(0, attempts - 1)));
+  }
+
+  deferDispatch(dispatch, reason, now = this.now(), notBefore = now) {
+    const nextAttemptAt = Math.max(notBefore, now + this.retryDelay(dispatch.attempts));
+    this.dispatchStore.defer(dispatch, reason, nextAttemptAt, now);
+  }
+
+  handleHandoffClaimLoss(dispatch, now, payload) {
+    const reason = "wake-dispatch-handoff-claim-lost";
+    const nextAttemptAt = now + this.retryDelay(dispatch.attempts);
+    const rescheduled = this.dispatchStore.rescheduleAfterClaimLoss(dispatch, reason, nextAttemptAt, now);
+    this.log("error", "WakeMonitor handoff claim invariant failed", {
+      msgId: payload.msgId,
+      recipient: dispatch.recipientId,
+      memberSlot: dispatch.memberSlot,
+      rescheduled: rescheduled === 1,
+      nextAttemptAt,
+    });
+  }
+
+  async safeNotify(payload, reason, diagnostic = {}) {
+    try {
+      await this.notify?.(payload, reason);
+    } catch (err) {
+      this.log("error", "WakeMonitor notification failed", {
+        msgId: payload.msgId,
+        conversationId: payload.conversationId,
+        reason,
+        ...diagnostic,
+        notificationError: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  async failDispatch(dispatch, reason, now = this.now(), payload = dispatch.payload) {
+    const result = this.dispatchStore.fail(
+      dispatch,
+      reason,
+      now + this.retryDelay(dispatch.attempts + 1),
+      now,
+    );
+    if (!result.terminal) return;
+    const diagnostic = {
+      msgId: result.row.msgId,
+      recipient: result.row.recipientId,
+      memberSlot: result.row.memberSlot,
+      attempts: result.row.attempts,
+      lastError: result.row.lastError,
+      timestamp: new Date(now).toISOString(),
+      transitionReason: "delivery-attempt-budget-exhausted",
+    };
+    this.log("error", "WakeMonitor dispatch terminal failure", diagnostic);
+    await this.safeNotify(
+      { ...payload, dispatchDiagnostic: diagnostic },
+      "terminal",
+      diagnostic,
+    );
   }
 
   pruneSeen(now = this.now()) {
@@ -237,9 +349,8 @@ export class WakeMonitor {
     const suspendedUntil = this.suspendedSenders.get(sender);
     if (suspendedUntil !== undefined) {
       if (now < suspendedUntil) {
-        this.suspendedSenders.set(sender, now + this.loopBreaker.windowMs);
-        await this.notify?.(payload, "loop-breaker");
-        this.log("warn", "WakeMonitor loop-breaker suspended wake", { sender, msgId: payload.msgId, suspendedUntil: this.suspendedSenders.get(sender) });
+        await this.safeNotify(payload, "loop-breaker", { suspendedUntil });
+        this.log("warn", "WakeMonitor loop-breaker suspended wake", { sender, msgId: payload.msgId, suspendedUntil });
         return true;
       }
       this.suspendedSenders.delete(sender);
@@ -248,9 +359,10 @@ export class WakeMonitor {
     const since = now - this.loopBreaker.windowMs;
     const window = (this.senderWindows.get(sender) || []).filter((ts) => ts > since);
     if (window.length >= this.loopBreaker.maxWakes) {
-      this.suspendedSenders.set(sender, now + this.loopBreaker.windowMs);
+      const nextSuspendedUntil = now + this.loopBreaker.windowMs;
+      this.suspendedSenders.set(sender, nextSuspendedUntil);
       this.senderWindows.set(sender, window);
-      await this.notify?.(payload, "loop-breaker");
+      await this.safeNotify(payload, "loop-breaker", { suspendedUntil: nextSuspendedUntil });
       this.log("warn", "WakeMonitor loop-breaker tripped", { sender, count: window.length + 1, msgId: payload.msgId });
       return true;
     }

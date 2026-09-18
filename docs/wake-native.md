@@ -4,6 +4,33 @@ Murmur wakes agents on new messages using each CLI's **native** mechanism: no
 `tmux send-keys`, no OpenClaw bridge, no polling daemon. Human notification stays
 on the Telegram bot (`notify_queue`).
 
+## Durable Dispatch Guarantee
+
+The daemon records one wake dispatch per `(msgId, recipientId, memberSlot)` in
+SQLite before attempting an active runtime handoff. Claiming or deferring work does
+not consume the delivery-attempt budget; an attempt begins only immediately before
+the configured hook or native injector is called. Runtime failures use bounded
+backoff and become an operator-visible `terminal` dispatch after the configured
+attempt limit. A final audit `deny` is recorded as `rejected`, while approval
+pending, lease contention, and loop-breaker suppression remain `deferred`.
+
+`handed_off` means only that Murmur completed its current runtime boundary: either
+the active hook/injector returned successfully, or a pull-based stateless agent's
+message is durable in its local inbox. It does **not** mean the model processed the
+message or completed a turn. There is no processing receipt in Iteration 1.
+
+Dispatch deduplication prevents the same `msgId` from being handed to the same
+recipient/member slot twice after a durably recorded `handed_off`. The guarantee is
+otherwise **at least once**: if the daemon crashes after the runtime accepted a
+handoff but before `handed_off` is persisted, restart recovery retries it and the
+runtime may see the message again. A future runtime processing receipt is required
+to close that crash window.
+
+A `deferred` dispatch is retained for an unlimited time and does not consume the
+runtime-attempt budget. This is intentional safe retention for lease contention,
+approval waits, and temporary suppression. Stalled-defer observability and an
+optional expiry policy are deferred to Iteration 2.
+
 ## Claude Code - `asyncRewake` Hook
 
 `scripts/wake-drain-claude.sh` reads new inbound messages from the daemon's

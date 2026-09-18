@@ -18,6 +18,7 @@ import { NotifyQueue, flushNotifyQueue, normalizeNotifyTargets } from "./notify-
 import { createChannelThreadStartBindingResolver, createCodexAppServerInjector } from "./codex-app-server-wake.mjs";
 import { startJetStreamAdvisoryDlqIfEnabled } from "./murmur-jetstream-advisory.mjs";
 import { WakeMonitor, createAuditShellHook, createShellHook, normalizeWakeConfig } from "./wake-monitor.mjs";
+import { WakeDispatchStore } from "./wake-dispatch-store.mjs";
 import { SessionLeaseStore, createNativeLeaseGate } from "./lease.mjs";
 import { ensurePrivateDirectory, readPrivateJson, setPrivateUmask } from "./secure-state.mjs";
 // vault-guard: optional content policy hook (not included in OSS release)
@@ -105,7 +106,20 @@ const envTelegramFallback = (() => {
 const effectiveNotifyTargets = notifyTargets.length > 0 ? notifyTargets : envTelegramFallback;
 const notifyQueue = new NotifyQueue(dbPath);
 const wakeDb = new DatabaseSync(dbPath);
+const wakeDispatchStore = new WakeDispatchStore(dbPath, {
+  maxAttempts: Number(process.env.MURMUR_WAKE_MAX_ATTEMPTS) || 5,
+  recipientId: agentId,
+});
+// This process is the sole owner of its local dispatch ledger. On process start,
+// any claimed row belongs to the previous daemon generation and is recoverable
+// immediately. Operators may set a positive grace when deliberately overlapping
+// daemon generations during a supervised handoff.
+const wakeClaimTtlMs = Number(process.env.MURMUR_WAKE_CLAIM_TTL_MS) || 0;
+const recoveredWakeClaims = wakeDispatchStore.recoverStaleClaims({ claimTtlMs: wakeClaimTtlMs });
+const backfilledWakeDispatches = wakeDispatchStore.backfillMissingInbound();
 const wakeConfig = normalizeWakeConfig(config);
+if (recoveredWakeClaims > 0) log("warn", "Recovered stale wake dispatch claims", { count: recoveredWakeClaims });
+if (backfilledWakeDispatches > 0) log("warn", "Recovered inbound messages missing wake dispatch state", { count: backfilledWakeDispatches });
 
 log("info", "Daemon starting", {
   agentId,
@@ -223,6 +237,11 @@ const wakeMonitor = new WakeMonitor({
   ...wakeConfig,
   initialCursor: inboundCursor(),
   loadBacklogAfter: loadInboundAfter,
+  dispatchStore: wakeDispatchStore,
+  retry: {
+    baseDelayMs: Number(process.env.MURMUR_WAKE_RETRY_BASE_MS) || 1000,
+    maxDelayMs: Number(process.env.MURMUR_WAKE_RETRY_MAX_MS) || 30000,
+  },
   leaseGate: nativeLeaseGate,
   auditHook: createAuditShellHook({ command: wakeConfig.auditHook, log }),
   hook: createShellHook({ command: config.onReceive, log }),
@@ -313,6 +332,12 @@ let running = true;
 
 const flushLoop = async () => {
   while (running) {
+    try {
+      await wakeMonitor.drain();
+    } catch (err) {
+      log("error", "Wake dispatch retry error", { error: err.message });
+    }
+
     try {
       await broker.flushOutbox({ outbox: store, maxAttempts: 5, ackTimeoutMs, ackWindow });
     } catch (err) {
