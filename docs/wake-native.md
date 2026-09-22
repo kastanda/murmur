@@ -68,8 +68,9 @@ Drain semantics:
 - One cursor per session, so a message wakes **every** live session rather than only
   whichever one reached the hook first. Within a session the hook and the cold-idle
   watcher share the key, so it still wakes exactly once.
-- The first run in a new session seeds the cursor to the current tip and stays silent:
-  without that, a fresh session would replay the whole inbound history as "new".
+- The first run in a new session seeds the cursor to the current tip without replaying
+  history. The Node default/poll mode then remains armed for future messages; `--once`
+  seeds and returns silently.
 - The cursor advances to the last **reported** `rowid`, never to the table's tip: a row
   inserted mid-drain would otherwise be stepped over and never wake anyone.
 - Cursor writes use a temporary file plus rename where the filesystem allows it.

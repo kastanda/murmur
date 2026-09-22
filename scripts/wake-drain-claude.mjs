@@ -197,6 +197,8 @@ async function main() {
   try { statSync(DB); } catch (err) { bail("store not readable", err); }
 
   // First run ever: establish a baseline at the current tip, do not dump history.
+  // A one-shot invocation is done after seeding, but the default Stop-hook poller
+  // must remain armed for messages that arrive after the session becomes idle.
   let cursorExists = true;
   try { statSync(CURSOR); } catch { cursorExists = false; }
   if (!cursorExists) {
@@ -204,7 +206,7 @@ async function main() {
     const tip = maxInbound(db);
     db.close();
     writeCursor(tip);
-    process.exit(0);
+    if (ONCE) process.exit(0);
   }
 
   if (ONCE) {
