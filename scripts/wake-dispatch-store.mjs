@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import { ProcessingReceiptStore } from "./processing-receipt-store.mjs";
 
 export const WAKE_DISPATCH_STATES = Object.freeze({
   pending: "pending",
@@ -63,6 +64,7 @@ export class WakeDispatchStore {
         .some((column) => column.name === "recipient_id");
       if (legacySchema) this.migrateLegacySchema();
       else this.db.exec(DDL);
+      this.processingReceipts = new ProcessingReceiptStore(this.db);
       if (!hadDispatchTable) this.seedMigrationBaseline();
     } catch (err) {
       this.db.close();
@@ -135,16 +137,111 @@ export class WakeDispatchStore {
     }
   }
 
-  beginHandoff(identity, now = Date.now()) {
+  beginHandoff(identity, now = Date.now(), attempt = null) {
     const key = this.requireTransitionIdentity(identity);
-    const result = this.db.prepare(`
-      UPDATE wake_dispatch
-      SET state = 'dispatched', attempts = attempts + 1,
-          updated_at = ?, claimed_at = ?
-      WHERE msg_id = ? AND recipient_id = ? AND member_slot = ?
-        AND state = 'claimed' AND attempts < max_attempts
-    `).run(now, now, key.msgId, key.recipientId, key.memberSlot);
-    return Number(result.changes);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.db.prepare(`
+        UPDATE wake_dispatch
+        SET state = 'dispatched', attempts = attempts + 1,
+            updated_at = ?, claimed_at = ?
+        WHERE msg_id = ? AND recipient_id = ? AND member_slot = ?
+          AND state = 'claimed' AND attempts < max_attempts
+      `).run(now, now, key.msgId, key.recipientId, key.memberSlot);
+      if (Number(result.changes) === 1 && attempt) {
+        this.processingReceipts.createAttempt({
+          ...attempt,
+          inboundMessageId: key.msgId,
+          recipientId: key.recipientId,
+          memberSlot: key.memberSlot,
+        }, now);
+      }
+      this.db.exec("COMMIT");
+      return Number(result.changes);
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  recordProcessingReceipt(receipt, now = Date.now()) {
+    return this.processingReceipts.record(receipt, now);
+  }
+
+  getProcessingAttempt(attemptId) {
+    return this.processingReceipts.get(attemptId);
+  }
+
+  latestProcessingAttempt(identity) {
+    return this.processingReceipts.latestForDispatch(this.normalizeIdentity(identity));
+  }
+
+  listProcessingAttempts(identity) {
+    return this.processingReceipts.listForDispatch(this.normalizeIdentity(identity));
+  }
+
+  reconcileProcessingAttempts({ now = Date.now(), startedTtlMs = 300_000, retryAt = now } = {}) {
+    const diagnostics = [];
+    const rows = this.db.prepare(`
+      SELECT d.msg_id, d.recipient_id, d.member_slot, d.state,
+             p.attempt_id, p.status, p.started_at, p.last_error
+      FROM wake_dispatch d
+      JOIN processing_attempts p ON p.attempt_id = (
+        SELECT p2.attempt_id FROM processing_attempts p2
+        WHERE p2.inbound_message_id = d.msg_id
+          AND p2.recipient_id = d.recipient_id
+          AND p2.member_slot = d.member_slot
+        ORDER BY p2.created_at DESC, p2.rowid DESC LIMIT 1
+      )
+      WHERE d.state IN ('claimed', 'dispatched', 'failed', 'deferred')
+    `).all();
+    for (const row of rows) {
+      const identity = { msgId: row.msg_id, recipientId: row.recipient_id, memberSlot: row.member_slot };
+      if (row.status === "completed") {
+        const result = this.db.prepare(`
+          UPDATE wake_dispatch SET state = 'handed_off', handed_off_at = COALESCE(handed_off_at, ?),
+            claimed_at = NULL, last_error = NULL, updated_at = ?
+          WHERE msg_id = ? AND recipient_id = ? AND member_slot = ?
+            AND state IN ('claimed', 'dispatched', 'failed', 'deferred')
+        `).run(now, now, identity.msgId, identity.recipientId, identity.memberSlot);
+        if (Number(result.changes) === 1) {
+          diagnostics.push({ type: "completed-skip-replay", identity, attemptId: row.attempt_id });
+        }
+      } else if (row.status === "started" && row.started_at != null && now - Number(row.started_at) < startedTtlMs) {
+        this.db.prepare(`
+          UPDATE wake_dispatch SET state = 'dispatched', claimed_at = ?, updated_at = ?
+          WHERE msg_id = ? AND recipient_id = ? AND member_slot = ?
+            AND state IN ('claimed', 'failed', 'deferred')
+        `).run(row.started_at, now, identity.msgId, identity.recipientId, identity.memberSlot);
+        diagnostics.push({ type: "started-in-flight", identity, attemptId: row.attempt_id });
+      } else if (row.status === "started") {
+        const receipt = this.processingReceipts.record({
+          ...identity,
+          inboundMessageId: identity.msgId,
+          attemptId: row.attempt_id,
+          status: "failed",
+          errorMessage: "processing-started-receipt-expired",
+        }, now);
+        const result = this.db.prepare(`
+          UPDATE wake_dispatch SET state = CASE WHEN attempts >= max_attempts THEN 'terminal' ELSE 'failed' END,
+            next_attempt_at = ?, claimed_at = NULL, last_error = ?, updated_at = ?
+          WHERE msg_id = ? AND recipient_id = ? AND member_slot = ? AND state IN ('claimed', 'dispatched')
+        `).run(retryAt, "processing-started-receipt-expired", now, identity.msgId, identity.recipientId, identity.memberSlot);
+        if (!receipt.duplicate || Number(result.changes) === 1) {
+          diagnostics.push({ type: "started-expired", identity, attemptId: row.attempt_id });
+        }
+      } else if (row.status === "failed") {
+        const result = this.db.prepare(`
+          UPDATE wake_dispatch SET state = CASE WHEN attempts >= max_attempts THEN 'terminal' ELSE 'failed' END,
+            next_attempt_at = ?, claimed_at = NULL, last_error = ?, updated_at = ?
+          WHERE msg_id = ? AND recipient_id = ? AND member_slot = ? AND state IN ('claimed', 'dispatched')
+        `).run(retryAt, row.last_error || "runtime-processing-failed", now, identity.msgId, identity.recipientId, identity.memberSlot);
+        if (Number(result.changes) === 1) {
+          diagnostics.push({ type: "processing-failed", identity, attemptId: row.attempt_id });
+        }
+      }
+    }
+    return diagnostics;
   }
 
   markHandedOff(identity, now = Date.now()) {
@@ -157,6 +254,38 @@ export class WakeDispatchStore {
         AND state IN ('claimed', 'dispatched')
     `).run(now, now, key.msgId, key.recipientId, key.memberSlot);
     return Number(result.changes);
+  }
+
+  markHandedOffIfLatestAttemptCompleted(identity, attemptId, now = Date.now()) {
+    const key = this.requireTransitionIdentity(identity);
+    if (typeof attemptId !== "string" || !attemptId) return 0;
+    const completed = this.db.prepare(`
+      SELECT 1 FROM processing_attempts p
+      WHERE p.attempt_id = ? AND p.status = 'completed'
+        AND p.inbound_message_id = ? AND p.recipient_id = ? AND p.member_slot = ?
+        AND p.attempt_id = (
+          SELECT p2.attempt_id FROM processing_attempts p2
+          WHERE p2.inbound_message_id = ? AND p2.recipient_id = ? AND p2.member_slot = ?
+          ORDER BY p2.created_at DESC, p2.rowid DESC LIMIT 1
+        )
+    `).get(
+      attemptId,
+      key.msgId,
+      key.recipientId,
+      key.memberSlot,
+      key.msgId,
+      key.recipientId,
+      key.memberSlot,
+    );
+    if (!completed) return 0;
+    this.db.prepare(`
+      UPDATE wake_dispatch
+      SET state = 'handed_off', updated_at = ?, handed_off_at = COALESCE(handed_off_at, ?),
+          claimed_at = NULL, last_error = NULL
+      WHERE msg_id = ? AND recipient_id = ? AND member_slot = ?
+        AND state IN ('claimed', 'dispatched', 'failed', 'deferred')
+    `).run(now, now, key.msgId, key.recipientId, key.memberSlot);
+    return 1;
   }
 
   defer(identity, reason, nextAttemptAt, now = Date.now()) {
@@ -218,7 +347,7 @@ export class WakeDispatchStore {
     return Number(result.changes);
   }
 
-  recoverStaleClaims({ now = Date.now(), claimTtlMs = 60_000, retryAt = now } = {}) {
+  recoverStaleClaims({ now = Date.now(), claimTtlMs = 60_000, processingStartedTtlMs = 300_000, retryAt = now } = {}) {
     const result = this.db.prepare(`
       UPDATE wake_dispatch
       SET state = CASE
@@ -234,7 +363,23 @@ export class WakeDispatchStore {
           updated_at = ?
       WHERE state IN ('claimed', 'dispatched')
         AND claimed_at IS NOT NULL AND (? - claimed_at) >= ?
-    `).run(retryAt, now, now, claimTtlMs);
+        AND NOT EXISTS (
+          SELECT 1 FROM processing_attempts p
+          WHERE p.inbound_message_id = wake_dispatch.msg_id
+            AND p.recipient_id = wake_dispatch.recipient_id
+            AND p.member_slot = wake_dispatch.member_slot
+            AND p.status = 'started'
+            AND p.started_at IS NOT NULL
+            AND (? - p.started_at) < ?
+            AND p.attempt_id = (
+              SELECT p2.attempt_id FROM processing_attempts p2
+              WHERE p2.inbound_message_id = wake_dispatch.msg_id
+                AND p2.recipient_id = wake_dispatch.recipient_id
+                AND p2.member_slot = wake_dispatch.member_slot
+              ORDER BY p2.created_at DESC, p2.rowid DESC LIMIT 1
+            )
+        )
+    `).run(retryAt, now, now, claimTtlMs, now, processingStartedTtlMs);
     return Number(result.changes);
   }
 

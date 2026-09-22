@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { SQLiteDedupeOutboxStore } from "../packages/core/dist/src/index.js";
 import { createKeyPair, createSigningKeyPair } from "../packages/security/dist/src/index.js";
+import { WakeDispatchStore } from "../scripts/wake-dispatch-store.mjs";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const script = path.join(repoRoot, "scripts", "murmur-shell-send.mjs");
@@ -92,4 +93,49 @@ test("LLM reply hook fails closed when MURMUR_MSG_ID is missing", () => {
   });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /Missing MURMUR_MSG_ID; refusing to send an uncorrelated reply/);
+});
+
+test("LLM hook durably records model setup failure for its exact attempt", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "murmur-llm-receipt-"));
+  const dbPath = path.join(dir, "murmur.db");
+  const store = new WakeDispatchStore(dbPath, { recipientId: "agent-a" });
+  const inbound = {
+    from: "agent-b",
+    text: "reply needed",
+    msgId: "msg-llm-1",
+    conversationId: "conv-llm",
+    recipientAgentId: "agent-a",
+  };
+  store.enqueue(inbound, 1000);
+  const dispatch = store.claimDue(1000);
+  const attempt = { attemptId: "attempt-llm-1", runtime: "llm-hook", capability: "completed" };
+  store.beginHandoff(dispatch, 1000, attempt);
+  try {
+    const result = spawnSync(process.execPath, [path.join(repoRoot, "scripts", "on-receive-llm.mjs")], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        LLM_API_KEY: "",
+        OPENAI_API_KEY: "",
+        MURMUR_TEXT: inbound.text,
+        MURMUR_FROM: inbound.from,
+        MURMUR_MSG_ID: inbound.msgId,
+        MURMUR_CONVERSATION_ID: inbound.conversationId,
+        MURMUR_PROCESSING_ATTEMPT_ID: attempt.attemptId,
+        MURMUR_PROCESSING_RECIPIENT_ID: dispatch.recipientId,
+        MURMUR_PROCESSING_MEMBER_SLOT: dispatch.memberSlot,
+        MURMUR_PROCESSING_RUNTIME: attempt.runtime,
+        MURMUR_STORE_PATH: dbPath,
+        DATA_DIR: dir,
+      },
+      encoding: "utf8",
+    });
+    assert.notEqual(result.status, 0);
+    const receipt = store.getProcessingAttempt(attempt.attemptId);
+    assert.equal(receipt.status, "failed");
+    assert.equal(receipt.lastError, "llm-api-key-missing");
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

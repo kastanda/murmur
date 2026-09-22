@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 
 const ensureObject = (value) => (value && typeof value === "object" ? value : {});
 const validMode = (mode) => mode === "stateless" || mode === "codex_app_server";
@@ -52,9 +53,9 @@ export const normalizeWakeConfig = (config = {}) => {
   };
 };
 
-export const createShellHook = ({ command, timeoutMs = 10000, baseEnv = process.env, log = () => {} }) => {
+export const createShellHook = ({ command, timeoutMs = 10000, baseEnv = process.env, log = () => {}, processingReceipts = "none", storePath = null }) => {
   if (!command) return null;
-  return (payload) => new Promise((resolve, reject) => {
+  const hook = (payload, attempt = null) => new Promise((resolve, reject) => {
     const env = {
       ...baseEnv,
       MURMUR_FROM: payload.from,
@@ -63,6 +64,14 @@ export const createShellHook = ({ command, timeoutMs = 10000, baseEnv = process.
       MURMUR_REPLY_TO_MESSAGE_ID: payload.msgId,
       MURMUR_INBOUND_REPLY_TO_MESSAGE_ID: payload.replyToMessageId || "",
       MURMUR_CONVERSATION_ID: payload.conversationId,
+      ...(attempt ? {
+        MURMUR_PROCESSING_ATTEMPT_ID: attempt.attemptId,
+        MURMUR_PROCESSING_RECIPIENT_ID: attempt.recipientId,
+        MURMUR_PROCESSING_MEMBER_SLOT: attempt.memberSlot,
+        MURMUR_PROCESSING_RUNTIME: attempt.runtime,
+        MURMUR_PROCESSING_RECEIPT_CAPABILITY: attempt.capability,
+        MURMUR_STORE_PATH: storePath || baseEnv.MURMUR_STORE_PATH || "",
+      } : {}),
       ...(payload.env || {}),
     };
     execFile("sh", ["-c", command], { env, timeout: timeoutMs }, (err) => {
@@ -74,6 +83,9 @@ export const createShellHook = ({ command, timeoutMs = 10000, baseEnv = process.
       resolve();
     });
   });
+  hook.processingReceipts = processingReceipts;
+  hook.runtime = processingReceipts === "completed" ? "llm-hook" : "shell-hook";
+  return hook;
 };
 
 export const createAuditShellHook = ({ command, timeoutMs = 10000, baseEnv = process.env, log = () => {} }) => {
@@ -122,6 +134,7 @@ export class WakeMonitor {
       maxDelayMs: options.retry?.maxDelayMs ?? 30000,
       baseDelayMs: options.retry?.baseDelayMs ?? 1000,
     };
+    this.processingStartedTtlMs = options.processingStartedTtlMs ?? 300_000;
     this.now = options.now || (() => Date.now());
     this.log = options.log || (() => {});
     this.seen = new Map();
@@ -180,6 +193,26 @@ export class WakeMonitor {
     } finally {
       this.processing = false;
     }
+  }
+
+  reconcileProcessingAttempts() {
+    if (!this.dispatchStore) return [];
+    const now = this.now();
+    const diagnostics = this.dispatchStore.reconcileProcessingAttempts({
+      now,
+      startedTtlMs: this.processingStartedTtlMs,
+      retryAt: now,
+    });
+    for (const diagnostic of diagnostics) {
+      if (diagnostic.type === "completed-skip-replay") {
+        this.log("info", "WakeMonitor skipped replay because processing completed", diagnostic);
+      } else if (diagnostic.type === "started-expired") {
+        this.log("warn", "WakeMonitor processing started receipt expired", diagnostic);
+      } else if (diagnostic.type === "processing-failed") {
+        this.log("warn", "WakeMonitor recovered failed processing attempt", diagnostic);
+      }
+    }
+    return diagnostics;
   }
 
   async processPayload(payload, dispatch = null) {
@@ -244,22 +277,27 @@ export class WakeMonitor {
       payload.leaseToken = decision.token ?? null;
     }
 
+    let processingAttempt = null;
     try {
       const peer = this.peerFor(payload);
       if (peer.mode === "codex_app_server") {
-        if (dispatch && this.dispatchStore.beginHandoff(dispatch, now) !== 1) {
+        processingAttempt = dispatch ? this.createProcessingAttempt(dispatch, "codex-app-server", "completed") : null;
+        if (dispatch && this.dispatchStore.beginHandoff(dispatch, now, processingAttempt) !== 1) {
           this.handleHandoffClaimLoss(dispatch, now, payload);
           return;
         }
         if (!this.injector) throw new Error(`wake-native-injector-missing:${payload.from}`);
-        await this.injector(payload, peer);
+        await this.injector(payload, peer, this.processingContext(processingAttempt));
         this.log("info", "WakeMonitor native wake completed", { msgId: payload.msgId, conversationId: payload.conversationId, mode: peer.mode });
       } else if (this.hook) {
-        if (dispatch && this.dispatchStore.beginHandoff(dispatch, now) !== 1) {
+        processingAttempt = dispatch
+          ? this.createProcessingAttempt(dispatch, this.hook.runtime || "shell-hook", this.hook.processingReceipts || "none")
+          : null;
+        if (dispatch && this.dispatchStore.beginHandoff(dispatch, now, processingAttempt) !== 1) {
           this.handleHandoffClaimLoss(dispatch, now, payload);
           return;
         }
-        await this.hook(payload);
+        await this.hook(payload, processingAttempt);
         this.log("info", "WakeMonitor hook completed", { msgId: payload.msgId, conversationId: payload.conversationId });
       } else {
         // Stateless/pull agents consume the durable local inbox themselves. No active
@@ -274,10 +312,69 @@ export class WakeMonitor {
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
       this.log("warn", "WakeMonitor hook error", { error: e.message, msgId: payload.msgId });
-      if (dispatch) await this.failDispatch(dispatch, e.message, this.now(), payload);
+      if (dispatch) {
+        const completedWon = processingAttempt
+          ? this.dispatchStore.markHandedOffIfLatestAttemptCompleted(dispatch, processingAttempt.attemptId, this.now()) === 1
+          : false;
+        if (completedWon) {
+          this.log("error", "WakeMonitor post-completion hook failure", {
+            error: e.message,
+            msgId: payload.msgId,
+            attemptId: processingAttempt.attemptId,
+            runtime: processingAttempt.runtime,
+          });
+          return;
+        }
+        const attempt = processingAttempt
+          ? this.dispatchStore.getProcessingAttempt(processingAttempt.attemptId)
+          : this.dispatchStore.latestProcessingAttempt(dispatch);
+        if (attempt?.capability !== "none" && attempt?.status !== "completed") {
+          this.recordProcessingReceipt(attempt, "failed", { errorMessage: e.message });
+        }
+        await this.failDispatch(dispatch, e.message, this.now(), payload);
+      }
     } finally {
       this.advanceCursor(payload);
     }
+  }
+
+  createProcessingAttempt(dispatch, runtime, capability) {
+    return {
+      attemptId: randomUUID(),
+      inboundMessageId: dispatch.msgId,
+      recipientId: dispatch.recipientId,
+      memberSlot: dispatch.memberSlot,
+      runtime,
+      capability,
+    };
+  }
+
+  processingContext(attempt) {
+    if (!attempt) return null;
+    return {
+      ...attempt,
+      started: (details = {}) => this.recordProcessingReceipt(attempt, "started", details),
+      completed: (details = {}) => this.recordProcessingReceipt(attempt, "completed", details),
+      failed: (details = {}) => this.recordProcessingReceipt(attempt, "failed", details),
+    };
+  }
+
+  recordProcessingReceipt(attempt, status, details = {}) {
+    if (!attempt || !this.dispatchStore) return { accepted: false, reason: "receipt-store-unavailable" };
+    const result = this.dispatchStore.recordProcessingReceipt({ ...attempt, ...details, status }, this.now());
+    const diagnostic = {
+      msgId: attempt.inboundMessageId,
+      recipientId: attempt.recipientId,
+      memberSlot: attempt.memberSlot,
+      attemptId: attempt.attemptId,
+      runtime: attempt.runtime,
+      status,
+      reason: result.reason ?? null,
+    };
+    if (result.conflict) this.log("error", "WakeMonitor conflicting processing receipt", diagnostic);
+    else if (!result.accepted) this.log("warn", "WakeMonitor stale or unknown processing receipt", diagnostic);
+    else if (!result.duplicate) this.log("info", `WakeMonitor processing ${status}`, diagnostic);
+    return result;
   }
 
   retryDelay(attempts) {

@@ -17,14 +17,16 @@ pending, lease contention, and loop-breaker suppression remain `deferred`.
 `handed_off` means only that Murmur completed its current runtime boundary: either
 the active hook/injector returned successfully, or a pull-based stateless agent's
 message is durable in its local inbox. It does **not** mean the model processed the
-message or completed a turn. There is no processing receipt in Iteration 1.
+message or completed a turn. Runtime processing is tracked separately where the
+runtime can provide trustworthy lifecycle events; see
+[`processing-receipts.md`](processing-receipts.md).
 
 Dispatch deduplication prevents the same `msgId` from being handed to the same
 recipient/member slot twice after a durably recorded `handed_off`. The guarantee is
-otherwise **at least once**: if the daemon crashes after the runtime accepted a
-handoff but before `handed_off` is persisted, restart recovery retries it and the
-runtime may see the message again. A future runtime processing receipt is required
-to close that crash window.
+otherwise **at least once**. A durable `completed` processing receipt suppresses a
+replay if the daemon crashes before `handed_off` is persisted. Without that receipt,
+or for runtimes that cannot report completion, restart recovery still retries and
+the runtime may see the message again.
 
 A `deferred` dispatch is retained for an unlimited time and does not consume the
 runtime-attempt budget. This is intentional safe retention for lease contention,

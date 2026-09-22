@@ -4,16 +4,18 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { once } from "node:events";
+import { EventEmitter, once } from "node:events";
 import { WebSocketServer } from "ws";
 import { ChannelRosterStore } from "../packages/core/dist/src/index.js";
 import { WakeMonitor, normalizeWakeConfig } from "../scripts/wake-monitor.mjs";
+import { WakeDispatchStore } from "../scripts/wake-dispatch-store.mjs";
 import {
   buildCodexTurnText,
   buildThreadStartParams,
   buildTurnStartRequest,
   CodexAppServerClient,
   createChannelThreadStartBindingResolver,
+  createCodexAppServerDaemonInjector,
   createCodexAppServerInjector,
   readFinalAnswerFromSessionLog,
 } from "../scripts/codex-app-server-wake.mjs";
@@ -340,6 +342,50 @@ test("readFinalAnswerFromSessionLog reads task_complete by turn id", () => {
   assert.equal(readFinalAnswerFromSessionLog(sessionPath, "turn-target"), "WAKE_OK");
 });
 
+const protocolWebSocket = (turnStatus = "completed") => class FakeWebSocket extends EventEmitter {
+  constructor() {
+    super();
+    queueMicrotask(() => this.emit("open"));
+  }
+
+  send(raw) {
+    const request = JSON.parse(raw);
+    const emit = (message) => this.emit("message", Buffer.from(JSON.stringify(message)));
+    if (request.method === "initialize") {
+      queueMicrotask(() => emit({ id: request.id, result: { protocolVersion: "0.1.0" } }));
+    } else if (request.method === "turn/start") {
+      queueMicrotask(() => {
+        emit({ id: request.id, result: { turn: { id: "turn-protocol" } } });
+        emit({ method: "turn/started", params: { turn: { id: "turn-protocol", status: "inProgress" } } });
+        emit({ method: "item/completed", params: { turnId: "turn-protocol", item: { type: "agentMessage", phase: "final_answer", text: "final" } } });
+        emit({ method: "turn/completed", params: { turn: { id: "turn-protocol", status: turnStatus, ...(turnStatus === "completed" ? {} : { error: { message: "model failed" } }) } } });
+      });
+    }
+  }
+
+  close() {}
+};
+
+test("Codex protocol fixture maps turn/started and turn/completed to trustworthy lifecycle points", async () => {
+  const started = [];
+  const client = new CodexAppServerClient({ socketPath: "/fake/codex.sock", WebSocketImpl: protocolWebSocket() });
+  const result = await client.startTurnAndWaitForFinal({ threadId: "thread-1", input: [] }, {
+    onStarted: ({ turnId }) => started.push(turnId),
+  });
+  assert.deepEqual(started, ["turn-protocol"]);
+  assert.equal(result.turnId, "turn-protocol");
+  assert.equal(result.finalText, "final");
+  assert.equal(result.source, "app-server-events");
+});
+
+test("Codex protocol fixture treats a failed terminal turn as processing failure", async () => {
+  const client = new CodexAppServerClient({ socketPath: "/fake/codex.sock", WebSocketImpl: protocolWebSocket("failed") });
+  await assert.rejects(
+    () => client.startTurnAndWaitForFinal({ threadId: "thread-1", input: [] }),
+    /codex-app-server-turn-failed:model failed/,
+  );
+});
+
 test("WakeMonitor gates Codex app-server wake before injector", async () => {
   const injected = [];
   let now = 1000;
@@ -509,4 +555,125 @@ test("Codex app-server injector fails loud without socket", async () => {
   const injector = createCodexAppServerInjector();
 
   await assert.rejects(() => injector(payload, { mode: "codex_app_server", threadId: "thread-1" }), /socket-missing/);
+});
+
+test("Codex app-server processing receipts follow turn/started then final completion", async () => {
+  const events = [];
+  let metadata = null;
+  class FakeClient {
+    async request(method) {
+      if (method === "thread/start") return { thread: { id: "thread-receipt", path: null } };
+      return {};
+    }
+
+    async startTurnAndWaitForFinal(params, options) {
+      metadata = params.responsesapiClientMetadata;
+      options.onStarted({ turnId: "turn-receipt" });
+      return { turnId: "turn-receipt", finalText: "done", source: "app-server-events" };
+    }
+  }
+  const injector = createCodexAppServerInjector({ Client: FakeClient });
+  await injector(payload, { socketPath: "/tmp/codex.sock", resume: false }, {
+    attemptId: "attempt-codex-1",
+    started: ({ sessionId }) => events.push(["started", sessionId]),
+    completed: ({ sessionId }) => events.push(["completed", sessionId]),
+  });
+  assert.deepEqual(events, [["started", "turn-receipt"], ["completed", "turn-receipt"]]);
+  assert.equal(metadata.murmur_processing_attempt_id, "attempt-codex-1");
+});
+
+test("daemon Codex wrappers forward one processing attempt through started and completed", async () => {
+  const observed = [];
+  class FakeClient {
+    async request(method) {
+      if (method === "thread/start") return { thread: { id: "thread-daemon-wrapper", path: null } };
+      return {};
+    }
+
+    async startTurnAndWaitForFinal(params, options) {
+      const attemptId = params.responsesapiClientMetadata.murmur_processing_attempt_id;
+      observed.push({ event: "turn/started", attemptId });
+      options.onStarted({ turnId: "turn-daemon-wrapper" });
+      observed.push({ event: "turn/completed", attemptId });
+      return { turnId: "turn-daemon-wrapper", finalText: "done", source: "app-server-events" };
+    }
+  }
+  const daemonInjector = createCodexAppServerDaemonInjector(
+    createCodexAppServerInjector({ Client: FakeClient }),
+  );
+
+  for (const wrapperPath of ["primary", "proxy"]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `murmur-codex-${wrapperPath}-`));
+    const store = new WakeDispatchStore(path.join(dir, "murmur.db"));
+    const item = { ...payload, msgId: `${payload.msgId}-${wrapperPath}` };
+    const monitor = new WakeMonitor({
+      dispatchStore: store,
+      peers: {
+        "agent-jarvis": {
+          mode: "codex_app_server",
+          socketPath: "/tmp/codex.sock",
+          resume: false,
+        },
+      },
+      injector: daemonInjector,
+      now: () => 1000,
+    });
+    try {
+      await monitor.onInbound(item);
+      const dispatch = store.get(item.msgId);
+      const attempt = store.latestProcessingAttempt(dispatch);
+      const pathEvents = observed.slice(-2);
+      assert.equal(attempt.status, "completed");
+      assert.equal(attempt.sessionId, "turn-daemon-wrapper");
+      assert.equal(dispatch.state, "handed_off");
+      assert.equal(dispatch.attempts, 1);
+      assert.deepEqual(pathEvents.map((event) => event.event), ["turn/started", "turn/completed"]);
+      assert.equal(pathEvents[0].attemptId, attempt.attemptId);
+      assert.equal(pathEvents[1].attemptId, attempt.attemptId);
+    } finally {
+      store.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("daemon Codex wrapper preserves legacy calls without processing context", async () => {
+  let receivedProcessing = "not-called";
+  const daemonInjector = createCodexAppServerDaemonInjector(async (_payload, _peer, processing) => {
+    receivedProcessing = processing;
+    return { turn: { id: "legacy-turn" } };
+  });
+  const result = await daemonInjector(payload, { mode: "codex_app_server" });
+  assert.deepEqual(result, { turn: { id: "legacy-turn" } });
+  assert.equal(receivedProcessing, null);
+});
+
+test("Codex app-server runtime failure records a failed processing attempt", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "murmur-codex-receipt-"));
+  const store = new WakeDispatchStore(path.join(dir, "murmur.db"));
+  class FakeClient {
+    async request() { return {}; }
+    async startTurnAndWaitForFinal(_params, options) {
+      options.onStarted({ turnId: "turn-failed" });
+      throw new Error("codex-turn-failed");
+    }
+  }
+  const monitor = new WakeMonitor({
+    dispatchStore: store,
+    peers: { "agent-jarvis": { mode: "codex_app_server", socketPath: "/tmp/codex.sock", threadId: "thread-1", resume: false } },
+    injector: createCodexAppServerInjector({ Client: FakeClient }),
+    now: () => 1000,
+  });
+  try {
+    await monitor.onInbound(payload);
+    const dispatch = store.get(payload.msgId);
+    const attempt = store.latestProcessingAttempt(dispatch);
+    assert.equal(attempt.status, "failed");
+    assert.equal(attempt.sessionId, "turn-failed");
+    assert.equal(attempt.lastError, "codex-turn-failed");
+    assert.equal(dispatch.state, "failed");
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

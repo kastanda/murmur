@@ -268,6 +268,7 @@ export class CodexAppServerClient {
   startTurnAndWaitForFinal(params, {
     completionTimeoutMs = DEFAULT_TURN_COMPLETION_TIMEOUT_MS,
     sessionPath = null,
+    onStarted = null,
   } = {}) {
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -374,6 +375,12 @@ export class CodexAppServerClient {
 
         if (message.method === "turn/started" && message.params?.turn?.id) {
           turnId = turnId || message.params.turn.id;
+          try {
+            onStarted?.({ turnId });
+          } catch (err) {
+            const e = err instanceof Error ? err : new Error(String(err));
+            finish(new Error(`codex-processing-started-receipt-failed:${e.message}`));
+          }
           return;
         }
 
@@ -383,7 +390,6 @@ export class CodexAppServerClient {
           const item = message.params.item;
           if (item?.type === "agentMessage" && item.phase === "final_answer" && typeof item.text === "string") {
             finalText = item.text;
-            finish(null, { ...startResult, finalText, turnId, source: "app-server-final-item" });
           }
           return;
         }
@@ -391,6 +397,12 @@ export class CodexAppServerClient {
         if (message.method === "turn/completed" && message.params?.turn?.id) {
           turnId = turnId || message.params.turn.id;
           if (message.params.turn.id !== turnId) return;
+          const status = message.params.turn.status;
+          if (status && status !== "completed") {
+            const detail = message.params.turn.error?.message || status;
+            finish(new Error(`codex-app-server-turn-${status}:${detail}`));
+            return;
+          }
           finish(null, { ...startResult, finalText, turnId, source: "app-server-events" });
         }
       });
@@ -486,8 +498,18 @@ export const createChannelThreadStartBindingResolver = ({ rosterStore, agentId, 
   };
 };
 
+export const createCodexAppServerDaemonInjector = (codexInjector) => {
+  if (typeof codexInjector !== "function") throw new Error("codex-app-server-injector-required");
+  return async (payload, peer, processing = null) => {
+    if (peer?.mode !== "codex_app_server") {
+      throw new Error(`wake-native-mode-unsupported:${peer?.mode}`);
+    }
+    return codexInjector(payload, peer, processing);
+  };
+};
+
 export const createCodexAppServerInjector = ({ Client = CodexAppServerClient, log = () => {}, timeoutMs = DEFAULT_TIMEOUT_MS, resolveThreadStartBinding = null } = {}) => {
-  return async (payload, peer) => {
+  return async (payload, peer, processing = null) => {
     const socketPath = peer?.socketPath || peer?.target;
     if (!socketPath) throw new Error(`codex-app-server-socket-missing:${payload.from}`);
 
@@ -520,17 +542,38 @@ export const createCodexAppServerInjector = ({ Client = CodexAppServerClient, lo
         murmur_msg_id: payload.msgId || "",
         murmur_conversation_id: payload.conversationId || "",
         murmur_from: payload.from || "",
+        ...(processing?.attemptId ? { murmur_processing_attempt_id: processing.attemptId } : {}),
         ...bindingMetadata,
       },
     });
     const startTurn = async (threadId) => {
+      if (!processing && peer?.relayFinalToMurmur !== true) {
+        return client.request("turn/start", turnParams(threadId));
+      }
+      const result = await client.startTurnAndWaitForFinal(turnParams(threadId), {
+        completionTimeoutMs: Number(peer?.replyTimeoutMs) || DEFAULT_TURN_COMPLETION_TIMEOUT_MS,
+        sessionPath: threadPath,
+        onStarted: ({ turnId }) => processing?.started({ sessionId: turnId }),
+      });
+      processing?.completed({ sessionId: result?.turnId ?? null });
       if (peer?.relayFinalToMurmur === true) {
-        const result = await client.startTurnAndWaitForFinal(turnParams(threadId), {
-          completionTimeoutMs: Number(peer?.replyTimeoutMs) || DEFAULT_TURN_COMPLETION_TIMEOUT_MS,
-          sessionPath: threadPath,
-        });
-        const relay = await sendRelayReply(peer, payload, result?.finalText || "");
-        log("info", "Codex app-server wake final relayed", {
+        let relay = null;
+        let relayFailed = false;
+        try {
+          relay = await sendRelayReply(peer, payload, result?.finalText || "");
+        } catch (err) {
+          relayFailed = true;
+          const e = err instanceof Error ? err : new Error(String(err));
+          log("error", "Codex app-server processing completed but reply relay failed", {
+            msgId: payload.msgId,
+            threadId,
+            turnId: result?.turnId,
+            error: e.message,
+          });
+        }
+        log(relayFailed ? "warn" : "info", relayFailed
+          ? "Codex app-server wake final reply not relayed"
+          : "Codex app-server wake final relayed", {
           msgId: payload.msgId,
           threadId,
           socketPath,
@@ -539,9 +582,9 @@ export const createCodexAppServerInjector = ({ Client = CodexAppServerClient, lo
           replyMsgId: relay?.msgId ?? null,
           finalTextLen: String(result?.finalText || "").length,
         });
-        return result;
+        if (relay?.msgId) processing?.completed({ sessionId: result?.turnId ?? null, resultMessageId: relay.msgId });
       }
-      return client.request("turn/start", turnParams(threadId));
+      return result;
     };
 
     // A thread seeded in this call has no rollout file until its first turn, so

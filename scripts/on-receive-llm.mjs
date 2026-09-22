@@ -27,6 +27,8 @@ import { promisify } from "node:util";
 import path from "node:path";
 import https from "node:https";
 import http from "node:http";
+import { ProcessingReceiptStore } from "./processing-receipt-store.mjs";
+import { invokeWithProcessingReceipts } from "./llm-processing-lifecycle.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -34,6 +36,28 @@ const from = process.env.MURMUR_FROM || "unknown";
 const text = process.env.MURMUR_TEXT || "";
 const msgId = (process.env.MURMUR_MSG_ID || "").trim();
 const conversationId = process.env.MURMUR_CONVERSATION_ID || "";
+const processingAttempt = (() => {
+  const attemptId = process.env.MURMUR_PROCESSING_ATTEMPT_ID;
+  const recipientId = process.env.MURMUR_PROCESSING_RECIPIENT_ID;
+  const memberSlot = process.env.MURMUR_PROCESSING_MEMBER_SLOT;
+  const runtime = process.env.MURMUR_PROCESSING_RUNTIME;
+  const storePath = process.env.MURMUR_STORE_PATH;
+  if (![attemptId, recipientId, memberSlot, runtime, storePath].every((value) => typeof value === "string" && value.trim())) return null;
+  return { attemptId, inboundMessageId: msgId, recipientId, memberSlot, runtime, storePath };
+})();
+
+const recordProcessing = (status, details = {}) => {
+  if (!processingAttempt) return null;
+  const store = new ProcessingReceiptStore(processingAttempt.storePath);
+  try {
+    const result = store.record({ ...processingAttempt, ...details, status });
+    if (!result.accepted) console.error(`[llm] Processing receipt rejected: ${result.reason}`);
+    else if (!result.duplicate) console.log(`[llm] Processing ${status}: ${processingAttempt.attemptId}`);
+    return result;
+  } finally {
+    store.close();
+  }
+};
 
 if (!text) {
   console.error("[llm] No text received, skipping");
@@ -58,22 +82,27 @@ Current context:
 
 if (!apiKey) {
   console.error("[llm] No API key found. Set LLM_API_KEY or OPENAI_API_KEY");
+  recordProcessing("failed", { errorMessage: "llm-api-key-missing" });
   // Send error reply
   await sendReply(from, `⚠️ LLM not configured — set LLM_API_KEY in environment. Message received but can't process: "${text.slice(0, 100)}..."`);
-  process.exit(0);
+  process.exit(3);
 }
 
 console.log(`[llm] Processing message from ${from}: "${text.slice(0, 80)}..."`);
 
 // Call LLM
 try {
-  const response = await callLLM(systemPrompt, `Message from ${from}:\n\n${text}`);
+  const response = await invokeWithProcessingReceipts({
+    invoke: () => callLLM(systemPrompt, `Message from ${from}:\n\n${text}`),
+    record: recordProcessing,
+  });
   console.log(`[llm] Got response (${response.length} chars)`);
   await sendReply(from, response);
   console.log(`[llm] Reply sent to ${from}`);
 } catch (err) {
   console.error(`[llm] Error: ${err.message}`);
   await sendReply(from, `⚠️ LLM error: ${err.message}. Original message received: "${text.slice(0, 100)}..."`);
+  process.exitCode = 3;
 }
 
 // === Functions ===

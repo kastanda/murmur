@@ -15,7 +15,11 @@ import {
 } from "@murmurv2/core";
 import { decryptPayload, signEnvelope, verifyEnvelopeSignature } from "@murmurv2/security";
 import { NotifyQueue, flushNotifyQueue, normalizeNotifyTargets } from "./notify-router.mjs";
-import { createChannelThreadStartBindingResolver, createCodexAppServerInjector } from "./codex-app-server-wake.mjs";
+import {
+  createChannelThreadStartBindingResolver,
+  createCodexAppServerDaemonInjector,
+  createCodexAppServerInjector,
+} from "./codex-app-server-wake.mjs";
 import { startJetStreamAdvisoryDlqIfEnabled } from "./murmur-jetstream-advisory.mjs";
 import { WakeMonitor, createAuditShellHook, createShellHook, normalizeWakeConfig } from "./wake-monitor.mjs";
 import { WakeDispatchStore } from "./wake-dispatch-store.mjs";
@@ -115,7 +119,18 @@ const wakeDispatchStore = new WakeDispatchStore(dbPath, {
 // immediately. Operators may set a positive grace when deliberately overlapping
 // daemon generations during a supervised handoff.
 const wakeClaimTtlMs = Number(process.env.MURMUR_WAKE_CLAIM_TTL_MS) || 0;
-const recoveredWakeClaims = wakeDispatchStore.recoverStaleClaims({ claimTtlMs: wakeClaimTtlMs });
+const processingStartedTtlMs = Number(process.env.MURMUR_PROCESSING_STARTED_TTL_MS) || 300_000;
+const processingRecovery = wakeDispatchStore.reconcileProcessingAttempts({ startedTtlMs: processingStartedTtlMs });
+for (const diagnostic of processingRecovery) {
+  if (diagnostic.type === "completed-skip-replay") log("info", "Recovery skipped replay because processing completed", diagnostic);
+  else if (diagnostic.type === "started-expired") log("warn", "Processing started receipt expired", diagnostic);
+  else if (diagnostic.type === "started-in-flight") log("info", "Processing attempt remains in flight", diagnostic);
+  else if (diagnostic.type === "processing-failed") log("warn", "Recovered failed processing attempt", diagnostic);
+}
+const recoveredWakeClaims = wakeDispatchStore.recoverStaleClaims({
+  claimTtlMs: wakeClaimTtlMs,
+  processingStartedTtlMs,
+});
 const backfilledWakeDispatches = wakeDispatchStore.backfillMissingInbound();
 const wakeConfig = normalizeWakeConfig(config);
 if (recoveredWakeClaims > 0) log("warn", "Recovered stale wake dispatch claims", { count: recoveredWakeClaims });
@@ -164,6 +179,7 @@ const threadStartBindingResolver = channelRosterStore
   ? createChannelThreadStartBindingResolver({ rosterStore: channelRosterStore, agentId, log })
   : null;
 const codexAppServerInjector = createCodexAppServerInjector({ log, resolveThreadStartBinding: threadStartBindingResolver });
+const daemonCodexAppServerInjector = createCodexAppServerDaemonInjector(codexAppServerInjector);
 if (channelRosterEnabled) log("info", "Channel roster thread-start binding enabled", { channelRosterPath });
 const broker = new NatsBroker({
   url: natsUrl,
@@ -240,19 +256,20 @@ const wakeMonitor = new WakeMonitor({
   initialCursor: inboundCursor(),
   loadBacklogAfter: loadInboundAfter,
   dispatchStore: wakeDispatchStore,
+  processingStartedTtlMs,
   retry: {
     baseDelayMs: Number(process.env.MURMUR_WAKE_RETRY_BASE_MS) || 1000,
     maxDelayMs: Number(process.env.MURMUR_WAKE_RETRY_MAX_MS) || 30000,
   },
   leaseGate: nativeLeaseGate,
   auditHook: createAuditShellHook({ command: wakeConfig.auditHook, log }),
-  hook: createShellHook({ command: config.onReceive, log }),
-  injector: async (payload, peer) => {
-    if (peer.mode === "codex_app_server") {
-      return codexAppServerInjector(payload, peer);
-    }
-    throw new Error(`wake-native-mode-unsupported:${peer.mode}`);
-  },
+  hook: createShellHook({
+    command: config.onReceive,
+    log,
+    storePath: dbPath,
+    processingReceipts: config.onReceiveProcessingReceipts === "completed" ? "completed" : "none",
+  }),
+  injector: daemonCodexAppServerInjector,
   notify: enqueueWakeNotification,
   log,
 });
@@ -263,12 +280,7 @@ const proxyWakeMonitor = new WakeMonitor({
   auditHook: createAuditShellHook({ command: wakeConfig.auditHook, log }),
   hook: createShellHook({ command: config.proxyOnReceive, log }),
   leaseGate: nativeLeaseGate,
-  injector: async (payload, peer) => {
-    if (peer.mode === "codex_app_server") {
-      return codexAppServerInjector(payload, peer);
-    }
-    throw new Error(`wake-native-mode-unsupported:${peer.mode}`);
-  },
+  injector: daemonCodexAppServerInjector,
   notify: enqueueWakeNotification,
   log,
 });
@@ -338,6 +350,7 @@ let running = true;
 const flushLoop = async () => {
   while (running) {
     try {
+      wakeMonitor.reconcileProcessingAttempts();
       await wakeMonitor.drain();
     } catch (err) {
       log("error", "Wake dispatch retry error", { error: err.message });
