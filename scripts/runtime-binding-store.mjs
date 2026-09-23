@@ -129,6 +129,87 @@ export class RuntimeBindingStore {
     return Number(result.changes);
   }
 
+  updateProcess(fence, { pid = null, processStartIdentity = null } = {}, now = Date.now()) {
+    const result = this.db.prepare(`
+      UPDATE runtime_bindings
+      SET pid = ?, process_start_identity = ?, updated_at = ?, last_heartbeat = ?
+      WHERE binding_id = ? AND runtime_generation = ? AND lease_token = ?
+        AND fencing_epoch = ? AND state IN ('CLAIMED','WAKING','RUNNING')
+    `).run(
+      pid, processStartIdentity, now, now, fence.bindingId, fence.ownerGeneration,
+      fence.fencingToken, fence.fencingEpoch,
+    );
+    return Number(result.changes);
+  }
+
+  confirmRuntimeSession(fence, runtimeSessionId, now = Date.now()) {
+    requiredString(runtimeSessionId, "session-id");
+    const result = this.db.prepare(`
+      UPDATE runtime_bindings
+      SET runtime_session_id = COALESCE(runtime_session_id, ?), updated_at = ?, last_heartbeat = ?
+      WHERE binding_id = ? AND runtime_generation = ? AND lease_token = ?
+        AND fencing_epoch = ? AND state = 'RUNNING'
+        AND (runtime_session_id IS NULL OR runtime_session_id = ?)
+    `).run(
+      runtimeSessionId, now, now, fence.bindingId, fence.ownerGeneration,
+      fence.fencingToken, fence.fencingEpoch, runtimeSessionId,
+    );
+    return Number(result.changes);
+  }
+
+  releaseAssignment(fence, identity, {
+    state = "deferred", reason = "runtime-assignment-released", nextAttemptAt = Date.now(),
+  } = {}, now = Date.now()) {
+    if (!["deferred", "failed", "terminal"].includes(state)) {
+      throw new Error("runtime-binding-release-state-invalid");
+    }
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (!this.validateFence(fence, identity)) {
+        this.db.exec("ROLLBACK");
+        return 0;
+      }
+      const dispatch = this.db.prepare(`
+        UPDATE wake_dispatch
+        SET state = ?, next_attempt_at = ?, claimed_at = NULL, last_error = ?, updated_at = ?,
+            owner_binding_id = NULL, owner_generation = NULL,
+            fencing_token = NULL, fencing_epoch = NULL
+        WHERE msg_id = ? AND recipient_id = ? AND member_slot = ?
+          AND owner_binding_id = ? AND owner_generation = ?
+          AND fencing_token = ? AND fencing_epoch = ?
+          AND state IN ('claimed','dispatched')
+      `).run(
+        state, nextAttemptAt, reason, now, identity.msgId, identity.recipientId,
+        identity.memberSlot, fence.bindingId, fence.ownerGeneration,
+        fence.fencingToken, fence.fencingEpoch,
+      );
+      if (Number(dispatch.changes) !== 1) {
+        this.db.exec("ROLLBACK");
+        return 0;
+      }
+      const binding = this.db.prepare(`
+        UPDATE runtime_bindings
+        SET state = 'BOUND_IDLE', task_id = CASE
+              WHEN json_extract(metadata_json, '$.stickyTask') = 1 THEN task_id ELSE NULL END,
+            pid = NULL, process_start_identity = NULL,
+            updated_at = ?, last_heartbeat = ?
+        WHERE binding_id = ? AND runtime_generation = ? AND lease_token = ?
+          AND fencing_epoch = ? AND state IN ('CLAIMED','WAKING','RUNNING')
+      `).run(
+        now, now, fence.bindingId, fence.ownerGeneration, fence.fencingToken, fence.fencingEpoch,
+      );
+      if (Number(binding.changes) !== 1) {
+        this.db.exec("ROLLBACK");
+        return 0;
+      }
+      this.db.exec("COMMIT");
+      return 1;
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
   markIdle(fence, now = Date.now()) {
     const row = this.get(fence?.bindingId);
     if (!row || row.runtimeGeneration !== fence.ownerGeneration
@@ -138,7 +219,7 @@ export class RuntimeBindingStore {
     const result = this.db.prepare(`
       UPDATE runtime_bindings
       SET state = 'BOUND_IDLE', task_id = CASE WHEN ? THEN task_id ELSE NULL END,
-          updated_at = ?, last_heartbeat = ?
+          pid = NULL, process_start_identity = NULL, updated_at = ?, last_heartbeat = ?
       WHERE binding_id = ? AND runtime_generation = ? AND lease_token = ? AND state = ?
     `).run(sticky ? 1 : 0, now, now, row.bindingId, row.runtimeGeneration, row.leaseToken, row.state);
     return Number(result.changes);
@@ -338,7 +419,73 @@ export class RuntimeBindingStore {
         throw err;
       }
     }
+    const retained = this.db.prepare(`
+      SELECT d.*, b.binding_id, b.runtime_generation, b.lease_token,
+             p.status AS processing_status, p.started_at AS processing_started_at
+      FROM wake_dispatch d
+      JOIN runtime_bindings b ON b.binding_id = d.owner_binding_id
+        AND b.runtime_generation = d.owner_generation
+        AND b.lease_token = d.fencing_token
+      LEFT JOIN processing_attempts p ON p.attempt_id = (
+        SELECT p2.attempt_id FROM processing_attempts p2
+        WHERE p2.inbound_message_id = d.msg_id AND p2.recipient_id = d.recipient_id
+          AND p2.member_slot = d.member_slot
+        ORDER BY p2.created_at DESC, p2.rowid DESC LIMIT 1
+      )
+      WHERE b.state = 'STALE' AND d.state IN ('claimed','dispatched')
+    `).all();
+    for (const dispatch of retained) {
+      if (dispatch.processing_status === "completed") {
+        const changed = this.db.prepare(`
+          UPDATE wake_dispatch
+          SET state = 'handed_off', handed_off_at = COALESCE(handed_off_at, ?),
+              claimed_at = NULL, last_error = NULL, updated_at = ?
+          WHERE msg_id = ? AND recipient_id = ? AND member_slot = ?
+            AND owner_binding_id = ? AND owner_generation = ? AND fencing_token = ?
+            AND state IN ('claimed','dispatched')
+        `).run(now, now, dispatch.msg_id, dispatch.recipient_id, dispatch.member_slot,
+          dispatch.binding_id, dispatch.runtime_generation, dispatch.lease_token);
+        if (Number(changed.changes) === 1) {
+          diagnostics.push({ type: "processing-completed", bindingId: dispatch.binding_id, msgId: dispatch.msg_id });
+        }
+        continue;
+      }
+      const freshStarted = dispatch.processing_status === "started"
+        && dispatch.processing_started_at != null
+        && now - Number(dispatch.processing_started_at) < processingStartedTtlMs;
+      if (freshStarted) continue;
+      const changed = this.db.prepare(`
+        UPDATE wake_dispatch
+        SET state = CASE WHEN state = 'claimed' THEN 'deferred'
+                         WHEN attempts >= max_attempts THEN 'terminal' ELSE 'failed' END,
+            next_attempt_at = ?, claimed_at = NULL,
+            last_error = 'runtime-binding-stale', updated_at = ?,
+            owner_binding_id = NULL, owner_generation = NULL,
+            fencing_token = NULL, fencing_epoch = NULL
+        WHERE msg_id = ? AND recipient_id = ? AND member_slot = ?
+          AND owner_binding_id = ? AND owner_generation = ? AND fencing_token = ?
+          AND state IN ('claimed','dispatched')
+      `).run(retryAt, now, dispatch.msg_id, dispatch.recipient_id, dispatch.member_slot,
+        dispatch.binding_id, dispatch.runtime_generation, dispatch.lease_token);
+      if (Number(changed.changes) === 1) {
+        diagnostics.push({ type: "assignment-retryable", bindingId: dispatch.binding_id, msgId: dispatch.msg_id });
+      }
+    }
     return diagnostics;
+  }
+
+  expireRoute({ agentId, projectId, memberSlot, runtimeKind }, now = Date.now()) {
+    requiredString(agentId, "agentId");
+    requiredString(projectId, "projectId");
+    requiredString(memberSlot, "memberSlot");
+    requiredString(runtimeKind, "runtimeKind");
+    const result = this.db.prepare(`
+      UPDATE runtime_bindings
+      SET last_heartbeat = ? - lease_ttl_ms - 1, updated_at = ?
+      WHERE agent_id = ? AND project_id = ? AND member_slot = ? AND runtime_kind = ?
+        AND state IN ('STARTING','BOUND_IDLE','CLAIMED','WAKING','RUNNING','STOPPING')
+    `).run(now, now, agentId, projectId, memberSlot, runtimeKind);
+    return Number(result.changes);
   }
 
   get(bindingId) {

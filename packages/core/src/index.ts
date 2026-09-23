@@ -778,6 +778,7 @@ export interface LocalMessageRecord {
   text: string;
   createdAt: string;
   transport?: string;
+  memberSlot?: string;
 }
 
 /**
@@ -826,7 +827,8 @@ export class SQLiteMessageStore {
         sender TEXT NOT NULL,
         text TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        transport TEXT
+        transport TEXT,
+        member_slot TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_local_messages_conversation ON local_messages(conversation_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_local_messages_text ON local_messages(text);
@@ -848,6 +850,9 @@ export class SQLiteMessageStore {
     const messageColumns = this.db.prepare(`PRAGMA table_info(local_messages)`).all() as Array<{ name: string }>;
     if (!messageColumns.some((column) => column.name === "reply_to_message_id")) {
       this.db.exec(`ALTER TABLE local_messages ADD COLUMN reply_to_message_id TEXT`);
+    }
+    if (!messageColumns.some((column) => column.name === "member_slot")) {
+      this.db.exec(`ALTER TABLE local_messages ADD COLUMN member_slot TEXT`);
     }
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_local_messages_reply_to
@@ -960,8 +965,8 @@ export class SQLiteMessageStore {
     this.db
       .prepare(
         `INSERT INTO local_messages
-         (id, conversation_id, msg_id, reply_to_message_id, direction, sender, text, created_at, transport)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, conversation_id, msg_id, reply_to_message_id, direction, sender, text, created_at, transport, member_slot)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         row.id,
@@ -973,8 +978,46 @@ export class SQLiteMessageStore {
         row.text,
         row.createdAt,
         row.transport ?? null,
+        row.memberSlot ?? null,
       );
     return row;
+  }
+
+  /**
+   * Mirror a deterministic message exactly once without imposing a new unique
+   * constraint on databases that may already contain historical duplicates.
+   */
+  async appendIdempotent(input: Omit<LocalMessageRecord, "id">): Promise<LocalMessageRecord> {
+    const row: LocalMessageRecord = { id: randomUUID(), ...input };
+    this.db.prepare(
+      `INSERT INTO local_messages
+       (id, conversation_id, msg_id, reply_to_message_id, direction, sender, text, created_at, transport, member_slot)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+       WHERE NOT EXISTS (
+         SELECT 1 FROM local_messages WHERE direction = ? AND msg_id = ?
+       )`,
+    ).run(
+      row.id,
+      row.conversationId,
+      row.msgId,
+      row.replyToMessageId ?? null,
+      row.direction,
+      row.sender,
+      row.text,
+      row.createdAt,
+      row.transport ?? null,
+      row.memberSlot ?? null,
+      row.direction,
+      row.msgId,
+    );
+    const stored = this.db.prepare(
+      `SELECT id, conversation_id AS conversationId, msg_id AS msgId,
+              reply_to_message_id AS replyToMessageId, direction, sender, text,
+              created_at AS createdAt, transport, member_slot AS memberSlot
+       FROM local_messages WHERE direction = ? AND msg_id = ?
+       ORDER BY rowid ASC LIMIT 1`,
+    ).get(row.direction, row.msgId) as unknown as LocalMessageRecord;
+    return stored;
   }
 
   async listConversations(limit = 50): Promise<Array<{ conversationId: string; lastMessageAt: string; messageCount: number }>> {
@@ -1002,7 +1045,8 @@ export class SQLiteMessageStore {
            sender,
            text,
            created_at as createdAt,
-           transport
+           transport,
+           member_slot as memberSlot
          FROM local_messages
          WHERE conversation_id = ? AND direction = 'inbound' AND created_at > ?
          ORDER BY created_at ASC
@@ -1023,7 +1067,8 @@ export class SQLiteMessageStore {
          sender,
          text,
          created_at as createdAt,
-         transport
+         transport,
+         member_slot as memberSlot
        FROM local_messages
        WHERE direction = 'inbound' AND reply_to_message_id = ? AND sender = ?
        ORDER BY created_at ASC, rowid ASC
@@ -1052,7 +1097,8 @@ export class SQLiteMessageStore {
            sender,
            text,
            created_at as createdAt,
-           transport
+           transport,
+           member_slot as memberSlot
          FROM local_messages
          WHERE direction = 'inbound'
          ORDER BY created_at DESC, rowid DESC
@@ -1075,7 +1121,8 @@ export class SQLiteMessageStore {
            sender,
            text,
            created_at as createdAt,
-           transport
+           transport,
+           member_slot as memberSlot
          FROM local_messages
          WHERE text LIKE ? OR sender LIKE ? OR conversation_id LIKE ?
          ORDER BY created_at DESC

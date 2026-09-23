@@ -50,11 +50,18 @@ fi
 last="$(cat "$CURSOR" 2>/dev/null || printf '0\n')"
 case "$last" in ''|*[!0-9]*) last=0 ;; esac
 
+has_member_slot="$(sqlite3 "$DB" "SELECT COUNT(*) FROM pragma_table_info('local_messages') WHERE name='member_slot';" 2>/dev/null || echo 0)"
+if [ "$has_member_slot" = "1" ]; then
+  slot_filter="AND (member_slot IS NULL OR member_slot <> 'claude:auto')"
+else
+  slot_filter=""
+fi
+
 # New inbound (from any peer) since the last drained rowid.
 rows="$(sqlite3 "$DB" \
   "SELECT '  rowid='||rowid||' ['||sender||'] msgId='||msg_id||' conversationId='||conversation_id||' '||substr(replace(replace(text,char(10),' '),char(13),' '),1,360) \
    FROM local_messages \
-   WHERE direction='inbound' AND rowid > $last \
+   WHERE direction='inbound' AND rowid > $last $slot_filter \
    ORDER BY rowid;" 2>/dev/null || true)"
 
 [ -z "$rows" ] && exit 0

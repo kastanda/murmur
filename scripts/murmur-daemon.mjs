@@ -4,6 +4,7 @@
  */
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import { NatsBroker } from "@murmurv2/broker-nats";
 import {
@@ -13,7 +14,7 @@ import {
   stableAckPayload,
   stableEnvelopePayload,
 } from "@murmurv2/core";
-import { decryptPayload, signEnvelope, verifyEnvelopeSignature } from "@murmurv2/security";
+import { decryptPayload, encryptPayload, signEnvelope, verifyEnvelopeSignature } from "@murmurv2/security";
 import { NotifyQueue, flushNotifyQueue, normalizeNotifyTargets } from "./notify-router.mjs";
 import {
   createChannelThreadStartBindingResolver,
@@ -23,6 +24,12 @@ import {
 import { startJetStreamAdvisoryDlqIfEnabled } from "./murmur-jetstream-advisory.mjs";
 import { WakeMonitor, createAuditShellHook, createShellHook, normalizeWakeConfig } from "./wake-monitor.mjs";
 import { WakeDispatchStore } from "./wake-dispatch-store.mjs";
+import { RuntimeBindingStore } from "./runtime-binding-store.mjs";
+import {
+  CLAUDE_AUTO_MEMBER_SLOT,
+  CLAUDE_ONE_SHOT_KIND,
+  ClaudeOneShotRuntime,
+} from "./claude-one-shot-runtime.mjs";
 import { SessionLeaseStore, createNativeLeaseGate } from "./lease.mjs";
 import { ensurePrivateDirectory, readPrivateJson, setPrivateUmask } from "./secure-state.mjs";
 // vault-guard: optional content policy hook (not included in OSS release)
@@ -133,6 +140,20 @@ const recoveredWakeClaims = wakeDispatchStore.recoverStaleClaims({
 });
 const backfilledWakeDispatches = wakeDispatchStore.backfillMissingInbound();
 const wakeConfig = normalizeWakeConfig(config);
+const claudeOneShotConfig = config.runtime?.claudeOneShot || {};
+const claudeOneShotEnabled = claudeOneShotConfig.enabled === true;
+const claudeProjectId = claudeOneShotConfig.projectId || path.resolve(claudeOneShotConfig.cwd || process.cwd());
+const runtimeBindingStore = claudeOneShotEnabled ? new RuntimeBindingStore(wakeDb) : null;
+if (runtimeBindingStore) {
+  runtimeBindingStore.expireRoute({
+    agentId,
+    projectId: claudeProjectId,
+    memberSlot: CLAUDE_AUTO_MEMBER_SLOT,
+    runtimeKind: CLAUDE_ONE_SHOT_KIND,
+  });
+  const bindingRecovery = runtimeBindingStore.reconcileStale({ processingStartedTtlMs });
+  for (const diagnostic of bindingRecovery) log("warn", "Recovered Claude one-shot runtime binding", diagnostic);
+}
 if (recoveredWakeClaims > 0) log("warn", "Recovered stale wake dispatch claims", { count: recoveredWakeClaims });
 if (backfilledWakeDispatches > 0) log("warn", "Recovered inbound messages missing wake dispatch state", { count: backfilledWakeDispatches });
 
@@ -202,6 +223,38 @@ const verifyAck = async (ack) => {
   return verifyEnvelopeSignature(stableAckPayload(ack), ack.signature, peer.signing.publicKey);
 };
 
+const enqueueRuntimeReply = async ({ msgId = randomUUID(), to, conversationId, replyToMessageId, text }) => {
+  const peer = peers[to];
+  if (!peer) throw new Error(`unknown-reply-recipient:${to}`);
+  const createdAt = new Date().toISOString();
+  const encrypted = await encryptPayload(text, peer.encryption.publicKey, keys.encryption.privateKey);
+  const envelope = {
+    schemaVersion: "1.0",
+    msgId,
+    conversationId,
+    replyToMessageId,
+    senderAgentId: agentId,
+    recipients: [to],
+    createdAt,
+    payloadCiphertext: encrypted.ciphertext,
+    payloadNonce: encrypted.nonce,
+    signature: "",
+  };
+  envelope.signature = await signEnvelope(stableEnvelopePayload(envelope), keys.signing.privateKey);
+  await store.enqueue(peer.subject, envelope);
+  await msgStore.appendIdempotent({
+    conversationId,
+    msgId,
+    replyToMessageId,
+    direction: "outbound",
+    sender: agentId,
+    text,
+    createdAt,
+    transport: "nats",
+  });
+  return { msgId };
+};
+
 const durableSafe = (value) => value.replace(/[^A-Za-z0-9_-]/g, "-");
 
 const inboundCursor = () => {
@@ -222,6 +275,7 @@ const loadInboundAfter = async (cursor) => {
          conversation_id as conversationId,
          msg_id as msgId,
          reply_to_message_id as replyToMessageId,
+         member_slot as memberSlot,
          sender as "from",
          text,
          created_at as ts
@@ -236,6 +290,7 @@ const loadInboundAfter = async (cursor) => {
     text: row.text,
     msgId: row.msgId,
     ...(row.replyToMessageId ? { replyToMessageId: row.replyToMessageId } : {}),
+    ...(row.memberSlot ? { memberSlot: row.memberSlot } : {}),
     conversationId: row.conversationId,
     ts: row.ts,
     cursor: Number(row.cursor),
@@ -251,11 +306,42 @@ const enqueueWakeNotification = async (payload, reason) => {
   }, effectiveNotifyTargets);
 };
 
+const claudeOneShotRuntime = runtimeBindingStore ? new ClaudeOneShotRuntime({
+  bindingStore: runtimeBindingStore,
+  dispatchStore: wakeDispatchStore,
+  agentId,
+  projectId: claudeProjectId,
+  cwd: path.resolve(claudeOneShotConfig.cwd || process.cwd()),
+  sendReply: enqueueRuntimeReply,
+  heartbeatIntervalMs: Number(claudeOneShotConfig.heartbeatIntervalMs) || 5_000,
+  turnTimeoutMs: Number(claudeOneShotConfig.turnTimeoutMs) || 300_000,
+  terminateGraceMs: Number(claudeOneShotConfig.terminateGraceMs) || 5_000,
+  permissionMode: claudeOneShotConfig.permissionMode || "dontAsk",
+  model: claudeOneShotConfig.model,
+  log,
+}) : null;
+if (claudeOneShotRuntime) {
+  claudeOneShotRuntime.start({
+    bindingId: randomUUID(),
+    runtimeGeneration: Date.now(),
+    leaseTtlMs: Number(claudeOneShotConfig.leaseTtlMs) || 30_000,
+  });
+  await claudeOneShotRuntime.recoverCompletedReplies();
+  log("info", "Claude one-shot runtime enabled", {
+    projectId: claudeProjectId,
+    memberSlot: CLAUDE_AUTO_MEMBER_SLOT,
+    permissionMode: claudeOneShotConfig.permissionMode || "dontAsk",
+  });
+}
+
 const wakeMonitor = new WakeMonitor({
   ...wakeConfig,
   initialCursor: inboundCursor(),
   loadBacklogAfter: loadInboundAfter,
   dispatchStore: wakeDispatchStore,
+  runtimeDispatcher: claudeOneShotRuntime
+    ? (payload, dispatch) => claudeOneShotRuntime.executeTurn(payload, dispatch)
+    : null,
   processingStartedTtlMs,
   retry: {
     baseDelayMs: Number(process.env.MURMUR_WAKE_RETRY_BASE_MS) || 1000,
@@ -305,6 +391,7 @@ const onMessage = async (envelope) => {
     keys.encryption.privateKey,
   );
 
+  const inboundMemberSlot = claudeOneShotEnabled ? CLAUDE_AUTO_MEMBER_SLOT : null;
   await msgStore.append({
     conversationId: envelope.conversationId,
     msgId: envelope.msgId,
@@ -314,6 +401,7 @@ const onMessage = async (envelope) => {
     text: plaintext,
     createdAt: envelope.createdAt,
     transport: "nats",
+    ...(inboundMemberSlot ? { memberSlot: inboundMemberSlot } : {}),
   });
 
   log("info", "Message received", {
@@ -332,6 +420,7 @@ const onMessage = async (envelope) => {
     conversationId: envelope.conversationId,
     ts: new Date().toISOString(),
     cursor: inboundCursorForMsg(envelope.msgId),
+    ...(inboundMemberSlot ? { memberSlot: inboundMemberSlot } : {}),
   };
 
   if (effectiveNotifyTargets.length > 0) {
@@ -351,6 +440,8 @@ const flushLoop = async () => {
   while (running) {
     try {
       wakeMonitor.reconcileProcessingAttempts();
+      runtimeBindingStore?.reconcileStale({ processingStartedTtlMs });
+      await claudeOneShotRuntime?.recoverCompletedReplies();
       await wakeMonitor.drain();
     } catch (err) {
       log("error", "Wake dispatch retry error", { error: err.message });
@@ -375,6 +466,8 @@ const flushLoop = async () => {
 const shutdown = async (signal) => {
   log("info", "Shutdown signal received, draining NATS", { signal });
   running = false;
+  await claudeOneShotRuntime?.cancel();
+  claudeOneShotRuntime?.shutdown();
   try {
     await broker.close();
   } catch (err) {

@@ -201,6 +201,7 @@ export class WakeDispatchStore {
         ORDER BY p2.created_at DESC, p2.rowid DESC LIMIT 1
       )
       WHERE d.state IN ('claimed', 'dispatched', 'failed', 'deferred')
+        AND d.owner_binding_id IS NULL
     `).all();
     for (const row of rows) {
       const identity = { msgId: row.msg_id, recipientId: row.recipient_id, memberSlot: row.member_slot };
@@ -396,25 +397,33 @@ export class WakeDispatchStore {
     const replyColumn = this.hasLocalMessageReplyColumn()
       ? "reply_to_message_id AS replyToMessageId"
       : "NULL AS replyToMessageId";
+    const hasMemberSlotColumn = this.hasLocalMessageMemberSlotColumn();
+    const memberSlotColumn = hasMemberSlotColumn
+      ? "member_slot AS memberSlot"
+      : "NULL AS memberSlot";
+    const memberSlotExpression = hasMemberSlotColumn ? "message.member_slot" : "NULL";
     const baseline = Number(this.db.prepare(`
       SELECT value FROM wake_dispatch_meta WHERE key = 'inbound-baseline-rowid'
     `).get()?.value ?? 0);
     const rows = this.db.prepare(`
       SELECT rowid AS cursor, conversation_id AS conversationId, msg_id AS msgId,
              ${replyColumn},
+             ${memberSlotColumn},
              sender AS "from", text, created_at AS ts
       FROM local_messages AS message
       WHERE direction = 'inbound' AND rowid > ?
         AND NOT EXISTS (
           SELECT 1 FROM wake_dispatch AS dispatch
           WHERE dispatch.msg_id = message.msg_id
-            AND dispatch.recipient_id = ? AND dispatch.member_slot = ?
+            AND dispatch.recipient_id = ?
+            AND dispatch.member_slot = COALESCE(${memberSlotExpression}, ?)
         )
       ORDER BY rowid ASC
     `).all(baseline, this.recipientId, this.recipientId);
     for (const row of rows) this.enqueue({
       ...row,
       ...(row.replyToMessageId ? { replyToMessageId: row.replyToMessageId } : {}),
+      ...(row.memberSlot ? { memberSlot: row.memberSlot } : {}),
       cursor: Number(row.cursor),
     }, now);
     return rows.length;
@@ -484,6 +493,11 @@ export class WakeDispatchStore {
   hasLocalMessageReplyColumn() {
     return this.db.prepare(`PRAGMA table_info(local_messages)`).all()
       .some((column) => column.name === "reply_to_message_id");
+  }
+
+  hasLocalMessageMemberSlotColumn() {
+    return this.db.prepare(`PRAGMA table_info(local_messages)`).all()
+      .some((column) => column.name === "member_slot");
   }
 
   hasMigrationBaseline() {

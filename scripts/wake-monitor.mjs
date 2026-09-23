@@ -130,6 +130,7 @@ export class WakeMonitor {
     this.notify = options.notify || null;
     this.loadBacklogAfter = options.loadBacklogAfter || null;
     this.dispatchStore = options.dispatchStore || null;
+    this.runtimeDispatcher = options.runtimeDispatcher || null;
     this.retry = {
       maxDelayMs: options.retry?.maxDelayMs ?? 30000,
       baseDelayMs: options.retry?.baseDelayMs ?? 1000,
@@ -279,6 +280,10 @@ export class WakeMonitor {
 
     let processingAttempt = null;
     try {
+      if (dispatch && this.runtimeDispatcher) {
+        await this.runtimeDispatcher(payload, dispatch);
+        return;
+      }
       const peer = this.peerFor(payload);
       if (peer.mode === "codex_app_server") {
         processingAttempt = dispatch ? this.createProcessingAttempt(dispatch, "codex-app-server", "completed") : null;

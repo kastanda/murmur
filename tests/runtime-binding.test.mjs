@@ -291,8 +291,32 @@ test("binding crash while running holds fresh started receipt and completed evid
       recipientId: item.recipientId, memberSlot: item.memberSlot,
       runtime: "claude-worker", status: "completed",
     }, 1201);
-    ctx.dispatch.reconcileProcessingAttempts({ now: 1202 });
+    ctx.bindings.reconcileStale({ now: 1202, processingStartedTtlMs: 500 });
     assert.equal(ctx.dispatch.get(item).state, "handed_off");
+  } finally { ctx.close(); }
+});
+
+test("binding authority revisits retained started ownership after its TTL expires", () => {
+  const ctx = setup();
+  try {
+    addBinding(ctx.bindings, "auto-1", "claude:auto");
+    const item = prepareDispatch(ctx.dispatch, "msg-retained", "claude:auto");
+    const fence = ctx.bindings.assignDispatch(item, route("claude:auto"), 1001);
+    ctx.bindings.markWaking(fence, 1002);
+    ctx.dispatch.beginHandoff(item, 1002, {
+      attemptId: "attempt-retained", runtime: "claude-worker", capability: "completed",
+    });
+    ctx.dispatch.recordProcessingReceipt({
+      attemptId: "attempt-retained", inboundMessageId: item.msgId,
+      recipientId: item.recipientId, memberSlot: item.memberSlot,
+      runtime: "claude-worker", status: "started",
+    }, 1003);
+    ctx.bindings.markRunning(fence, 1003);
+    ctx.bindings.reconcileStale({ now: 1200, processingStartedTtlMs: 500 });
+    assert.equal(ctx.dispatch.get(item).ownerBindingId, "auto-1");
+    ctx.bindings.reconcileStale({ now: 1604, retryAt: 1604, processingStartedTtlMs: 500 });
+    assert.equal(ctx.dispatch.get(item).state, "failed");
+    assert.equal(ctx.dispatch.get(item).ownerBindingId, null);
   } finally { ctx.close(); }
 });
 

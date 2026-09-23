@@ -95,15 +95,17 @@ function maxInbound(db) {
 }
 
 function newRows(db, since) {
-  const hasReplyColumn = db.prepare("PRAGMA table_info(local_messages)").all()
-    .some((column) => column.name === "reply_to_message_id");
+  const columns = db.prepare("PRAGMA table_info(local_messages)").all();
+  const hasReplyColumn = columns.some((column) => column.name === "reply_to_message_id");
+  const hasMemberSlotColumn = columns.some((column) => column.name === "member_slot");
   const replyColumn = hasReplyColumn ? "reply_to_message_id" : "NULL AS reply_to_message_id";
+  const slotFilter = hasMemberSlotColumn ? "AND (member_slot IS NULL OR member_slot <> 'claude:auto')" : "";
   return db.prepare(
     `SELECT rowid, sender, msg_id, conversation_id,
             ${replyColumn},
             substr(replace(replace(text, char(10), ' '), char(13), ' '), 1, 360) AS snippet
        FROM local_messages
-      WHERE direction='inbound' AND rowid > ?
+      WHERE direction='inbound' AND rowid > ? ${slotFilter}
       ORDER BY rowid`,
   ).all(since);
 }
