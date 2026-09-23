@@ -34,6 +34,10 @@ const DDL = `
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL,
     handed_off_at     INTEGER,
+    owner_binding_id  TEXT,
+    owner_generation  INTEGER,
+    fencing_token     INTEGER,
+    fencing_epoch     INTEGER,
     PRIMARY KEY (msg_id, recipient_id, member_slot)
   );
   CREATE INDEX IF NOT EXISTS idx_wake_dispatch_due
@@ -63,7 +67,10 @@ export class WakeDispatchStore {
       const legacySchema = hadDispatchTable && !this.db.prepare(`PRAGMA table_info(wake_dispatch)`).all()
         .some((column) => column.name === "recipient_id");
       if (legacySchema) this.migrateLegacySchema();
-      else this.db.exec(DDL);
+      else {
+        this.db.exec(DDL);
+        this.ensureAssignmentColumns();
+      }
       this.processingReceipts = new ProcessingReceiptStore(this.db);
       if (!hadDispatchTable) this.seedMigrationBaseline();
     } catch (err) {
@@ -362,6 +369,7 @@ export class WakeDispatchStore {
           END,
           updated_at = ?
       WHERE state IN ('claimed', 'dispatched')
+        AND owner_binding_id IS NULL
         AND claimed_at IS NOT NULL AND (? - claimed_at) >= ?
         AND NOT EXISTS (
           SELECT 1 FROM processing_attempts p
@@ -487,6 +495,26 @@ export class WakeDispatchStore {
     `).get());
   }
 
+  ensureAssignmentColumns() {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const columns = new Set(this.db.prepare(`PRAGMA table_info(wake_dispatch)`).all()
+        .map((column) => column.name));
+      for (const [name, type] of [
+        ["owner_binding_id", "TEXT"],
+        ["owner_generation", "INTEGER"],
+        ["fencing_token", "INTEGER"],
+        ["fencing_epoch", "INTEGER"],
+      ]) {
+        if (!columns.has(name)) this.db.exec(`ALTER TABLE wake_dispatch ADD COLUMN ${name} ${type}`);
+      }
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
   migrateLegacySchema() {
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -546,6 +574,10 @@ export class WakeDispatchStore {
       createdAt: Number(row.created_at),
       updatedAt: Number(row.updated_at),
       handedOffAt: row.handed_off_at == null ? null : Number(row.handed_off_at),
+      ownerBindingId: row.owner_binding_id ?? null,
+      ownerGeneration: row.owner_generation == null ? null : Number(row.owner_generation),
+      fencingToken: row.fencing_token == null ? null : Number(row.fencing_token),
+      fencingEpoch: row.fencing_epoch == null ? null : Number(row.fencing_epoch),
     };
   }
 }
