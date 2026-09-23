@@ -134,7 +134,7 @@ export class RuntimeBindingStore {
       UPDATE runtime_bindings
       SET pid = ?, process_start_identity = ?, updated_at = ?, last_heartbeat = ?
       WHERE binding_id = ? AND runtime_generation = ? AND lease_token = ?
-        AND fencing_epoch = ? AND state IN ('CLAIMED','WAKING','RUNNING')
+        AND fencing_epoch = ? AND state IN ('STARTING','BOUND_IDLE','CLAIMED','WAKING','RUNNING')
     `).run(
       pid, processStartIdentity, now, now, fence.bindingId, fence.ownerGeneration,
       fence.fencingToken, fence.fencingEpoch,
@@ -191,7 +191,9 @@ export class RuntimeBindingStore {
         UPDATE runtime_bindings
         SET state = 'BOUND_IDLE', task_id = CASE
               WHEN json_extract(metadata_json, '$.stickyTask') = 1 THEN task_id ELSE NULL END,
-            pid = NULL, process_start_identity = NULL,
+            pid = CASE WHEN json_extract(metadata_json, '$.persistentProcess') = 1 THEN pid ELSE NULL END,
+            process_start_identity = CASE
+              WHEN json_extract(metadata_json, '$.persistentProcess') = 1 THEN process_start_identity ELSE NULL END,
             updated_at = ?, last_heartbeat = ?
         WHERE binding_id = ? AND runtime_generation = ? AND lease_token = ?
           AND fencing_epoch = ? AND state IN ('CLAIMED','WAKING','RUNNING')
@@ -216,12 +218,16 @@ export class RuntimeBindingStore {
       || (fence.fencingToken != null && row.leaseToken !== fence.fencingToken)
       || !TRANSITIONS.get(row.state)?.has("BOUND_IDLE")) return 0;
     const sticky = row.metadata?.stickyTask === true;
+    const persistentProcess = row.metadata?.persistentProcess === true;
     const result = this.db.prepare(`
       UPDATE runtime_bindings
       SET state = 'BOUND_IDLE', task_id = CASE WHEN ? THEN task_id ELSE NULL END,
-          pid = NULL, process_start_identity = NULL, updated_at = ?, last_heartbeat = ?
+          pid = CASE WHEN ? THEN pid ELSE NULL END,
+          process_start_identity = CASE WHEN ? THEN process_start_identity ELSE NULL END,
+          updated_at = ?, last_heartbeat = ?
       WHERE binding_id = ? AND runtime_generation = ? AND lease_token = ? AND state = ?
-    `).run(sticky ? 1 : 0, now, now, row.bindingId, row.runtimeGeneration, row.leaseToken, row.state);
+    `).run(sticky ? 1 : 0, persistentProcess ? 1 : 0, persistentProcess ? 1 : 0,
+      now, now, row.bindingId, row.runtimeGeneration, row.leaseToken, row.state);
     return Number(result.changes);
   }
 
@@ -252,9 +258,13 @@ export class RuntimeBindingStore {
       || (fence.fencingToken != null && row.leaseToken !== fence.fencingToken)) return 0;
     if (!TRANSITIONS.get(row.state)?.has(nextState)) return 0;
     const result = this.db.prepare(`
-      UPDATE runtime_bindings SET state = ?, updated_at = ?, last_heartbeat = ?
+      UPDATE runtime_bindings SET state = ?,
+        pid = CASE WHEN ? = 'OFFLINE' THEN NULL ELSE pid END,
+        process_start_identity = CASE WHEN ? = 'OFFLINE' THEN NULL ELSE process_start_identity END,
+        updated_at = ?, last_heartbeat = ?
       WHERE binding_id = ? AND runtime_generation = ? AND lease_token = ? AND state = ?
-    `).run(nextState, now, now, row.bindingId, row.runtimeGeneration, row.leaseToken, row.state);
+    `).run(nextState, nextState, nextState, now, now,
+      row.bindingId, row.runtimeGeneration, row.leaseToken, row.state);
     return Number(result.changes);
   }
 

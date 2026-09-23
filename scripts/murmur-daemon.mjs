@@ -30,6 +30,12 @@ import {
   CLAUDE_ONE_SHOT_KIND,
   ClaudeOneShotRuntime,
 } from "./claude-one-shot-runtime.mjs";
+import {
+  CURSOR_ACP_KIND,
+  CURSOR_ACP_MEMBER_SLOT,
+  CursorAcpRuntime,
+  normalizeCursorAcpRuntimeConfig,
+} from "./cursor-acp-runtime.mjs";
 import { SessionLeaseStore, createNativeLeaseGate } from "./lease.mjs";
 import { ensurePrivateDirectory, readPrivateJson, setPrivateUmask } from "./secure-state.mjs";
 // vault-guard: optional content policy hook (not included in OSS release)
@@ -143,16 +149,18 @@ const wakeConfig = normalizeWakeConfig(config);
 const claudeOneShotConfig = config.runtime?.claudeOneShot || {};
 const claudeOneShotEnabled = claudeOneShotConfig.enabled === true;
 const claudeProjectId = claudeOneShotConfig.projectId || path.resolve(claudeOneShotConfig.cwd || process.cwd());
-const runtimeBindingStore = claudeOneShotEnabled ? new RuntimeBindingStore(wakeDb) : null;
+const cursorAcpConfig = normalizeCursorAcpRuntimeConfig(config.runtime?.cursorAcp);
+const cursorAcpEnabled = cursorAcpConfig.enabled === true;
+if (claudeOneShotEnabled && cursorAcpEnabled) throw new Error("only-one-autonomous-runtime-per-daemon");
+const cursorProjectId = cursorAcpConfig.projectId || path.resolve(cursorAcpConfig.cwd || process.cwd());
+const runtimeBindingStore = claudeOneShotEnabled || cursorAcpEnabled ? new RuntimeBindingStore(wakeDb) : null;
 if (runtimeBindingStore) {
-  runtimeBindingStore.expireRoute({
-    agentId,
-    projectId: claudeProjectId,
-    memberSlot: CLAUDE_AUTO_MEMBER_SLOT,
-    runtimeKind: CLAUDE_ONE_SHOT_KIND,
-  });
+  if (claudeOneShotEnabled) runtimeBindingStore.expireRoute({ agentId, projectId: claudeProjectId,
+    memberSlot: CLAUDE_AUTO_MEMBER_SLOT, runtimeKind: CLAUDE_ONE_SHOT_KIND });
+  if (cursorAcpEnabled) runtimeBindingStore.expireRoute({ agentId, projectId: cursorProjectId,
+    memberSlot: CURSOR_ACP_MEMBER_SLOT, runtimeKind: CURSOR_ACP_KIND });
   const bindingRecovery = runtimeBindingStore.reconcileStale({ processingStartedTtlMs });
-  for (const diagnostic of bindingRecovery) log("warn", "Recovered Claude one-shot runtime binding", diagnostic);
+  for (const diagnostic of bindingRecovery) log("warn", "Recovered autonomous runtime binding", diagnostic);
 }
 if (recoveredWakeClaims > 0) log("warn", "Recovered stale wake dispatch claims", { count: recoveredWakeClaims });
 if (backfilledWakeDispatches > 0) log("warn", "Recovered inbound messages missing wake dispatch state", { count: backfilledWakeDispatches });
@@ -306,7 +314,7 @@ const enqueueWakeNotification = async (payload, reason) => {
   }, effectiveNotifyTargets);
 };
 
-const claudeOneShotRuntime = runtimeBindingStore ? new ClaudeOneShotRuntime({
+const claudeOneShotRuntime = claudeOneShotEnabled ? new ClaudeOneShotRuntime({
   bindingStore: runtimeBindingStore,
   dispatchStore: wakeDispatchStore,
   agentId,
@@ -334,13 +342,40 @@ if (claudeOneShotRuntime) {
   });
 }
 
+const cursorAcpRuntime = cursorAcpEnabled ? new CursorAcpRuntime({
+  bindingStore: runtimeBindingStore,
+  dispatchStore: wakeDispatchStore,
+  agentId,
+  projectId: cursorProjectId,
+  cwd: path.resolve(cursorAcpConfig.cwd || process.cwd()),
+  sendReply: enqueueRuntimeReply,
+  command: cursorAcpConfig.command || "agent",
+  heartbeatIntervalMs: Number(cursorAcpConfig.heartbeatIntervalMs) || 5_000,
+  startupTimeoutMs: Number(cursorAcpConfig.startupTimeoutMs) || 30_000,
+  turnTimeoutMs: Number(cursorAcpConfig.turnTimeoutMs) || 300_000,
+  terminateGraceMs: Number(cursorAcpConfig.terminateGraceMs) || 5_000,
+  permissionPolicy: cursorAcpConfig.permissionPolicy || "reject-once",
+  mode: cursorAcpConfig.mode || "ask",
+  log,
+}) : null;
+if (cursorAcpRuntime) {
+  await cursorAcpRuntime.start({ bindingId: randomUUID(), runtimeGeneration: Date.now(),
+    leaseTtlMs: Number(cursorAcpConfig.leaseTtlMs) || 30_000 });
+  await cursorAcpRuntime.recoverCompletedReplies();
+  log("info", "Cursor ACP runtime enabled", { projectId: cursorProjectId,
+    memberSlot: CURSOR_ACP_MEMBER_SLOT, permissionPolicy: cursorAcpConfig.permissionPolicy || "reject-once",
+    mode: cursorAcpConfig.mode || "ask" });
+}
+
+const autonomousRuntime = claudeOneShotRuntime || cursorAcpRuntime;
+
 const wakeMonitor = new WakeMonitor({
   ...wakeConfig,
   initialCursor: inboundCursor(),
   loadBacklogAfter: loadInboundAfter,
   dispatchStore: wakeDispatchStore,
-  runtimeDispatcher: claudeOneShotRuntime
-    ? (payload, dispatch) => claudeOneShotRuntime.executeTurn(payload, dispatch)
+  runtimeDispatcher: autonomousRuntime
+    ? (payload, dispatch) => autonomousRuntime.executeTurn(payload, dispatch)
     : null,
   processingStartedTtlMs,
   retry: {
@@ -391,7 +426,8 @@ const onMessage = async (envelope) => {
     keys.encryption.privateKey,
   );
 
-  const inboundMemberSlot = claudeOneShotEnabled ? CLAUDE_AUTO_MEMBER_SLOT : null;
+  const inboundMemberSlot = claudeOneShotEnabled ? CLAUDE_AUTO_MEMBER_SLOT
+    : cursorAcpEnabled ? CURSOR_ACP_MEMBER_SLOT : null;
   await msgStore.append({
     conversationId: envelope.conversationId,
     msgId: envelope.msgId,
@@ -442,6 +478,7 @@ const flushLoop = async () => {
       wakeMonitor.reconcileProcessingAttempts();
       runtimeBindingStore?.reconcileStale({ processingStartedTtlMs });
       await claudeOneShotRuntime?.recoverCompletedReplies();
+      await cursorAcpRuntime?.recoverCompletedReplies();
       await wakeMonitor.drain();
     } catch (err) {
       log("error", "Wake dispatch retry error", { error: err.message });
@@ -467,7 +504,9 @@ const shutdown = async (signal) => {
   log("info", "Shutdown signal received, draining NATS", { signal });
   running = false;
   await claudeOneShotRuntime?.cancel();
-  claudeOneShotRuntime?.shutdown();
+  await cursorAcpRuntime?.cancel();
+  await claudeOneShotRuntime?.shutdown();
+  await cursorAcpRuntime?.shutdown();
   try {
     await broker.close();
   } catch (err) {
