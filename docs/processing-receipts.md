@@ -14,7 +14,7 @@ to `started` and then to `completed` or `failed`.
 
 | Runtime path | Trustworthy started point | Trustworthy completed point | Trustworthy failed point | Capability |
 |---|---|---|---|---|
-| Codex App Server | `turn/started` for the returned turn id | `turn/completed`, or a correlated rollout `task_complete` fallback | app-server error, close, or completion timeout | `completed` |
+| Codex App Server | None guaranteed on the autonomous Unix/WebSocket path; observed `turn/started` remains diagnostic only | `turn/completed`, or a correlated rollout `task_complete` fallback | app-server error, close, or completion timeout | `completed` (created → completed) |
 | Claude Code `asyncRewake` | None. Exit 2 only proves wake text was emitted to Claude Code | None. The current Stop hook has no durable binding from a Stop event to one inbound message and attempt | Wake script faults are observable but do not prove a model-turn failure | `none` |
 | Codex one-shot responder | The responder process can claim its send, but model generation occurred outside this script | None for the model turn; successful reply persistence/send is only a reply-delivery fact | Responder/send failure only | `none` for model processing |
 | `on-receive-llm.mjs` | Immediately before the real LLM request | Successful LLM response, before reply delivery | Configuration error or LLM invocation error; the hook exits non-zero so normal retry policy applies | `completed` when `onReceiveProcessingReceipts` is enabled |
@@ -86,3 +86,11 @@ completion may occur with no reply, and a reply with `replyToMessageId` does not
 imply that processing completed. Reply delivery failure after a successful LLM or
 Codex turn is logged separately and does not rewrite a completed model receipt as
 failed.
+
+For the autonomous Codex adapter, completed metadata records the actual
+per-attempt App Server thread. Thread affinity is scoped to sender+conversation
+and to the current external server generation; it is not derived from the runtime
+binding's single `runtime_session_id`. A server-generation change before durable
+completion leaves the attempt without fabricated completion and permits normal
+at-least-once recovery. Completed reply recovery uses stored metadata and does not
+require the original thread or a currently connected App Server.

@@ -186,12 +186,32 @@ const buildInitializeRequest = (id) => ({
 });
 
 export class CodexAppServerClient {
-  constructor({ socketPath, timeoutMs = DEFAULT_TIMEOUT_MS, WebSocketImpl = WebSocket } = {}) {
+  constructor({ socketPath, timeoutMs = DEFAULT_TIMEOUT_MS, WebSocketImpl = WebSocket, diagnosticObserver = null } = {}) {
     if (!socketPath) throw new Error("codex-app-server-socket-missing");
     this.socketPath = socketPath;
     this.timeoutMs = timeoutMs;
     this.WebSocketImpl = WebSocketImpl;
+    this.diagnosticObserver = typeof diagnosticObserver === "function" ? diagnosticObserver : null;
     this.nextId = 1;
+  }
+
+  observe(message, details = {}) {
+    if (!this.diagnosticObserver) return;
+    const params = message?.params || {};
+    try {
+      this.diagnosticObserver({
+        method: details.method || message?.method || null,
+        threadId: params.threadId || params.thread?.id || details.threadId || null,
+        turnId: params.turnId || params.turn?.id || details.turnId || null,
+        turnStatus: params.turn?.status || details.turnStatus || null,
+        timestamp: new Date().toISOString(),
+        transport: "ws-unix",
+        source: details.source || "app-server-notification",
+        ...(details.reason ? { reason: details.reason } : {}),
+      });
+    } catch {
+      // Diagnostics must never change protocol behavior.
+    }
   }
 
   request(method, params) {
@@ -276,6 +296,7 @@ export class CodexAppServerClient {
       let turnId = null;
       let startResult = null;
       let finalText = "";
+      let startedObserved = false;
       const requestId = this.nextId++;
       const initId = `init-${this.nextId++}`;
       const url = `ws+unix://${this.socketPath}:/`;
@@ -291,6 +312,10 @@ export class CodexAppServerClient {
         const text = readFinalAnswerFromSessionLog(sessionPath, turnId);
         if (!text) return;
         finalText = finalText || text;
+        if (!startedObserved) this.observe(null, { method: "turn/started", turnId,
+          source: "missing-start-diagnostic", reason: "session-log-completed-without-observed-start" });
+        this.observe(null, { method: "turn/completion-source", turnId,
+          turnStatus: "completed", source: "session-log" });
         finish(null, { ...startResult, finalText, turnId, source: "session-log" });
       }, SESSION_LOG_POLL_INTERVAL_MS);
 
@@ -350,6 +375,8 @@ export class CodexAppServerClient {
           return;
         }
 
+        if (typeof message.method === "string") this.observe(message);
+
         if (message.id === initId) {
           if (message.error) {
             finish(new Error(`codex-app-server-initialize-error:${message.error.message || JSON.stringify(message.error)}`));
@@ -376,7 +403,13 @@ export class CodexAppServerClient {
         if (message.method === "turn/started" && message.params?.turn?.id) {
           turnId = turnId || message.params.turn.id;
           try {
-            onStarted?.({ turnId });
+            const callbackResult = onStarted?.({ turnId, threadId: message.params.threadId || null });
+            if (callbackResult?.accepted === false) {
+              this.observe(message, { source: "processing-started-rejected", reason: callbackResult.reason || "rejected" });
+              finish(new Error(`codex-processing-started-receipt-rejected:${callbackResult.reason || "rejected"}`));
+              return;
+            }
+            startedObserved = true;
           } catch (err) {
             const e = err instanceof Error ? err : new Error(String(err));
             finish(new Error(`codex-processing-started-receipt-failed:${e.message}`));
@@ -403,6 +436,9 @@ export class CodexAppServerClient {
             finish(new Error(`codex-app-server-turn-${status}:${detail}`));
             return;
           }
+          if (!startedObserved) this.observe(message, { method: "turn/started", source: "missing-start-diagnostic",
+            reason: "terminal-completed-without-observed-start" });
+          this.observe(message, { source: "app-server-events", turnId });
           finish(null, { ...startResult, finalText, turnId, source: "app-server-events" });
         }
       });
@@ -513,7 +549,10 @@ export const createCodexAppServerInjector = ({ Client = CodexAppServerClient, lo
     const socketPath = peer?.socketPath || peer?.target;
     if (!socketPath) throw new Error(`codex-app-server-socket-missing:${payload.from}`);
 
-    const client = new Client({ socketPath, timeoutMs });
+    const diagnosticObserver = peer?.protocolDiagnostics === true
+      ? (diagnostic) => log("info", "Codex app-server protocol diagnostic", diagnostic)
+      : null;
+    const client = new Client({ socketPath, timeoutMs, diagnosticObserver });
     const text = buildCodexTurnText(payload, peer);
     const threadStartBinding = peer?.threadStartBinding ?? (resolveThreadStartBinding ? await resolveThreadStartBinding(payload, peer) : null);
     const bindingMetadata = threadStartBinding?.metadata ?? {};
@@ -547,14 +586,19 @@ export const createCodexAppServerInjector = ({ Client = CodexAppServerClient, lo
       },
     });
     const startTurn = async (threadId) => {
-      if (!processing && peer?.relayFinalToMurmur !== true) {
+      if (!processing && peer?.relayFinalToMurmur !== true && peer?.returnFinalToCaller !== true) {
         return client.request("turn/start", turnParams(threadId));
       }
       const result = await client.startTurnAndWaitForFinal(turnParams(threadId), {
         completionTimeoutMs: Number(peer?.replyTimeoutMs) || DEFAULT_TURN_COMPLETION_TIMEOUT_MS,
         sessionPath: threadPath,
-        onStarted: ({ turnId }) => processing?.started({ sessionId: turnId }),
+        ...(typeof processing?.started === "function"
+          ? { onStarted: ({ turnId }) => processing.started({ sessionId: turnId }) }
+          : {}),
       });
+      diagnosticObserver?.({ method: "turn/completion-source", threadId, turnId: result?.turnId ?? null,
+        turnStatus: "completed", timestamp: new Date().toISOString(), transport: "ws-unix",
+        source: result?.source || "unknown" });
       processing?.completed({ sessionId: result?.turnId ?? null });
       if (peer?.relayFinalToMurmur === true) {
         let relay = null;

@@ -342,7 +342,7 @@ test("readFinalAnswerFromSessionLog reads task_complete by turn id", () => {
   assert.equal(readFinalAnswerFromSessionLog(sessionPath, "turn-target"), "WAKE_OK");
 });
 
-const protocolWebSocket = (turnStatus = "completed") => class FakeWebSocket extends EventEmitter {
+const protocolWebSocket = (turnStatus = "completed", { emitStarted = true } = {}) => class FakeWebSocket extends EventEmitter {
   constructor() {
     super();
     queueMicrotask(() => this.emit("open"));
@@ -356,7 +356,7 @@ const protocolWebSocket = (turnStatus = "completed") => class FakeWebSocket exte
     } else if (request.method === "turn/start") {
       queueMicrotask(() => {
         emit({ id: request.id, result: { turn: { id: "turn-protocol" } } });
-        emit({ method: "turn/started", params: { turn: { id: "turn-protocol", status: "inProgress" } } });
+        if (emitStarted) emit({ method: "turn/started", params: { threadId: "thread-1", turn: { id: "turn-protocol", status: "inProgress" } } });
         emit({ method: "item/completed", params: { turnId: "turn-protocol", item: { type: "agentMessage", phase: "final_answer", text: "final" } } });
         emit({ method: "turn/completed", params: { turn: { id: "turn-protocol", status: turnStatus, ...(turnStatus === "completed" ? {} : { error: { message: "model failed" } }) } } });
       });
@@ -366,7 +366,7 @@ const protocolWebSocket = (turnStatus = "completed") => class FakeWebSocket exte
   close() {}
 };
 
-test("Codex protocol fixture maps turn/started and turn/completed to trustworthy lifecycle points", async () => {
+test("Codex protocol fixture exposes observed turn/started and terminal completion callbacks", async () => {
   const started = [];
   const client = new CodexAppServerClient({ socketPath: "/fake/codex.sock", WebSocketImpl: protocolWebSocket() });
   const result = await client.startTurnAndWaitForFinal({ threadId: "thread-1", input: [] }, {
@@ -376,6 +376,34 @@ test("Codex protocol fixture maps turn/started and turn/completed to trustworthy
   assert.equal(result.turnId, "turn-protocol");
   assert.equal(result.finalText, "final");
   assert.equal(result.source, "app-server-events");
+});
+
+test("Codex protocol reports missing start without synthesizing it", async () => {
+  const diagnostics = [];
+  const client = new CodexAppServerClient({ socketPath: "/fake/codex.sock",
+    WebSocketImpl: protocolWebSocket("completed", { emitStarted: false }),
+    diagnosticObserver: (event) => diagnostics.push(event) });
+  const started = [];
+  const result = await client.startTurnAndWaitForFinal({ threadId: "thread-1", input: [] }, {
+    onStarted: (event) => started.push(event),
+  });
+  assert.equal(result.source, "app-server-events");
+  assert.equal(started.length, 0);
+  assert.ok(diagnostics.some((event) => event.method === "turn/started"
+    && event.source === "missing-start-diagnostic"
+    && event.reason === "terminal-completed-without-observed-start"));
+});
+
+test("Codex protocol fails closed when durable started receipt is rejected", async () => {
+  const diagnostics = [];
+  const client = new CodexAppServerClient({ socketPath: "/fake/codex.sock",
+    WebSocketImpl: protocolWebSocket(), diagnosticObserver: (event) => diagnostics.push(event) });
+  await assert.rejects(() => client.startTurnAndWaitForFinal({ threadId: "thread-1", input: [] }, {
+    onStarted: () => ({ accepted: false, reason: "stale-runtime-fence" }),
+  }), /codex-processing-started-receipt-rejected:stale-runtime-fence/);
+  assert.ok(diagnostics.some((event) => event.source === "processing-started-rejected"
+    && event.method === "turn\/started" && event.threadId === "thread-1"
+    && event.turnId === "turn-protocol" && event.reason === "stale-runtime-fence"));
 });
 
 test("Codex protocol fixture treats a failed terminal turn as processing failure", async () => {

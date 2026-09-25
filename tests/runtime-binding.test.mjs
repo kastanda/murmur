@@ -267,6 +267,26 @@ test("binding crash before handoff makes dispatch retryable and reassignable", (
   } finally { ctx.close(); }
 });
 
+test("binding crash with a created-only completed-capability attempt becomes retryable", () => {
+  const ctx = setup();
+  try {
+    addBinding(ctx.bindings, "codex-1", "codex:app-server");
+    const item = prepareDispatch(ctx.dispatch, "msg-codex-created", "codex:app-server");
+    const fence = ctx.bindings.assignDispatch(item, route("codex:app-server"), 1001);
+    assert.equal(ctx.bindings.markWaking(fence, 1002), 1);
+    assert.equal(ctx.dispatch.beginHandoff(item, 1002, {
+      attemptId: "attempt-codex-created", runtime: "codex_app_server", capability: "completed",
+    }), 1);
+    assert.equal(ctx.bindings.markRunning(fence, 1003), 1);
+
+    const events = ctx.bindings.reconcileStale({ now: 1200, retryAt: 1200 });
+    assert.ok(events.some((event) => event.type === "assignment-retryable"));
+    assert.equal(ctx.dispatch.getProcessingAttempt("attempt-codex-created").status, "created");
+    assert.equal(ctx.dispatch.get(item).state, "failed");
+    assert.equal(ctx.dispatch.get(item).ownerBindingId, null);
+  } finally { ctx.close(); }
+});
+
 test("binding crash while running holds fresh started receipt and completed evidence wins", () => {
   const ctx = setup();
   try {
