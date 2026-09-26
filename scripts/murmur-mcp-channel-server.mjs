@@ -5,7 +5,7 @@ import { createInterface } from "node:readline";
 import { homedir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { NatsBroker } from "../packages/broker-nats/dist/src/index.js";
-import { SQLiteDedupeOutboxStore } from "../packages/core/dist/src/index.js";
+import { SQLiteDedupeOutboxStore, stableEnvelopePayload } from "../packages/core/dist/src/index.js";
 import {
   decryptPayload,
   verifyEnvelopeSignature,
@@ -54,18 +54,6 @@ const envNum = (name, defaultValue) => {
   const value = Number(process.env[name]);
   return Number.isFinite(value) && value > 0 ? value : defaultValue;
 };
-
-const stableEnvelopePayload = (envelope) =>
-  JSON.stringify({
-    schemaVersion: envelope.schemaVersion,
-    msgId: envelope.msgId,
-    conversationId: envelope.conversationId,
-    senderAgentId: envelope.senderAgentId,
-    recipients: [...envelope.recipients],
-    createdAt: envelope.createdAt,
-    payloadCiphertext: envelope.payloadCiphertext,
-    payloadNonce: envelope.payloadNonce,
-  });
 
 const dataDir = process.env.DATA_DIR || ".data";
 const configPath = path.join(dataDir, "agent-config.json");
@@ -124,10 +112,11 @@ const claimDelivery = (envelope) => {
   return claim;
 };
 
-const emitChannelNotification = ({ from, text, msgId, conversationId, createdAt }) => {
+const emitChannelNotification = ({ from, text, msgId, replyToMessageId, conversationId, createdAt }) => {
   const data = {
     text: `${textPrefix}${text}`,
     msgId,
+    ...(replyToMessageId ? { replyToMessageId } : {}),
     source: from,
     conversationId,
     createdAt,
@@ -198,6 +187,7 @@ const onMessage = async (envelope) => {
     from: envelope.senderAgentId,
     text: plaintext,
     msgId: envelope.msgId,
+    replyToMessageId: envelope.replyToMessageId,
     conversationId: envelope.conversationId,
     createdAt: envelope.createdAt,
   });

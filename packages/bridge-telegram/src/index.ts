@@ -132,6 +132,7 @@ export class TelegramBridge {
     await this.store.append({
       conversationId: envelope.conversationId,
       msgId: envelope.msgId,
+      ...(envelope.replyToMessageId ? { replyToMessageId: envelope.replyToMessageId } : {}),
       direction: "outbound",
       sender: envelope.senderAgentId,
       text,
@@ -165,6 +166,7 @@ export class TelegramBridge {
       await this.store.append({
         conversationId: envelope.conversationId,
         msgId: envelope.msgId,
+        ...(envelope.replyToMessageId ? { replyToMessageId: envelope.replyToMessageId } : {}),
         direction: "inbound",
         sender: envelope.senderAgentId,
         text: msg.text,

@@ -10,6 +10,7 @@
 import { createInterface } from "node:readline/promises";
 import path from "node:path";
 import { createKeyPair, createSigningKeyPair, getCryptoProvider } from "@murmurv2/security";
+import { localHandoffCapabilities } from "./agent-handoff-controller.mjs";
 import { readPrivateJson, writePrivateJson } from "./secure-state.mjs";
 
 const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -45,6 +46,7 @@ const run = async () => {
   const encryption = await createKeyPair();
   const signing = await createSigningKeyPair();
 
+  const capabilities = localHandoffCapabilities();
   const config = {
     agentId,
     natsUrl,
@@ -52,6 +54,10 @@ const run = async () => {
     subject: `msg.${agentId}`,
     dataDir,
     cryptoProvider: getCryptoProvider().name,
+    // Advertised to peers during pairing. `handoff-v1` + protocol 1.1 is what makes this
+    // agent eligible to RECEIVE an explicit handoff; a peer missing it fails closed.
+    protocolVersions: capabilities.protocolVersions,
+    features: capabilities.features,
     keys: { encryption, signing },
     ackSecurity: {
       emitSigned: true,
@@ -69,12 +75,16 @@ const run = async () => {
   console.log(JSON.stringify({
     agentId,
     subject: config.subject,
+    protocolVersions: config.protocolVersions,
+    features: config.features,
     encryption: { publicKey: encryption.publicKey },
     signing: { publicKey: signing.publicKey },
   }, null, 2));
   console.log("");
   console.log("To add a peer, edit the 'peers' section in agent-config.json:");
-  console.log(`  "peers": { "other-agent": { "encryption": { "publicKey": "..." }, "signing": { "publicKey": "..." }, "subject": "msg.other-agent" } }`);
+  console.log(`  "peers": { "other-agent": { "encryption": { "publicKey": "..." }, "signing": { "publicKey": "..." }, "subject": "msg.other-agent", "protocolVersions": ["1.0", "1.1"], "features": ["handoff-v1"] } }`);
+  console.log("");
+  console.log('A peer without "protocolVersions":["1.0","1.1"] and "features":["handoff-v1"] cannot receive handoffs.');
 
   rl.close();
 };

@@ -85,7 +85,7 @@ async function waitForPath(filePath, exists = true) {
   }
 }
 
-test("node drain seeds the cursor to the tip on first run and stays silent", () => {
+test("node drain --once seeds the cursor to the tip on first run and stays silent", () => {
   const ctx = withDb();
   insertMessage(ctx.db, { msgId: "old-1", text: "history one" });
   insertMessage(ctx.db, { msgId: "old-2", text: "history two" });
@@ -95,6 +95,34 @@ test("node drain seeds the cursor to the tip on first run and stays silent", () 
   assert.equal(result.status, 0);
   assert.equal(result.stderr, "");
   assert.equal(fs.readFileSync(ctx.cursorPath, "utf8").trim(), "2");
+});
+
+test("node drain first default poll stays armed after initial seed and wakes for a future inbound", async () => {
+  const ctx = withDb();
+  ctx.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 2000;");
+
+  assert.equal(fs.existsSync(ctx.cursorPath), false);
+  assert.equal(fs.existsSync(ctx.lockPath), false);
+
+  const poller = startPoller(ctx);
+  await Promise.all([waitForPath(ctx.cursorPath), waitForPath(ctx.lockPath)]);
+
+  assert.equal(poller.child.exitCode, null, "the initial default poller must remain alive after seeding");
+  assert.equal(fs.readFileSync(ctx.cursorPath, "utf8").trim(), "0");
+  assert.equal(fs.readFileSync(ctx.lockPath, "utf8").trim(), String(poller.child.pid));
+
+  insertMessage(ctx.db, {
+    msgId: "live-first-wake",
+    conversationId: "murmur-soak:first-wake",
+    text: "arrived after initial seed",
+  });
+
+  const result = await poller.result;
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /msgId=live-first-wake/);
+  assert.match(result.stderr, /conversationId=murmur-soak:first-wake/);
+  assert.equal(fs.readFileSync(ctx.cursorPath, "utf8").trim(), "1");
+  assert.equal(fs.existsSync(ctx.lockPath), false, "wake exit must release the initial poller's lock");
 });
 
 test("node drain emits new inbound rows and advances the cursor", () => {
@@ -118,6 +146,28 @@ test("node drain emits new inbound rows and advances the cursor", () => {
   assert.match(result.stderr, /Reply via murmur_send using the same conversationId\./);
   assert.doesNotMatch(result.stderr, /ignore me/);
   assert.equal(fs.readFileSync(ctx.cursorPath, "utf8").trim(), "3");
+});
+
+test("node interactive drain excludes claude:auto rows while preserving legacy inbound", () => {
+  const ctx = withDb();
+  ctx.db.exec("ALTER TABLE local_messages ADD COLUMN member_slot TEXT");
+  assert.equal(drain(ctx).status, 0);
+  ctx.db.prepare(`
+    INSERT INTO local_messages (msg_id, created_at, sender, conversation_id, direction, text, member_slot)
+    VALUES (?, '2026-08-28T00:00:00.000Z', ?, ?, 'inbound', ?, ?)
+  `).run("auto-1", "agent-peer", "conv-auto", "autonomous only", "claude:auto");
+  const autoOnly = drain(ctx);
+  assert.equal(autoOnly.status, 0);
+  assert.doesNotMatch(autoOnly.stderr, /auto-1|autonomous only/);
+
+  ctx.db.prepare(`
+    INSERT INTO local_messages (msg_id, created_at, sender, conversation_id, direction, text, member_slot)
+    VALUES (?, '2026-08-28T00:00:01.000Z', ?, ?, 'inbound', ?, NULL)
+  `).run("legacy-1", "agent-peer", "conv-legacy", "legacy visible");
+  const legacy = drain(ctx);
+  assert.equal(legacy.status, 2);
+  assert.match(legacy.stderr, /legacy-1.*legacy visible/);
+  assert.doesNotMatch(legacy.stderr, /auto-1|autonomous only/);
 });
 
 test("node drain preserves each exact conversation id in a multi-message wake", () => {

@@ -85,8 +85,15 @@ while true; do
   last="$(cat "$CURSOR" 2>/dev/null || printf '0\n')"
   case "$last" in ''|*[!0-9]*) last=0 ;; esac
 
+  has_member_slot="$(sqlite3 "$DB" "SELECT COUNT(*) FROM pragma_table_info('local_messages') WHERE name='member_slot';" 2>/dev/null || echo 0)"
+  if [ "$has_member_slot" = "1" ]; then
+    slot_filter="AND (member_slot IS NULL OR member_slot <> 'claude:auto')"
+  else
+    slot_filter=""
+  fi
+
   max="$(sqlite3 "$DB" \
-    "SELECT COALESCE(MAX(rowid), $last) FROM local_messages WHERE direction='inbound';" \
+    "SELECT COALESCE(MAX(rowid), $last) FROM local_messages WHERE direction='inbound' $slot_filter;" \
     2>/dev/null || echo "$last")"
   case "$max" in ''|*[!0-9]*) max="$last" ;; esac
 
@@ -94,7 +101,7 @@ while true; do
     rows="$(sqlite3 "$DB" \
       "SELECT '  rowid='||rowid||' ['||sender||'] '||substr(replace(replace(text,char(10),' '),char(13),' '),1,400) \
        FROM local_messages \
-       WHERE direction='inbound' AND rowid > $last \
+       WHERE direction='inbound' AND rowid > $last $slot_filter \
        ORDER BY rowid;" 2>/dev/null || true)"
     # drain-to-tip: advance cursor so the message wakes exactly once
     tmp="${CURSOR}.$$"

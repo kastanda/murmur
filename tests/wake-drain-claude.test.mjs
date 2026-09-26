@@ -103,6 +103,28 @@ test("Claude wake drain emits new inbound rows and advances the cursor", () => {
   assert.equal(fs.readFileSync(ctx.cursorPath, "utf8").trim(), "3");
 });
 
+test("shell interactive drain excludes claude:auto rows while preserving legacy inbound", () => {
+  const ctx = withDb();
+  ctx.db.exec("ALTER TABLE local_messages ADD COLUMN member_slot TEXT");
+  assert.equal(drain(ctx).status, 0);
+  ctx.db.prepare(`
+    INSERT INTO local_messages (msg_id, created_at, sender, conversation_id, direction, text, member_slot)
+    VALUES (?, '2026-06-20T00:00:00.000Z', ?, ?, 'inbound', ?, ?)
+  `).run("auto-shell", "agent-peer", "conv-auto", "autonomous only", "claude:auto");
+  const autoOnly = drain(ctx);
+  assert.equal(autoOnly.status, 0);
+  assert.doesNotMatch(autoOnly.stderr, /auto-shell|autonomous only/);
+
+  ctx.db.prepare(`
+    INSERT INTO local_messages (msg_id, created_at, sender, conversation_id, direction, text, member_slot)
+    VALUES (?, '2026-06-20T00:00:01.000Z', ?, ?, 'inbound', ?, NULL)
+  `).run("legacy-shell", "agent-peer", "conv-legacy", "legacy visible");
+  const legacy = drain(ctx);
+  assert.equal(legacy.status, 2);
+  assert.match(legacy.stderr, /legacy-shell.*legacy visible/);
+  assert.doesNotMatch(legacy.stderr, /auto-shell|autonomous only/);
+});
+
 test("Claude wake drain preserves each exact conversation id in a multi-message wake", () => {
   const ctx = withDb();
   drain(ctx);

@@ -11,19 +11,33 @@ import { readPrivateJson } from "./secure-state.mjs";
 
 const args = process.argv.slice(2);
 const opt = {};
+let replyToFlagPresent = false;
 for (let i = 0; i < args.length; i += 1) {
   const a = args[i];
   if (a === "--to") opt.to = args[++i];
   else if (a === "--conv" || a === "--conversation") opt.conversationId = args[++i];
+  else if (a === "--reply-to" || a === "--reply-to-message-id") {
+    replyToFlagPresent = true;
+    opt.replyToMessageId = args[++i];
+  }
   else if (a === "--text") opt.text = args[++i];
   else if (a === "--text-file") opt.textFile = args[++i];
   else if (a === "--stdin") opt.stdin = true;
   else if (a === "--help" || a === "-h") opt.help = true;
 }
 
+if (
+  replyToFlagPresent &&
+  (typeof opt.replyToMessageId !== "string" || !opt.replyToMessageId.trim() || opt.replyToMessageId.startsWith("--"))
+) {
+  process.stderr.write("error: --reply-to requires a non-empty message ID\n");
+  process.exit(1);
+}
+if (replyToFlagPresent) opt.replyToMessageId = opt.replyToMessageId.trim();
+
 if (opt.help || !opt.to || (!opt.text && !opt.textFile && !opt.stdin)) {
   process.stderr.write(
-    "usage: murmur-shell-send.mjs --to <peer-id> (--text <txt> | --text-file <path> | --stdin) [--conv <id>]\n",
+    "usage: murmur-shell-send.mjs --to <peer-id> (--text <txt> | --text-file <path> | --stdin) [--conv <id>] [--reply-to <msg-id>]\n",
   );
   process.exit(1);
 }
@@ -76,6 +90,7 @@ try {
     senderAgentId: cfg.agentId,
     recipients: [opt.to],
     createdAt,
+    ...(opt.replyToMessageId ? { replyToMessageId: opt.replyToMessageId } : {}),
     payloadCiphertext: encrypted.ciphertext,
     payloadNonce: encrypted.nonce,
     signature: "",
@@ -94,6 +109,7 @@ try {
   await store.append({
     conversationId,
     msgId,
+    ...(opt.replyToMessageId ? { replyToMessageId: opt.replyToMessageId } : {}),
     direction: "outbound",
     sender: cfg.agentId,
     text,
@@ -102,7 +118,7 @@ try {
   });
 
   process.stdout.write(
-    `${JSON.stringify({ msgId, to: opt.to, conversationId, status: "queued" })}\n`,
+    `${JSON.stringify({ msgId, to: opt.to, conversationId, ...(opt.replyToMessageId ? { replyToMessageId: opt.replyToMessageId } : {}), status: "queued" })}\n`,
   );
   process.exit(0);
 } catch (err) {

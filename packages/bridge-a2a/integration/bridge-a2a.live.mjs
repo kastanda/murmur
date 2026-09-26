@@ -73,7 +73,7 @@ test("LIVE: A2A client -> bridge -> NATS mesh -> mock agent -> reply", async (t)
       );
       const task = JSON.parse(plain);
       receivedTaskText = task.text;
-      // reply sealed back to the bridge, parentMsgId correlates to the original
+      // reply sealed back to the bridge, replyToMessageId correlates to the original
       const replyEnc = await encryptPayload(
         JSON.stringify({ reply: ANSWER, echo: task.text }),
         bridgeEnc.publicKey,
@@ -82,7 +82,7 @@ test("LIVE: A2A client -> bridge -> NATS mesh -> mock agent -> reply", async (t)
       const unsigned = {
         schemaVersion: "1.0",
         msgId: randomUUID(),
-        parentMsgId: env.msgId,
+        replyToMessageId: env.msgId,
         conversationId: env.conversationId,
         senderAgentId: target,
         recipients: [env.senderAgentId],

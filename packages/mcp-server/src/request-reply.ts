@@ -77,11 +77,11 @@ export async function waitForReply(deps: ReplyWaiterDeps): Promise<LocalMessageR
 }
 
 /**
- * Build a predicate that matches an inbound envelope as the awaited reply:
- * same conversation AND sent by the peer we are waiting on. Envelope metadata is
- * plaintext (conversationId / senderAgentId), so this needs no decryption.
+ * Build a predicate that matches an inbound envelope as the awaited reply. A reply
+ * must name the exact request msgId and come from the expected peer; conversationId
+ * is deliberately not a correlation key.
  */
 export const buildReplyMatcher =
-  (conversationId: string, fromAgentId: string) =>
-  (envelope: { conversationId: string; senderAgentId: string }): boolean =>
-    envelope.conversationId === conversationId && envelope.senderAgentId === fromAgentId;
+  (requestMessageId: string, fromAgentId: string) =>
+  (envelope: { replyToMessageId?: string; senderAgentId: string }): boolean =>
+    envelope.replyToMessageId === requestMessageId && envelope.senderAgentId === fromAgentId;

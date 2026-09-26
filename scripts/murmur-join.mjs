@@ -10,6 +10,7 @@
 import { createInterface } from "node:readline/promises";
 import path from "node:path";
 import { createKeyPair, createSigningKeyPair, getCryptoProvider } from "@murmurv2/security";
+import { localHandoffCapabilities, peerCapabilityFields } from "./agent-handoff-controller.mjs";
 import { readPrivateJson, writePrivateJson } from "./secure-state.mjs";
 
 const blob = process.argv[2];
@@ -54,6 +55,7 @@ try {
   const encryption = await createKeyPair();
   const signing = await createSigningKeyPair();
 
+  const capabilities = localHandoffCapabilities();
   config = {
     agentId,
     natsUrl: invite.natsUrl,
@@ -61,6 +63,8 @@ try {
     subject: `msg.${agentId}`,
     dataDir,
     cryptoProvider: getCryptoProvider().name,
+    protocolVersions: capabilities.protocolVersions,
+    features: capabilities.features,
     keys: { encryption, signing },
     peers: {},
   };
@@ -75,6 +79,8 @@ config.peers[invite.agentId] = {
   encryption: { publicKey: invite.encryption.publicKey },
   signing: { publicKey: invite.signing.publicKey },
   subject: invite.subject,
+  // Only what the inviter actually advertised. Absent => this peer can never receive a handoff.
+  ...peerCapabilityFields(invite),
 };
 
 // Also update natsUrl/natsToken if config was pre-existing but pointed elsewhere
@@ -85,6 +91,7 @@ if (config.natsUrl !== invite.natsUrl) {
 
 await writePrivateJson(configPath, config);
 console.log(`[join] Added peer: ${invite.agentId}`);
+console.log(`[join] Peer handoff capability: ${(invite.features || []).includes("handoff-v1") ? "handoff-v1" : "none (handoffs to this peer will be refused)"}`);
 
 // Generate reply blob
 const reply = {
@@ -92,6 +99,8 @@ const reply = {
   type: "reply",
   agentId: config.agentId,
   subject: config.subject,
+  protocolVersions: config.protocolVersions ?? localHandoffCapabilities().protocolVersions,
+  features: config.features ?? localHandoffCapabilities().features,
   encryption: { publicKey: config.keys.encryption.publicKey },
   signing: { publicKey: config.keys.signing.publicKey },
 };

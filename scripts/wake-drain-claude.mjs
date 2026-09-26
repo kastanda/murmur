@@ -95,11 +95,17 @@ function maxInbound(db) {
 }
 
 function newRows(db, since) {
+  const columns = db.prepare("PRAGMA table_info(local_messages)").all();
+  const hasReplyColumn = columns.some((column) => column.name === "reply_to_message_id");
+  const hasMemberSlotColumn = columns.some((column) => column.name === "member_slot");
+  const replyColumn = hasReplyColumn ? "reply_to_message_id" : "NULL AS reply_to_message_id";
+  const slotFilter = hasMemberSlotColumn ? "AND (member_slot IS NULL OR member_slot <> 'claude:auto')" : "";
   return db.prepare(
     `SELECT rowid, sender, msg_id, conversation_id,
+            ${replyColumn},
             substr(replace(replace(text, char(10), ' '), char(13), ' '), 1, 360) AS snippet
        FROM local_messages
-      WHERE direction='inbound' AND rowid > ?
+      WHERE direction='inbound' AND rowid > ? ${slotFilter}
       ORDER BY rowid`,
   ).all(since);
 }
@@ -111,11 +117,12 @@ function emitAndExit(rows) {
   writeCursor(rows[rows.length - 1].rowid);
   releaseLock();
   const lines = rows.map(
-    (r) => `  rowid=${r.rowid} [${r.sender}] msgId=${r.msg_id} conversationId=${r.conversation_id} ${r.snippet}`,
+    (r) => `  rowid=${r.rowid} [${r.sender}] msgId=${r.msg_id} conversationId=${r.conversation_id}` +
+      `${r.reply_to_message_id ? ` replyToMessageId=${r.reply_to_message_id}` : ""} ${r.snippet}`,
   );
   process.stderr.write(
     `Murmur wake: ${rows.length} new inbound message(s):\n${lines.join("\n")}\n` +
-    `Reply via murmur_send using the same conversationId.\n`,
+    `Reply via murmur_send using the same conversationId. Set replyToMessageId to the inbound msgId.\n`,
   );
   process.exit(2);
 }
@@ -192,6 +199,8 @@ async function main() {
   try { statSync(DB); } catch (err) { bail("store not readable", err); }
 
   // First run ever: establish a baseline at the current tip, do not dump history.
+  // A one-shot invocation is done after seeding, but the default Stop-hook poller
+  // must remain armed for messages that arrive after the session becomes idle.
   let cursorExists = true;
   try { statSync(CURSOR); } catch { cursorExists = false; }
   if (!cursorExists) {
@@ -199,7 +208,7 @@ async function main() {
     const tip = maxInbound(db);
     db.close();
     writeCursor(tip);
-    process.exit(0);
+    if (ONCE) process.exit(0);
   }
 
   if (ONCE) {
