@@ -16,9 +16,11 @@ import {
   createBoundAck,
   envelopeDigest,
   estimateBase64DecodedBytes,
+  type AnyEnvelope,
   type EnvelopeV1,
   isSignedAckV1,
   isEnvelopeV1,
+  isSupportedEnvelope,
   isSignedPresenceFrameV1,
   type SignedPresenceFrameV1,
   type AckReceiptStore,
@@ -52,7 +54,7 @@ export interface BrokerConfig {
   onStatus?: (status: BrokerStatusEvent) => void;
 }
 
-export type MessageHandler = (envelope: EnvelopeV1) => Promise<void>;
+export type MessageHandler = (envelope: AnyEnvelope) => Promise<void>;
 export type BrokerSubscription = Subscription | { unsubscribe(): void | Promise<void> };
 
 /**
@@ -63,7 +65,7 @@ export type BrokerSubscription = Subscription | { unsubscribe(): void | Promise<
  * enforcement). A rejected envelope is NACKed `auth-rejected:<reason>` and never
  * delivered. The hook MUST NOT log the token body.
  */
-export type InboundAuthorizer = (envelope: EnvelopeV1) => Promise<{ accepted: boolean; reason?: string }>;
+export type InboundAuthorizer = (envelope: AnyEnvelope) => Promise<{ accepted: boolean; reason?: string }>;
 
 export interface BrokerStatusEvent {
   type: string;
@@ -246,7 +248,7 @@ export class NatsBroker {
     });
   }
 
-  async publish(subject: string, envelope: EnvelopeV1, policy?: SecurityPolicy): Promise<void> {
+  async publish(subject: string, envelope: AnyEnvelope, policy?: SecurityPolicy): Promise<void> {
     const violations = validateEnvelopePolicy(envelope, policy);
     if (violations.length > 0) {
       throw new Error(`policy-rejected:${violations.join("|")}`);
@@ -275,7 +277,7 @@ export class NatsBroker {
   }
 
   private async createDeliveryAck(
-    envelope: EnvelopeV1,
+    envelope: AnyEnvelope,
     consumerId: string,
     status: AckV1["status"],
     reason: string | undefined,
@@ -298,10 +300,13 @@ export class NatsBroker {
   ): Promise<"ack" | "retry"> {
     let msgId = "unknown";
     let ackSubject = `ack.${params.consumerId}`;
-    let decodedEnvelope: EnvelopeV1 | undefined;
+    let decodedEnvelope: AnyEnvelope | undefined;
     try {
       const decoded = JSON.parse(this.sc.decode(data));
-      if (!isEnvelopeV1(decoded)) {
+      // Both supported wire versions are deliverable: ordinary/reply 1.0 and the 1.1
+       // handoff revision. A 1.1 envelope must NOT be NACKed as invalid here — the
+       // recipient daemon performs the signed-lineage and recipient checks.
+      if (!isSupportedEnvelope(decoded)) {
         await this.publishAck(ackSubject, createAck("unknown", params.consumerId, "nack", "invalid-envelope"));
         return "ack";
       }
@@ -488,7 +493,7 @@ export class NatsBroker {
    */
   async subscribeRaw(
     subject: string,
-    onEnvelope: (envelope: EnvelopeV1) => void,
+    onEnvelope: (envelope: AnyEnvelope) => void,
   ): Promise<BrokerSubscription> {
     await this.connect();
     const sub = this.nc!.subscribe(subject);
@@ -497,7 +502,7 @@ export class NatsBroker {
       for await (const m of sub) {
         try {
           const decoded = JSON.parse(this.sc.decode(m.data));
-          if (isEnvelopeV1(decoded)) onEnvelope(decoded);
+          if (isSupportedEnvelope(decoded)) onEnvelope(decoded);
         } catch {
           // ignore malformed frames — read-only wake signal, not a delivery path
         }
@@ -779,7 +784,7 @@ export class NatsBroker {
       const streamSeq = Math.trunc(streamSeqRaw);
       const stored = await this.jsm.streams.getMessage(advisory.stream, { seq: streamSeq });
       const envelope = JSON.parse(this.sc.decode(stored.data));
-      if (!isEnvelopeV1(envelope)) return;
+      if (!isSupportedEnvelope(envelope)) return;
 
       await outbox.markDlq(envelope.msgId, this.jetStreamAdvisoryReason(advisoryKind, advisory, streamSeq));
     } catch (err) {

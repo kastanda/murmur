@@ -50,6 +50,29 @@ const DDL = `
 
 const RETRYABLE_STATES = ["pending", "deferred", "failed"];
 
+const rebuildHandoffLineage = ({
+  handoffRootMessageId, handoffRootConversationId, handoffCausedByMessageId, handoffAncestryJson,
+}) => {
+  if (!handoffRootMessageId || !handoffRootConversationId || !handoffCausedByMessageId || !handoffAncestryJson) {
+    return null;
+  }
+  let ancestry;
+  try {
+    ancestry = JSON.parse(handoffAncestryJson);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(ancestry) || ancestry.length === 0) return null;
+  if (!ancestry.every((entry) => typeof entry === "string" && entry.length > 0)) return null;
+  if (new Set(ancestry).size !== ancestry.length) return null;
+  return {
+    rootMessageId: handoffRootMessageId,
+    rootConversationId: handoffRootConversationId,
+    causedByMessageId: handoffCausedByMessageId,
+    ancestry,
+  };
+};
+
 export class WakeDispatchStore {
   constructor(dbPath, { maxAttempts = 5, recipientId = "local", migrationFault = null } = {}) {
     this.db = new DatabaseSync(dbPath);
@@ -110,6 +133,44 @@ export class WakeDispatchStore {
       now,
       now,
     );
+    return this.get(identity);
+  }
+
+  /**
+   * Record an inbound message that was refused deterministically BEFORE any model
+   * execution (e.g. a handoff whose signed lineage or recipient is invalid).
+   *
+   * The row exists so the refusal is durable and auditable, and so inbound backfill
+   * after a restart can never resurrect a refused message as executable work.
+   */
+  rejectInbound(payload, reason, now = Date.now()) {
+    if (!payload?.msgId) throw new Error("wake-dispatch-msg-id-required");
+    if (!payload?.conversationId) throw new Error("wake-dispatch-conversation-id-required");
+    const identity = this.identityFor(payload);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare(`
+        INSERT INTO wake_dispatch
+          (msg_id, recipient_id, member_slot, conversation_id, payload_json, state,
+           attempts, claim_count, max_attempts, next_attempt_at, claimed_at,
+           last_error, created_at, updated_at, handed_off_at)
+        VALUES (?, ?, ?, ?, ?, 'rejected', 0, 0, ?, ?, NULL, ?, ?, ?, NULL)
+        ON CONFLICT(msg_id, recipient_id, member_slot) DO NOTHING
+      `).run(
+        identity.msgId, identity.recipientId, identity.memberSlot, payload.conversationId,
+        JSON.stringify(payload), this.maxAttempts, now, reason, now, now,
+      );
+      this.db.prepare(`
+        UPDATE wake_dispatch
+        SET state = 'rejected', last_error = ?, claimed_at = NULL, updated_at = ?
+        WHERE msg_id = ? AND recipient_id = ? AND member_slot = ?
+          AND state IN ('pending', 'claimed', 'deferred', 'failed')
+      `).run(reason, now, identity.msgId, identity.recipientId, identity.memberSlot);
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
     return this.get(identity);
   }
 
@@ -402,6 +463,16 @@ export class WakeDispatchStore {
       ? "member_slot AS memberSlot"
       : "NULL AS memberSlot";
     const memberSlotExpression = hasMemberSlotColumn ? "message.member_slot" : "NULL";
+    // Signed handoff lineage is recovered from its explicit durable columns, never by
+    // re-parsing plaintext: a recovered handoff dispatch keeps its exact lineage.
+    const hasHandoffColumns = this.hasLocalMessageHandoffColumns();
+    const handoffColumns = hasHandoffColumns
+      ? `handoff_root_message_id AS handoffRootMessageId,
+             handoff_root_conversation_id AS handoffRootConversationId,
+             handoff_caused_by_message_id AS handoffCausedByMessageId,
+             handoff_ancestry_json AS handoffAncestryJson`
+      : `NULL AS handoffRootMessageId, NULL AS handoffRootConversationId,
+             NULL AS handoffCausedByMessageId, NULL AS handoffAncestryJson`;
     const baseline = Number(this.db.prepare(`
       SELECT value FROM wake_dispatch_meta WHERE key = 'inbound-baseline-rowid'
     `).get()?.value ?? 0);
@@ -409,6 +480,7 @@ export class WakeDispatchStore {
       SELECT rowid AS cursor, conversation_id AS conversationId, msg_id AS msgId,
              ${replyColumn},
              ${memberSlotColumn},
+             ${handoffColumns},
              sender AS "from", text, created_at AS ts
       FROM local_messages AS message
       WHERE direction = 'inbound' AND rowid > ?
@@ -420,12 +492,22 @@ export class WakeDispatchStore {
         )
       ORDER BY rowid ASC
     `).all(baseline, this.recipientId, this.recipientId);
-    for (const row of rows) this.enqueue({
-      ...row,
-      ...(row.replyToMessageId ? { replyToMessageId: row.replyToMessageId } : {}),
-      ...(row.memberSlot ? { memberSlot: row.memberSlot } : {}),
-      cursor: Number(row.cursor),
-    }, now);
+    for (const row of rows) {
+      const {
+        handoffRootMessageId, handoffRootConversationId, handoffCausedByMessageId, handoffAncestryJson,
+        ...payload
+      } = row;
+      const handoff = rebuildHandoffLineage({
+        handoffRootMessageId, handoffRootConversationId, handoffCausedByMessageId, handoffAncestryJson,
+      });
+      this.enqueue({
+        ...payload,
+        ...(row.replyToMessageId ? { replyToMessageId: row.replyToMessageId } : {}),
+        ...(row.memberSlot ? { memberSlot: row.memberSlot } : {}),
+        ...(handoff ? { handoff } : {}),
+        cursor: Number(row.cursor),
+      }, now);
+    }
     return rows.length;
   }
 
@@ -498,6 +580,12 @@ export class WakeDispatchStore {
   hasLocalMessageMemberSlotColumn() {
     return this.db.prepare(`PRAGMA table_info(local_messages)`).all()
       .some((column) => column.name === "member_slot");
+  }
+
+  hasLocalMessageHandoffColumns() {
+    const columns = new Set(this.db.prepare(`PRAGMA table_info(local_messages)`).all().map((c) => c.name));
+    return ["handoff_root_message_id", "handoff_root_conversation_id",
+      "handoff_caused_by_message_id", "handoff_ancestry_json"].every((name) => columns.has(name));
   }
 
   hasMigrationBaseline() {

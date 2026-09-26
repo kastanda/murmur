@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
+import { HANDOFF_REASONS } from "@murmurv2/core";
+
+import { settleRuntimeTurn } from "./agent-handoff-runtime.mjs";
 
 import { CLAUDE_AUTO_MEMBER_SLOT, CLAUDE_ONE_SHOT_KIND } from "./claude-one-shot-runtime.mjs";
 import { CURSOR_ACP_KIND, CURSOR_ACP_MEMBER_SLOT } from "./cursor-acp-runtime.mjs";
@@ -59,6 +62,30 @@ export class CursorAcpRuntimeAdapter extends DelegatingRuntimeAdapter {
 
 const asError = (value) => value instanceof Error ? value : new Error(String(value));
 
+/**
+ * Codex continuation guard. The Unix-socket identity IS the external App Server
+ * generation: if it changed (or was never captured) the originating thread cannot be
+ * trusted to still exist, so the continuation fails closed instead of faking continuity.
+ * The numeric in-process generation is checked too, but only the durable socket identity
+ * survives a Murmur restart.
+ */
+export const codexHandoffResumeGuard = ({ continuation, serverGeneration, serverIdentity }) => {
+  if (!continuation.originatingRuntimeSessionId) {
+    return { ok: false, reason: HANDOFF_REASONS.continuationSessionUnavailable, detail: "no-originating-thread" };
+  }
+  if (!continuation.originatingServerIdentity || !serverIdentity) {
+    return { ok: false, reason: HANDOFF_REASONS.continuationServerGenerationChanged, detail: "server-identity-unknown" };
+  }
+  if (continuation.originatingServerIdentity !== serverIdentity) {
+    return { ok: false, reason: HANDOFF_REASONS.continuationServerGenerationChanged, detail: "server-identity-changed" };
+  }
+  if (continuation.originatingServerGeneration != null && serverGeneration != null
+    && continuation.originatingServerGeneration !== serverGeneration) {
+    return { ok: false, reason: HANDOFF_REASONS.continuationServerGenerationChanged, detail: "server-generation-changed" };
+  }
+  return { ok: true };
+};
+
 export const codexConversationKey = (payload) => JSON.stringify([
   String(payload?.from || ""),
   String(payload?.conversationId || ""),
@@ -95,10 +122,11 @@ export class CodexConversationThreadStore {
 export class CodexAppServerRuntimeAdapter {
   constructor({ bindingStore, dispatchStore, agentId, projectId, peer, injector, sendReply,
     now = () => Date.now(), heartbeatIntervalMs = 5_000, retryDelayMs = 1_000, log = () => {},
+    handoff = null,
     readServerIdentity = unixSocketIdentity, threadStore = new CodexConversationThreadStore() }) {
     if (typeof injector !== "function") throw new Error("codex-app-server-adapter-injector-required");
     Object.assign(this, { bindingStore, dispatchStore, agentId, projectId, peer, injector, sendReply,
-      now, heartbeatIntervalMs, retryDelayMs, log, readServerIdentity, threadStore });
+      now, heartbeatIntervalMs, retryDelayMs, log, handoff, readServerIdentity, threadStore });
     this.runtimeKind = CODEX_APP_SERVER_KIND;
     this.memberSlot = CODEX_APP_SERVER_MEMBER_SLOT;
     this.capabilities = RUNTIME_CAPABILITIES[this.runtimeKind];
@@ -171,6 +199,27 @@ export class CodexAppServerRuntimeAdapter {
       memberSlot: this.memberSlot, taskId: payload.conversationId }, this.now());
     if (!fence) { this.dispatchStore.defer(dispatch, "codex-app-server-binding-unavailable", this.now() + this.retryDelayMs, this.now()); return { status: "deferred" }; }
     if (this.bindingStore.markWaking(fence, this.now()) !== 1) throw new Error("codex-app-server-waking-transition-failed");
+    // The external App Server generation/identity must be known BEFORE a continuation is
+    // allowed to resume its originating thread.
+    const preTurnServerGeneration = this.handoff ? this.refreshServerGeneration() : null;
+    const turn = this.handoff
+      ? this.handoff.prepareTurn({
+        payload,
+        binding: this.bindingStore.get(fence.bindingId),
+        runtimeKind: this.runtimeKind,
+        memberSlot: this.memberSlot,
+        serverGeneration: preTurnServerGeneration,
+        serverIdentity: this.serverIdentity,
+        resumeGuard: codexHandoffResumeGuard,
+        fence,
+        identity,
+      })
+      : null;
+    if (turn?.rejection) {
+      return this.handoff.failClosedTurn({
+        turn, dispatch, dispatchStore: this.dispatchStore, bindingStore: this.bindingStore, fence, identity,
+      });
+    }
     const attempt = { attemptId: randomUUID(), inboundMessageId: identity.msgId,
       recipientId: identity.recipientId, memberSlot: identity.memberSlot,
       runtime: this.runtimeKind, capability: "completed" };
@@ -193,13 +242,23 @@ export class CodexAppServerRuntimeAdapter {
         },
       };
       const serverGeneration = this.refreshServerGeneration();
-      const existingSession = this.getSession(payload, serverGeneration);
+      // Continuation: resume the EXACT originating Codex thread recorded in the
+      // continuation — never a thread derived from the child sender or the derived
+      // handoff conversation. Ordinary turns keep per-sender/per-conversation affinity.
+      const continuationThreadId = turn?.kind === "continuation" ? turn.resumeSessionId : null;
+      const existingSession = continuationThreadId
+        ? { threadId: continuationThreadId }
+        : this.getSession(payload, serverGeneration);
+      const affinityKey = turn?.kind === "continuation"
+        ? { from: turn.reply.to, conversationId: turn.reply.conversationId }
+        : payload;
       const runtimePeer = { ...this.peer, ...(existingSession ? { threadId: existingSession.threadId } : {}) };
       if (!existingSession) delete runtimePeer.threadId;
       runtimePeer.mode = "codex_app_server";
       runtimePeer.relayFinalToMurmur = false;
       runtimePeer.returnFinalToCaller = true;
-      const result = await this.injector(payload, runtimePeer, processing);
+      const turnPayload = turn?.promptText != null ? { ...payload, text: turn.promptText } : payload;
+      const result = await this.injector(turnPayload, runtimePeer, processing);
       if (!this.bindingStore.validateFence(fence, identity)) return { status: "late-result-dropped" };
       if (this.refreshServerGeneration() !== serverGeneration) {
         const error = new Error("codex-app-server-generation-changed-during-turn");
@@ -209,27 +268,30 @@ export class CodexAppServerRuntimeAdapter {
       if (!terminalObserved) throw new Error("codex-app-server-terminal-completion-unconfirmed");
       const sessionId = runtimePeer.threadId || result?.threadId || null;
       if (!sessionId) throw new Error("codex-app-server-thread-id-missing");
-      this.replaceSession(payload, serverGeneration, sessionId);
+      this.replaceSession(affinityKey, serverGeneration, sessionId);
       if (!this.bindingStore.validateFence(fence, identity)) return { status: "late-result-dropped" };
-      const completed = this.dispatchStore.recordProcessingReceipt({ ...attempt, status: "completed",
+      return await settleRuntimeTurn({
+        runtimeKind: this.runtimeKind,
+        dispatchStore: this.dispatchStore,
+        bindingStore: this.bindingStore,
+        fence,
+        identity,
+        attempt,
+        payload,
+        turn,
+        coordinator: this.handoff,
+        resultText: result?.finalText || "",
         sessionId: result?.turnId || sessionId,
-        metadata: { resultText: result?.finalText || "", conversationId: payload.conversationId,
-          recipient: payload.from, replyToMessageId: payload.msgId, runtimeSessionId: sessionId } }, this.now());
-      if (!completed.accepted) throw new Error(`codex-app-server-completion-rejected:${completed.reason}`);
-      if (!this.bindingStore.validateFence(fence, identity)) return { status: "late-result-dropped" };
-      this.dispatchStore.markHandedOffIfLatestAttemptCompleted(identity, attempt.attemptId, this.now());
-      let reply = null;
-      if (!this.bindingStore.validateFence(fence, identity)) return { status: "late-result-dropped" };
-      try {
-        reply = await this.sendReply({ msgId: attempt.attemptId, to: payload.from,
-          conversationId: payload.conversationId, replyToMessageId: payload.msgId, text: result?.finalText || "" });
-        if (this.bindingStore.validateFence(fence, identity)) {
-          this.dispatchStore.recordProcessingReceipt({ ...attempt, status: "completed", resultMessageId: reply.msgId }, this.now());
-        }
-      } catch (error) { this.log("error", "Codex app-server reply enqueue failed after durable completion", { attemptId: attempt.attemptId, error: asError(error).message }); }
-      if (!this.bindingStore.validateFence(fence, identity)) return { status: "late-result-dropped" };
-      if (this.bindingStore.markIdle(fence, this.now()) !== 1) return { status: "late-result-dropped" };
-      return { status: reply ? "completed" : "completed-reply-pending", attemptId: attempt.attemptId, reply };
+        extraMetadata: { runtimeSessionId: sessionId },
+        runtimeSession: {
+          runtimeSessionId: sessionId,
+          serverGeneration,
+          serverIdentity: this.serverIdentity,
+        },
+        sendReply: this.sendReply,
+        log: this.log,
+        now: this.now,
+      });
     } catch (error) {
       const failure = asError(error);
       this.refreshServerGeneration();

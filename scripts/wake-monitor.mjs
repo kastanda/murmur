@@ -131,6 +131,9 @@ export class WakeMonitor {
     this.loadBacklogAfter = options.loadBacklogAfter || null;
     this.dispatchStore = options.dispatchStore || null;
     this.runtimeDispatcher = options.runtimeDispatcher || null;
+    // HANDOFF ONLY: an explicit delegation must never fall back to the legacy wake hook,
+    // the stateless inbox, an interactive drain, or a different runtime adapter.
+    this.onHandoffRejected = options.onHandoffRejected || null;
     this.retry = {
       maxDelayMs: options.retry?.maxDelayMs ?? 30000,
       baseDelayMs: options.retry?.baseDelayMs ?? 1000,
@@ -243,6 +246,9 @@ export class WakeMonitor {
       this.log("warn", "WakeMonitor audit denied wake", { msgId: payload.msgId, conversationId: payload.conversationId, from: payload.from });
       if (dispatch) this.dispatchStore.reject(dispatch, "audit-denied", now);
       else this.advanceCursor(payload);
+      // Audit denial happens BEFORE any model execution; a handoff gets an exact
+      // correlated authorization failure instead of silence.
+      if (payload.handoff) await this.rejectHandoff(payload, "handoff-unauthorized", "audit-denied");
       return;
     }
     if (verdict === "require_approval") {
@@ -276,6 +282,19 @@ export class WakeMonitor {
         return;
       }
       payload.leaseToken = decision.token ?? null;
+    }
+
+    // Explicit handoff routing: exact locally configured autonomous runtime only.
+    if (payload.handoff && !(dispatch && this.runtimeDispatcher)) {
+      this.log("error", "WakeMonitor refused handoff without an autonomous runtime", {
+        msgId: payload.msgId, from: payload.from, conversationId: payload.conversationId,
+        memberSlot: dispatch?.memberSlot ?? null,
+      });
+      if (dispatch) this.dispatchStore.reject(dispatch, "handoff-runtime-unavailable", now);
+      else this.advanceCursor(payload);
+      await this.rejectHandoff(payload, "handoff-runtime-unavailable",
+        dispatch ? "no-autonomous-runtime-adapter" : "no-durable-dispatch");
+      return;
     }
 
     let processingAttempt = null;
@@ -340,6 +359,18 @@ export class WakeMonitor {
       }
     } finally {
       this.advanceCursor(payload);
+    }
+  }
+
+  /** Exact correlated system failure for a handoff refused before model execution. */
+  async rejectHandoff(payload, reason, detail = null) {
+    if (typeof this.onHandoffRejected !== "function") return;
+    try {
+      await this.onHandoffRejected(payload, { reason, detail });
+    } catch (err) {
+      this.log("error", "WakeMonitor handoff failure reply could not be enqueued", {
+        msgId: payload.msgId, reason, error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 

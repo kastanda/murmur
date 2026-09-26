@@ -8,6 +8,7 @@
  * Env: DATA_DIR (default: .data)
  */
 import path from "node:path";
+import { localHandoffCapabilities } from "./agent-handoff-controller.mjs";
 import { readPrivateJson } from "./secure-state.mjs";
 
 const dataDir = process.env.DATA_DIR || ".data";
@@ -22,6 +23,11 @@ try {
   process.exit(1);
 }
 
+const advertised = {
+  protocolVersions: config.protocolVersions ?? localHandoffCapabilities().protocolVersions,
+  features: config.features ?? localHandoffCapabilities().features,
+};
+
 const invite = {
   v: 1,
   type: "invite",
@@ -29,6 +35,9 @@ const invite = {
   natsUrl: config.natsUrl,
   natsToken: config.natsToken || undefined,
   subject: config.subject,
+  // Capability advertisement: the peer needs these to authorize a handoff TO this agent.
+  protocolVersions: advertised.protocolVersions,
+  features: advertised.features,
   encryption: { publicKey: config.keys.encryption.publicKey },
   signing: { publicKey: config.keys.signing.publicKey },
 };
@@ -42,6 +51,7 @@ console.log(blob);
 console.log("");
 console.log(`Your agent: ${config.agentId}`);
 console.log(`NATS: ${config.natsUrl}`);
+console.log(`Advertised: protocolVersions=${advertised.protocolVersions.join(",")} features=${advertised.features.join(",")}`);
 console.log("");
 console.log("Peer should run: node scripts/murmur-join.mjs MURMUR:...");
 console.log("Then send you back the MURMUR-REPLY:... blob.");

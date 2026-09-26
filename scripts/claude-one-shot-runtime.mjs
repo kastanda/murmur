@@ -1,10 +1,29 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { HANDOFF_REASONS } from "@murmurv2/core";
+import { settleRuntimeTurn } from "./agent-handoff-runtime.mjs";
 
 export const CLAUDE_ONE_SHOT_KIND = "claude_one_shot";
 export const CLAUDE_AUTO_MEMBER_SLOT = "claude:auto";
 
 const asError = (value) => value instanceof Error ? value : new Error(String(value));
+
+/**
+ * Claude continuation guard. `claude -p --resume <sessionId>` genuinely reloads the
+ * originating logical session (it is CLI-side state, so it survives a Murmur restart),
+ * so resuming needs only the exact recorded session id. It is refused when the binding
+ * has meanwhile confirmed a DIFFERENT session — that binding can hold one session, and
+ * silently starting an unrelated one is not a resume.
+ */
+export const claudeHandoffResumeGuard = ({ continuation, binding }) => {
+  if (!continuation.originatingRuntimeSessionId) {
+    return { ok: false, reason: HANDOFF_REASONS.continuationSessionUnavailable, detail: "no-originating-session" };
+  }
+  if (binding.runtimeSessionId && binding.runtimeSessionId !== continuation.originatingRuntimeSessionId) {
+    return { ok: false, reason: HANDOFF_REASONS.continuationSessionUnavailable, detail: "binding-session-diverged" };
+  }
+  return { ok: true };
+};
 
 export function buildClaudeOneShotArgs({ prompt, sessionId, resume = false, permissionMode = "dontAsk", model }) {
   const args = ["-p", "--safe-mode", "--output-format", "json", "--permission-mode", permissionMode, "--tools", ""];
@@ -106,12 +125,13 @@ export class ClaudeOneShotRuntime {
     retryDelayMs = 1_000,
     permissionMode = "dontAsk",
     model,
+    handoff = null,
     log = () => {},
   }) {
     Object.assign(this, {
       bindingStore, dispatchStore, agentId, projectId, cwd, sendReply, runner, now,
       heartbeatIntervalMs, turnTimeoutMs, terminateGraceMs, retryDelayMs,
-      permissionMode, model, log,
+      permissionMode, model, handoff, log,
     });
   }
 
@@ -200,7 +220,27 @@ export class ClaudeOneShotRuntime {
     if (this.bindingStore.markWaking(fence, this.now()) !== 1) throw new Error("claude-one-shot-waking-transition-failed");
 
     const binding = this.bindingStore.get(fence.bindingId);
-    const requestedSessionId = binding.runtimeSessionId || randomUUID();
+    const turn = this.handoff
+      ? this.handoff.prepareTurn({
+        payload,
+        binding,
+        runtimeKind: CLAUDE_ONE_SHOT_KIND,
+        memberSlot: CLAUDE_AUTO_MEMBER_SLOT,
+        resumeGuard: claudeHandoffResumeGuard,
+        fence,
+        identity,
+      })
+      : null;
+    if (turn?.rejection) {
+      return this.handoff.failClosedTurn({
+        turn, dispatch, dispatchStore: this.dispatchStore, bindingStore: this.bindingStore, fence, identity,
+      });
+    }
+    // A continuation resumes the EXACT originating Claude session; an ordinary turn keeps
+    // the binding's session (or seeds a new one).
+    const requestedSessionId = turn?.resumeSessionId || binding.runtimeSessionId || randomUUID();
+    const resumeSession = Boolean(turn?.resumeSessionId || binding.runtimeSessionId);
+    const promptText = turn?.promptText ?? payload.text;
     const attempt = {
       attemptId: randomUUID(),
       inboundMessageId: identity.msgId,
@@ -212,9 +252,9 @@ export class ClaudeOneShotRuntime {
     let launched = false;
     try {
       const result = await this.runner({
-        prompt: payload.text,
+        prompt: promptText,
         sessionId: requestedSessionId,
-        resume: Boolean(binding.runtimeSessionId),
+        resume: resumeSession,
         cwd: this.cwd,
         permissionMode: this.permissionMode,
         model: this.model,
@@ -240,39 +280,23 @@ export class ClaudeOneShotRuntime {
         throw new Error("claude-one-shot-session-confirm-failed");
       }
       if (!this.bindingStore.validateFence(fence, identity)) return { status: "late-result-dropped" };
-      const receipt = this.dispatchStore.recordProcessingReceipt({
-        ...attempt,
-        status: "completed",
+      return await settleRuntimeTurn({
+        runtimeKind: CLAUDE_ONE_SHOT_KIND,
+        dispatchStore: this.dispatchStore,
+        bindingStore: this.bindingStore,
+        fence,
+        identity,
+        attempt,
+        payload,
+        turn,
+        coordinator: this.handoff,
+        resultText: result.text,
         sessionId: result.sessionId,
-        metadata: {
-          resultText: result.text,
-          conversationId: payload.conversationId,
-          recipient: payload.from,
-          replyToMessageId: payload.msgId,
-        },
-      }, this.now());
-      if (!receipt.accepted) throw new Error(`claude-one-shot-completion-rejected:${receipt.reason}`);
-      this.dispatchStore.markHandedOffIfLatestAttemptCompleted(identity, attempt.attemptId, this.now());
-      let reply = null;
-      if (this.bindingStore.validateFence(fence, identity)) {
-        try {
-          reply = await this.sendReply({
-            msgId: attempt.attemptId,
-            to: payload.from,
-            conversationId: payload.conversationId,
-            replyToMessageId: payload.msgId,
-            text: result.text,
-          });
-          this.dispatchStore.recordProcessingReceipt({ ...attempt, status: "completed", resultMessageId: reply.msgId }, this.now());
-        } catch (error) {
-          this.log("error", "Claude one-shot reply enqueue failed after durable completion", {
-            msgId: payload.msgId, attemptId: attempt.attemptId, error: asError(error).message,
-          });
-        }
-      }
-      if (!this.bindingStore.validateFence(fence, identity)) return { status: "late-result-dropped" };
-      if (this.bindingStore.markIdle(fence, this.now()) !== 1) return { status: "late-result-dropped" };
-      return { status: reply ? "completed" : "completed-reply-pending", attemptId: attempt.attemptId, reply };
+        runtimeSession: { runtimeSessionId: result.sessionId },
+        sendReply: this.sendReply,
+        log: this.log,
+        now: this.now,
+      });
     } catch (error) {
       const failure = asError(error);
       if (this.bindingStore.validateFence(fence, identity)) {

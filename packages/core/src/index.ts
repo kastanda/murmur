@@ -40,6 +40,221 @@ export interface EnvelopeV1 {
   signature: string;
 }
 
+/**
+ * Signed delegation lineage carried by a schemaVersion "1.1" HANDOFF envelope.
+ *
+ * Every field is part of the canonical signing payload, so none of it can be added,
+ * removed or rewritten by a relay without invalidating the signature. The handoff
+ * envelope's own `msgId` IS the handoff id; there is no separate handoffId.
+ */
+export interface HandoffLineageV1 {
+  /** msgId of the original/root request that ultimately caused this delegation. */
+  rootMessageId: string;
+  /** conversationId of that original/root request (NOT the derived handoff conversation). */
+  rootConversationId: string;
+  /** Exact message/result that caused THIS delegation decision. */
+  causedByMessageId: string;
+  /**
+   * ACTIVE delegation path only, ending with the delegating agent. It is not the
+   * history of every agent that has participated: a completed child branch is
+   * removed, so a sibling delegation after a child completes does not look like a
+   * cycle. Historical participation lives in rootMessageId / rootConversationId /
+   * causedByMessageId / the exact replyToMessageId chain / continuation records.
+   */
+  ancestry: string[];
+}
+
+/**
+ * schemaVersion "1.1" — a HANDOFF envelope: exactly one recipient, signed
+ * {@link HandoffLineageV1}, and never a `replyToMessageId` (handoff and reply are
+ * mutually exclusive structural cases). Ordinary and reply writers stay on "1.0",
+ * whose canonical signing bytes are unchanged by this revision. A reader that only
+ * understands "1.0" REJECTS a "1.1" envelope (`isEnvelopeV1` gates on the const),
+ * so handoff metadata can never be silently treated as unsigned ignorable data.
+ */
+export interface EnvelopeV11 extends Omit<EnvelopeV1, "schemaVersion" | "replyToMessageId"> {
+  schemaVersion: "1.1";
+  handoff: HandoffLineageV1;
+  replyToMessageId?: never;
+}
+
+export type AnyEnvelope = EnvelopeV1 | EnvelopeV11;
+
+/** Wire versions this build both reads and writes. */
+export const SUPPORTED_ENVELOPE_SCHEMA_VERSIONS = Object.freeze(["1.0", "1.1"] as const);
+
+/** The wire version a handoff envelope MUST use. */
+export const HANDOFF_WIRE_VERSION = "1.1";
+
+/** Peer capability feature string required to receive a handoff. */
+export const HANDOFF_FEATURE_V1 = "handoff-v1";
+
+/** Default maximum ACTIVE delegation depth (length of `handoff.ancestry`). */
+export const HANDOFF_MAX_ACTIVE_DEPTH = 4;
+
+/** Prefix of the derived, isolated conversation a handoff runs in. */
+export const HANDOFF_CONVERSATION_PREFIX = "handoff:";
+
+/** Stable machine-readable handoff rejection reasons. */
+export const HANDOFF_REASONS = Object.freeze({
+  self: "handoff-self",
+  cycle: "handoff-cycle",
+  ancestryInvalid: "handoff-ancestry-invalid",
+  ancestrySenderMismatch: "handoff-ancestry-sender-mismatch",
+  depthExceeded: "handoff-depth-exceeded",
+  recipientMismatch: "handoff-recipient-mismatch",
+  recipientsInvalid: "handoff-recipients-invalid",
+  conversationMismatch: "handoff-conversation-mismatch",
+  replyConflict: "handoff-reply-conflict",
+  lineageInvalid: "handoff-lineage-invalid",
+  versionUnsupported: "handoff-wire-version-unsupported",
+  unauthorized: "handoff-unauthorized",
+  runtimeUnavailable: "handoff-runtime-unavailable",
+  actionMalformed: "handoff-action-malformed",
+  targetUnknown: "handoff-target-unknown",
+  targetUnpaired: "handoff-target-unpaired",
+  targetCapabilityMissing: "handoff-target-capability-missing",
+  targetSubjectMissing: "handoff-target-subject-missing",
+  continuationMissing: "handoff-continuation-missing",
+  continuationSenderMismatch: "handoff-continuation-sender-mismatch",
+  continuationConversationMismatch: "handoff-continuation-conversation-mismatch",
+  continuationAlreadyClosed: "handoff-continuation-already-closed",
+  continuationTerminal: "handoff-continuation-terminal",
+  continuationRuntimeMismatch: "handoff-continuation-runtime-mismatch",
+  continuationSessionUnavailable: "handoff-continuation-session-unavailable",
+  continuationStaleBinding: "handoff-continuation-stale-binding",
+  continuationServerGenerationChanged: "handoff-continuation-server-generation-changed",
+} as const);
+
+/** The derived, isolated conversation a handoff and its exact reply run in. */
+export const derivedHandoffConversationId = (handoffMsgId: string): string => {
+  if (typeof handoffMsgId !== "string" || handoffMsgId.length === 0) {
+    throw new Error("handoff-msg-id-required");
+  }
+  return `${HANDOFF_CONVERSATION_PREFIX}${handoffMsgId}`;
+};
+
+const isNonEmptyString = (value: unknown): value is string =>
+  typeof value === "string" && value.length > 0;
+
+export const isHandoffLineageV1 = (value: unknown): value is HandoffLineageV1 => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const lineage = value as Record<string, unknown>;
+  return (
+    isNonEmptyString(lineage.rootMessageId) &&
+    isNonEmptyString(lineage.rootConversationId) &&
+    isNonEmptyString(lineage.causedByMessageId) &&
+    Array.isArray(lineage.ancestry) &&
+    lineage.ancestry.length > 0 &&
+    lineage.ancestry.every((entry) => isNonEmptyString(entry)) &&
+    new Set(lineage.ancestry as string[]).size === lineage.ancestry.length
+  );
+};
+
+/**
+ * Canonical form of the ACTIVE ancestry for a new handoff created by `agentId`.
+ *
+ * The currently executing agent is NOT already present in `parentActivePath`; if it
+ * is, the delegation would re-enter an agent still waiting further up the active
+ * path, which is exactly a cycle.
+ */
+export const buildHandoffAncestry = (
+  parentActivePath: readonly string[],
+  agentId: string,
+): { ancestry?: string[]; reason?: string } => {
+  if (!isNonEmptyString(agentId)) return { reason: HANDOFF_REASONS.ancestryInvalid };
+  if (!Array.isArray(parentActivePath)) return { reason: HANDOFF_REASONS.ancestryInvalid };
+  if (!parentActivePath.every((entry) => isNonEmptyString(entry))) {
+    return { reason: HANDOFF_REASONS.ancestryInvalid };
+  }
+  if (new Set(parentActivePath).size !== parentActivePath.length) {
+    return { reason: HANDOFF_REASONS.ancestryInvalid };
+  }
+  if (parentActivePath.includes(agentId)) return { reason: HANDOFF_REASONS.cycle };
+  return { ancestry: [...parentActivePath, agentId] };
+};
+
+/**
+ * Deterministic ACTIVE-ancestry / loop validation. Returns every violated stable
+ * reason code (empty array = valid).
+ */
+export const validateHandoffLineage = (
+  handoff: unknown,
+  {
+    senderAgentId,
+    recipientAgentId,
+    maxDepth = HANDOFF_MAX_ACTIVE_DEPTH,
+  }: { senderAgentId: string; recipientAgentId: string; maxDepth?: number },
+): string[] => {
+  if (!isHandoffLineageV1(handoff)) return [HANDOFF_REASONS.lineageInvalid];
+  const reasons: string[] = [];
+  const ancestry = handoff.ancestry;
+  if (ancestry.length > Math.max(1, Math.trunc(maxDepth))) reasons.push(HANDOFF_REASONS.depthExceeded);
+  if (!isNonEmptyString(senderAgentId) || ancestry[ancestry.length - 1] !== senderAgentId) {
+    reasons.push(HANDOFF_REASONS.ancestrySenderMismatch);
+  }
+  if (!isNonEmptyString(recipientAgentId)) reasons.push(HANDOFF_REASONS.recipientsInvalid);
+  else {
+    if (recipientAgentId === senderAgentId) reasons.push(HANDOFF_REASONS.self);
+    if (ancestry.includes(recipientAgentId)) reasons.push(HANDOFF_REASONS.cycle);
+  }
+  return reasons;
+};
+
+/**
+ * Full structural + lineage validation of an inbound handoff envelope. `localAgentId`,
+ * when given, closes the receiver-side wrong-recipient gap BEFORE any runtime runs.
+ *
+ * This is the AUTHORITATIVE handoff validation: every deterministic rule that JSON
+ * Schema cannot assert lives here (derived conversation, ancestry, loop, depth,
+ * recipient), so a caller cannot accidentally skip one.
+ */
+export const validateHandoffEnvelope = (
+  envelope: unknown,
+  {
+    localAgentId,
+    maxDepth = HANDOFF_MAX_ACTIVE_DEPTH,
+  }: { localAgentId?: string; maxDepth?: number } = {},
+): string[] => {
+  if (!envelope || typeof envelope !== "object") return [HANDOFF_REASONS.lineageInvalid];
+  const e = envelope as Record<string, unknown>;
+  if (e.schemaVersion !== HANDOFF_WIRE_VERSION) return [HANDOFF_REASONS.versionUnsupported];
+  const reasons: string[] = [];
+  if (e.replyToMessageId !== undefined) reasons.push(HANDOFF_REASONS.replyConflict);
+  // SESSION ISOLATION: a handoff MUST run in its own derived conversation, which is a
+  // pure function of its msgId. A correctly signed handoff aimed at any other
+  // conversation — the root conversation, another handoff's conversation, or an
+  // attacker-chosen one — is refused before the runtime ever sees it.
+  if (!isNonEmptyString(e.msgId) || !isNonEmptyString(e.conversationId)
+    || e.conversationId !== derivedHandoffConversationId(e.msgId)) {
+    reasons.push(HANDOFF_REASONS.conversationMismatch);
+  }
+  const recipients = Array.isArray(e.recipients) ? e.recipients : null;
+  if (!recipients || recipients.length !== 1 || !isNonEmptyString(recipients[0])) {
+    reasons.push(HANDOFF_REASONS.recipientsInvalid);
+  } else if (isNonEmptyString(localAgentId) && recipients[0] !== localAgentId) {
+    reasons.push(HANDOFF_REASONS.recipientMismatch);
+  }
+  reasons.push(...validateHandoffLineage(e.handoff, {
+    senderAgentId: String(e.senderAgentId ?? ""),
+    recipientAgentId: recipients && isNonEmptyString(recipients[0]) ? recipients[0] : "",
+    maxDepth,
+  }));
+  return [...new Set(reasons)];
+};
+
+/**
+ * Peer capability check. A handoff target MUST explicitly advertise the 1.1 wire
+ * version and the `handoff-v1` feature; anything less fails closed.
+ */
+export const peerSupportsHandoffV1 = (peer: unknown): boolean => {
+  if (!peer || typeof peer !== "object") return false;
+  const p = peer as Record<string, unknown>;
+  const versions = Array.isArray(p.protocolVersions) ? p.protocolVersions : [];
+  const features = Array.isArray(p.features) ? p.features : [];
+  return versions.includes(HANDOFF_WIRE_VERSION) && features.includes(HANDOFF_FEATURE_V1);
+};
+
 export interface AckV1 {
   msgId: string;
   consumerId: string;
@@ -64,7 +279,7 @@ export interface SignedAckV1 {
 
 export type UnsignedAckV1 = Omit<SignedAckV1, "signature">;
 
-export const envelopeDigest = (envelope: EnvelopeV1): string =>
+export const envelopeDigest = (envelope: SignableEnvelope): string =>
   `sha256:${createHash("sha256").update(stableEnvelopePayload(envelope)).digest("hex")}`;
 
 export const stableAckPayload = (ack: UnsignedAckV1 | SignedAckV1): string =>
@@ -107,7 +322,22 @@ export const isSignedAckV1 = (value: unknown): value is SignedAckV1 => {
  * or order is a wire-breaking change: update every signer together and bump the
  * protocol. Previously copy-pasted in 5+ places; keep it here only.
  */
-export const stableEnvelopePayload = (envelope: EnvelopeV1): string =>
+export interface SignableEnvelope {
+  schemaVersion: string;
+  msgId: string;
+  conversationId: string;
+  senderAgentId: string;
+  recipients: string[];
+  createdAt: string;
+  payloadCiphertext: string;
+  payloadNonce: string;
+  replyToMessageId?: string;
+  authToken?: string;
+  handoff?: HandoffLineageV1;
+  signature?: string;
+}
+
+export const stableEnvelopePayload = (envelope: SignableEnvelope): string =>
   JSON.stringify({
     schemaVersion: envelope.schemaVersion,
     msgId: envelope.msgId,
@@ -122,7 +352,28 @@ export const stableEnvelopePayload = (envelope: EnvelopeV1): string =>
     // without it sign byte-identically to before this field existed (back-compat),
     // and when present it is covered by the signature so it can't be stripped/swapped.
     ...(envelope.authToken !== undefined ? { authToken: envelope.authToken } : {}),
+    // handoff (schemaVersion "1.1") is likewise appended ONLY when present, after
+    // authToken, so every ordinary/reply 1.0 envelope keeps its exact pre-1.1 bytes.
+    // Inclusion keys on PRESENCE, not on the version string: a handoff smuggled into a
+    // "1.0" envelope still changes the signed bytes (and is rejected structurally by
+    // isEnvelopeV1), so handoff metadata is never unsigned.
+    ...(envelope.handoff !== undefined ? { handoff: canonicalHandoffLineage(envelope.handoff) } : {}),
   });
+
+/**
+ * Fixed field order for the signed lineage. A present-but-malformed `handoff` throws
+ * rather than producing ambiguous bytes: a signer must never emit, and a verifier must
+ * never accept, a lineage whose canonical form is undefined.
+ */
+const canonicalHandoffLineage = (handoff: unknown): HandoffLineageV1 => {
+  if (!isHandoffLineageV1(handoff)) throw new Error("envelope-handoff-malformed");
+  return {
+    rootMessageId: handoff.rootMessageId,
+    rootConversationId: handoff.rootConversationId,
+    causedByMessageId: handoff.causedByMessageId,
+    ancestry: [...handoff.ancestry],
+  };
+};
 
 export interface DedupeStore {
   seen(msgId: string, consumerId: string): Promise<boolean>;
@@ -272,7 +523,8 @@ export const TERMINAL_OUTBOX_STATUSES: ReadonlySet<OutboxStatus> = new Set<Outbo
 export interface OutboxRecord {
   msgId: string;
   subject: string;
-  envelope: EnvelopeV1;
+  /** Either supported wire version: ordinary/reply 1.0 or a 1.1 handoff. */
+  envelope: AnyEnvelope;
   status: OutboxStatus;
   attempts: number;
   nextAttemptAt: string;
@@ -283,7 +535,7 @@ export interface OutboxRecord {
 }
 
 export interface OutboxStore {
-  enqueue(subject: string, envelope: EnvelopeV1): Promise<void>;
+  enqueue(subject: string, envelope: AnyEnvelope): Promise<void>;
   claimDue(limit?: number): Promise<OutboxRecord[]>;
   listInFlight?(): Promise<OutboxRecord[]>;
   getOutboxRecord(msgId: string): Promise<OutboxRecord | undefined>;
@@ -333,7 +585,7 @@ export class JsonFileOutboxStore implements OutboxStore {
     await fs.writeFile(this.filePath, JSON.stringify(state, null, 2), "utf8");
   }
 
-  async enqueue(subject: string, envelope: EnvelopeV1): Promise<void> {
+  async enqueue(subject: string, envelope: AnyEnvelope): Promise<void> {
     const state = await this.load();
     if (state.records.find((r) => r.msgId === envelope.msgId)) return;
 
@@ -566,7 +818,7 @@ export class SQLiteDedupeOutboxStore implements DedupeStore, OutboxStore, AckRec
     return Number(result.changes ?? 0) > 0;
   }
 
-  async enqueue(subject: string, envelope: EnvelopeV1): Promise<void> {
+  async enqueue(subject: string, envelope: AnyEnvelope): Promise<void> {
     const now = new Date().toISOString();
     this.db
       .prepare(
@@ -693,7 +945,7 @@ export class SQLiteDedupeOutboxStore implements DedupeStore, OutboxStore, AckRec
     return {
       msgId: String(row.msg_id),
       subject: String(row.subject),
-      envelope: JSON.parse(String(row.envelope_json)) as EnvelopeV1,
+      envelope: JSON.parse(String(row.envelope_json)) as AnyEnvelope,
       status: String(row.status) as OutboxStatus,
       attempts: Number(row.attempts),
       nextAttemptAt: String(row.next_attempt_at),
@@ -772,14 +1024,101 @@ export interface LocalMessageRecord {
   id: string;
   conversationId: string;
   msgId: string;
-  replyToMessageId?: string;
+  /** `null` on read when absent — reads mirror the stored SQL NULL. */
+  replyToMessageId?: string | null;
   direction: "inbound" | "outbound";
   sender: string;
+  /** Exact addressed recipient. Explicit column so a handoff can be audited without
+   *  parsing plaintext (outbound handoffs and replies both carry it). */
+  recipientId?: string | null;
   text: string;
   createdAt: string;
-  transport?: string;
-  memberSlot?: string;
+  transport?: string | null;
+  memberSlot?: string | null;
+  /** Durable, signed-at-source handoff lineage, stored as explicit nullable columns. */
+  handoff?: HandoffLineageV1 | null;
 }
+
+/** Shared SELECT list so every local_messages read exposes the same audit fields. */
+const LOCAL_MESSAGE_COLUMNS = `
+           id,
+           conversation_id as conversationId,
+           msg_id as msgId,
+           reply_to_message_id as replyToMessageId,
+           direction,
+           sender,
+           recipient_id as recipientId,
+           text,
+           created_at as createdAt,
+           transport,
+           member_slot as memberSlot,
+           handoff_root_message_id as handoffRootMessageId,
+           handoff_root_conversation_id as handoffRootConversationId,
+           handoff_caused_by_message_id as handoffCausedByMessageId,
+           handoff_ancestry_json as handoffAncestryJson`;
+
+interface LocalMessageRow {
+  id: string;
+  conversationId: string;
+  msgId: string;
+  replyToMessageId: string | null;
+  direction: "inbound" | "outbound";
+  sender: string;
+  recipientId: string | null;
+  text: string;
+  createdAt: string;
+  transport: string | null;
+  memberSlot: string | null;
+  handoffRootMessageId: string | null;
+  handoffRootConversationId: string | null;
+  handoffCausedByMessageId: string | null;
+  handoffAncestryJson: string | null;
+}
+
+const localMessageFromRow = (row: LocalMessageRow): LocalMessageRecord => {
+  // Optional scalars are surfaced as null (not dropped) so reads stay byte-for-byte
+  // compatible with the pre-handoff raw-row shape every existing consumer reads.
+  const record: LocalMessageRecord = {
+    id: row.id,
+    conversationId: row.conversationId,
+    msgId: row.msgId,
+    replyToMessageId: row.replyToMessageId ?? null,
+    direction: row.direction,
+    sender: row.sender,
+    recipientId: row.recipientId ?? null,
+    text: row.text,
+    createdAt: row.createdAt,
+    transport: row.transport ?? null,
+    memberSlot: row.memberSlot ?? null,
+    handoff: null,
+  };
+  const lineage = {
+    rootMessageId: row.handoffRootMessageId ?? "",
+    rootConversationId: row.handoffRootConversationId ?? "",
+    causedByMessageId: row.handoffCausedByMessageId ?? "",
+    ancestry: (() => {
+      if (row.handoffAncestryJson == null) return null;
+      try {
+        const parsed = JSON.parse(row.handoffAncestryJson) as unknown;
+        return Array.isArray(parsed) ? parsed : null;
+      } catch {
+        return null;
+      }
+    })(),
+  };
+  if (isHandoffLineageV1(lineage)) record.handoff = lineage;
+  return record;
+};
+
+const localMessageLineageParams = (row: LocalMessageRecord): [string | null, string | null, string | null, string | null] =>
+  isHandoffLineageV1(row.handoff)
+    ? [
+        row.handoff.rootMessageId,
+        row.handoff.rootConversationId,
+        row.handoff.causedByMessageId,
+        JSON.stringify(row.handoff.ancestry),
+      ]
+    : [null, null, null, null];
 
 /**
  * Lifecycle stage of a single message, recorded independently of transport
@@ -825,10 +1164,15 @@ export class SQLiteMessageStore {
         reply_to_message_id TEXT,
         direction TEXT NOT NULL,
         sender TEXT NOT NULL,
+        recipient_id TEXT,
         text TEXT NOT NULL,
         created_at TEXT NOT NULL,
         transport TEXT,
-        member_slot TEXT
+        member_slot TEXT,
+        handoff_root_message_id TEXT,
+        handoff_root_conversation_id TEXT,
+        handoff_caused_by_message_id TEXT,
+        handoff_ancestry_json TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_local_messages_conversation ON local_messages(conversation_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_local_messages_text ON local_messages(text);
@@ -854,6 +1198,22 @@ export class SQLiteMessageStore {
     if (!messageColumns.some((column) => column.name === "member_slot")) {
       this.db.exec(`ALTER TABLE local_messages ADD COLUMN member_slot TEXT`);
     }
+    // Additive handoff-audit migration: existing ordinary rows stay valid with NULLs.
+    for (const column of [
+      "recipient_id",
+      "handoff_root_message_id",
+      "handoff_root_conversation_id",
+      "handoff_caused_by_message_id",
+      "handoff_ancestry_json",
+    ]) {
+      if (!messageColumns.some((existing) => existing.name === column)) {
+        this.db.exec(`ALTER TABLE local_messages ADD COLUMN ${column} TEXT`);
+      }
+    }
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_local_messages_handoff_root
+      ON local_messages(handoff_root_message_id, created_at)
+    `);
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_local_messages_reply_to
       ON local_messages(reply_to_message_id, direction, sender, created_at)
@@ -962,11 +1322,15 @@ export class SQLiteMessageStore {
 
   async append(input: Omit<LocalMessageRecord, "id">): Promise<LocalMessageRecord> {
     const row: LocalMessageRecord = { id: randomUUID(), ...input };
+    const lineage = localMessageLineageParams(row);
     this.db
       .prepare(
         `INSERT INTO local_messages
-         (id, conversation_id, msg_id, reply_to_message_id, direction, sender, text, created_at, transport, member_slot)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, conversation_id, msg_id, reply_to_message_id, direction, sender, recipient_id,
+          text, created_at, transport, member_slot,
+          handoff_root_message_id, handoff_root_conversation_id,
+          handoff_caused_by_message_id, handoff_ancestry_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         row.id,
@@ -975,10 +1339,12 @@ export class SQLiteMessageStore {
         row.replyToMessageId ?? null,
         row.direction,
         row.sender,
+        row.recipientId ?? null,
         row.text,
         row.createdAt,
         row.transport ?? null,
         row.memberSlot ?? null,
+        ...lineage,
       );
     return row;
   }
@@ -989,10 +1355,14 @@ export class SQLiteMessageStore {
    */
   async appendIdempotent(input: Omit<LocalMessageRecord, "id">): Promise<LocalMessageRecord> {
     const row: LocalMessageRecord = { id: randomUUID(), ...input };
+    const lineage = localMessageLineageParams(row);
     this.db.prepare(
       `INSERT INTO local_messages
-       (id, conversation_id, msg_id, reply_to_message_id, direction, sender, text, created_at, transport, member_slot)
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+       (id, conversation_id, msg_id, reply_to_message_id, direction, sender, recipient_id,
+        text, created_at, transport, member_slot,
+        handoff_root_message_id, handoff_root_conversation_id,
+        handoff_caused_by_message_id, handoff_ancestry_json)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
        WHERE NOT EXISTS (
          SELECT 1 FROM local_messages WHERE direction = ? AND msg_id = ?
        )`,
@@ -1003,21 +1373,21 @@ export class SQLiteMessageStore {
       row.replyToMessageId ?? null,
       row.direction,
       row.sender,
+      row.recipientId ?? null,
       row.text,
       row.createdAt,
       row.transport ?? null,
       row.memberSlot ?? null,
+      ...lineage,
       row.direction,
       row.msgId,
     );
     const stored = this.db.prepare(
-      `SELECT id, conversation_id AS conversationId, msg_id AS msgId,
-              reply_to_message_id AS replyToMessageId, direction, sender, text,
-              created_at AS createdAt, transport, member_slot AS memberSlot
+      `SELECT ${LOCAL_MESSAGE_COLUMNS}
        FROM local_messages WHERE direction = ? AND msg_id = ?
        ORDER BY rowid ASC LIMIT 1`,
-    ).get(row.direction, row.msgId) as unknown as LocalMessageRecord;
-    return stored;
+    ).get(row.direction, row.msgId) as unknown as LocalMessageRow;
+    return localMessageFromRow(stored);
   }
 
   async listConversations(limit = 50): Promise<Array<{ conversationId: string; lastMessageAt: string; messageCount: number }>> {
@@ -1036,44 +1406,24 @@ export class SQLiteMessageStore {
   async getInboundAfter(conversationId: string, afterTimestamp: string, limit = 10): Promise<LocalMessageRecord[]> {
     const rows = this.db
       .prepare(
-        `SELECT
-           id,
-           conversation_id as conversationId,
-           msg_id as msgId,
-           reply_to_message_id as replyToMessageId,
-           direction,
-           sender,
-           text,
-           created_at as createdAt,
-           transport,
-           member_slot as memberSlot
+        `SELECT ${LOCAL_MESSAGE_COLUMNS}
          FROM local_messages
          WHERE conversation_id = ? AND direction = 'inbound' AND created_at > ?
          ORDER BY created_at ASC
          LIMIT ?`,
       )
-      .all(conversationId, afterTimestamp, limit) as unknown as LocalMessageRecord[];
-    return rows;
+      .all(conversationId, afterTimestamp, limit) as unknown as LocalMessageRow[];
+    return rows.map(localMessageFromRow);
   }
 
   async getRepliesTo(replyToMessageId: string, expectedSender: string, limit = 10): Promise<LocalMessageRecord[]> {
-    return this.db.prepare(
-      `SELECT
-         id,
-         conversation_id as conversationId,
-         msg_id as msgId,
-         reply_to_message_id as replyToMessageId,
-         direction,
-         sender,
-         text,
-         created_at as createdAt,
-         transport,
-         member_slot as memberSlot
+    return (this.db.prepare(
+      `SELECT ${LOCAL_MESSAGE_COLUMNS}
        FROM local_messages
        WHERE direction = 'inbound' AND reply_to_message_id = ? AND sender = ?
        ORDER BY created_at ASC, rowid ASC
        LIMIT ?`,
-    ).all(replyToMessageId, expectedSender, limit) as unknown as LocalMessageRecord[];
+    ).all(replyToMessageId, expectedSender, limit) as unknown as LocalMessageRow[]).map(localMessageFromRow);
   }
 
   /**
@@ -1088,48 +1438,28 @@ export class SQLiteMessageStore {
   async listInbound(limit = 20): Promise<LocalMessageRecord[]> {
     const rows = this.db
       .prepare(
-        `SELECT
-           id,
-           conversation_id as conversationId,
-           msg_id as msgId,
-           reply_to_message_id as replyToMessageId,
-           direction,
-           sender,
-           text,
-           created_at as createdAt,
-           transport,
-           member_slot as memberSlot
+        `SELECT ${LOCAL_MESSAGE_COLUMNS}
          FROM local_messages
          WHERE direction = 'inbound'
          ORDER BY created_at DESC, rowid DESC
          LIMIT ?`,
       )
-      .all(limit) as unknown as LocalMessageRecord[];
-    return rows;
+      .all(limit) as unknown as LocalMessageRow[];
+    return rows.map(localMessageFromRow);
   }
 
   async searchMessages(query: string, limit = 50): Promise<LocalMessageRecord[]> {
     const q = `%${query}%`;
     const rows = this.db
       .prepare(
-        `SELECT
-           id,
-           conversation_id as conversationId,
-           msg_id as msgId,
-           reply_to_message_id as replyToMessageId,
-           direction,
-           sender,
-           text,
-           created_at as createdAt,
-           transport,
-           member_slot as memberSlot
+        `SELECT ${LOCAL_MESSAGE_COLUMNS}
          FROM local_messages
          WHERE text LIKE ? OR sender LIKE ? OR conversation_id LIKE ?
          ORDER BY created_at DESC
          LIMIT ?`,
       )
-      .all(q, q, q, limit) as unknown as LocalMessageRecord[];
-    return rows;
+      .all(q, q, q, limit) as unknown as LocalMessageRow[];
+    return rows.map(localMessageFromRow);
   }
 }
 
@@ -1724,9 +2054,56 @@ export const isEnvelopeV1 = (v: unknown): v is EnvelopeV1 => {
     hasOptional("parentMsgId", "string") &&
     (o.replyToMessageId === undefined || (typeof o.replyToMessageId === "string" && o.replyToMessageId.length > 0)) &&
     // authToken: optional, but if present must be a non-empty string (a bearer token)
-    (o.authToken === undefined || (typeof o.authToken === "string" && o.authToken.length > 0))
+    (o.authToken === undefined || (typeof o.authToken === "string" && o.authToken.length > 0)) &&
+    // handoff lineage belongs to schemaVersion "1.1" ONLY. A "1.0" envelope carrying it is
+    // rejected outright rather than accepted with the lineage treated as an ignorable
+    // unknown field — that is the hole this guard closes.
+    o.handoff === undefined
   );
 };
+
+/**
+ * Structural guard for a schemaVersion "1.1" HANDOFF envelope: exactly one recipient,
+ * a well-formed signed {@link HandoffLineageV1}, and no `replyToMessageId`.
+ *
+ * Deterministic ancestry/loop/recipient checks are separate and live in
+ * {@link validateHandoffEnvelope}; this guard is shape only, mirroring the JSON Schema.
+ */
+export const isEnvelopeV11 = (v: unknown): v is EnvelopeV11 => {
+  if (!v || typeof v !== "object") return false;
+  const o = v as Record<string, unknown>;
+  const hasOptional = (key: string, type: "string" | "number"): boolean => {
+    const value = o[key];
+    return value === undefined || typeof value === type;
+  };
+  return (
+    o.schemaVersion === HANDOFF_WIRE_VERSION &&
+    typeof o.msgId === "string" && o.msgId.length > 0 &&
+    typeof o.conversationId === "string" && o.conversationId.length > 0 &&
+    typeof o.senderAgentId === "string" && o.senderAgentId.length > 0 &&
+    Array.isArray(o.recipients) && o.recipients.length === 1 &&
+      o.recipients.every((r) => typeof r === "string" && r.length > 0) &&
+    typeof o.createdAt === "string" && !Number.isNaN(Date.parse(o.createdAt)) &&
+    typeof o.payloadCiphertext === "string" && o.payloadCiphertext.length > 0 &&
+    typeof o.payloadNonce === "string" && o.payloadNonce.length > 0 &&
+    typeof o.signature === "string" && o.signature.length > 0 &&
+    hasOptional("ttlSeconds", "number") &&
+    hasOptional("traceId", "string") &&
+    hasOptional("sequence", "number") &&
+    hasOptional("parentMsgId", "string") &&
+    (o.authToken === undefined || (typeof o.authToken === "string" && o.authToken.length > 0)) &&
+    // handoff and replyToMessageId are mutually exclusive structural cases.
+    o.replyToMessageId === undefined &&
+    isHandoffLineageV1(o.handoff)
+  );
+};
+
+/** True for any envelope shape this build supports reading (1.0 ordinary/reply or 1.1 handoff). */
+export const isSupportedEnvelope = (v: unknown): v is AnyEnvelope =>
+  isEnvelopeV1(v) || isEnvelopeV11(v);
+
+/** True only for a structurally valid 1.1 handoff envelope. */
+export const isHandoffEnvelope = (v: unknown): v is EnvelopeV11 => isEnvelopeV11(v);
 
 export const createAck = (
   msgId: string,
@@ -1742,7 +2119,7 @@ export const createAck = (
 });
 
 export const createBoundAck = (
-  envelope: EnvelopeV1,
+  envelope: AnyEnvelope,
   consumerId: string,
   status: SignedAckV1["status"],
   reason?: string,
@@ -1783,7 +2160,7 @@ export const estimateBase64DecodedBytes = (base64: string): number => {
   return Math.floor((normalized.length * 3) / 4) - padding;
 };
 
-export const validateEnvelopePolicy = (envelope: EnvelopeV1, policy?: SecurityPolicy): string[] => {
+export const validateEnvelopePolicy = (envelope: AnyEnvelope, policy?: SecurityPolicy): string[] => {
   if (!policy) return [];
   const violations: string[] = [];
 

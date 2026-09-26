@@ -34,6 +34,7 @@ member slot. An unknown slot fails closed; there is no default runtime fallback.
 | adapter-owned binding heartbeat | yes | yes | yes |
 | autonomous | yes | yes | yes |
 | interactive | no | no | no |
+| handoff continuation resume | yes, `--resume <session>` (survives a Murmur restart) | yes, the exact originating thread, only while the App Server socket identity is unchanged | yes, only while the exact originating ACP session is live |
 
 Claude owns a short-lived `claude -p` child per turn and persists the confirmed
 Claude session id. Codex connects to an externally managed App Server socket per
@@ -82,7 +83,9 @@ outbound message id.
 
 Only one autonomous runtime may be enabled in a daemon configuration. The
 supported opt-in keys are `runtime.claudeOneShot`, `runtime.codexAppServer`, and
-`runtime.cursorAcp`. Existing manual/legacy Codex wake configuration continues to
+`runtime.cursorAcp`. An inbound handoff routes to that exact member slot and to nothing
+else: there is no fallback to the legacy wake hook, the stateless inbox, an interactive
+drain, or another adapter. Existing manual/legacy Codex wake configuration continues to
 use the original injector when the autonomous Codex adapter is disabled.
 
 For a scoped live investigation, `runtime.codexAppServer.protocolDiagnostics`
@@ -93,9 +96,53 @@ structured logger. Prompt and response content are never included. A
 receipt capability or create a durable `started` receipt. Diagnostics are disabled
 by default.
 
+## Explicit handoff continuation
+
+Handoff semantics are implemented **once** and shared by all three adapters — no adapter
+re-implements them. Two collaborators do the work:
+
+- `HandoffTurnCoordinator.prepareTurn(...)` classifies a claimed dispatch as an ordinary
+  turn, an inbound bounded handoff task, or a **continuation** resume of a delegator, and
+  produces the prompt, the exact reply correlation, the root lineage, the restored
+  `parentActivePath` and the session to resume.
+- `settleRuntimeTurn(...)` turns a terminal model result into exactly one durable outcome:
+  an ordinary correlated reply, a durably created child handoff with the parent reply
+  **suppressed**, or a fail-closed error. Without a coordinator it is byte-for-byte the
+  pre-handoff behaviour.
+
+Each adapter contributes only a small `resumeGuard` answering "can I genuinely resume this
+exact originating session right now?", and passes its `fence` + dispatch `identity` through
+so every irreversible continuation mutation commits atomically with a re-read of that
+fence (see the fenced-authority section of `agent-handoff.md`). A stale runtime generation
+cannot create a handoff, enqueue its outbound outbox row, close a continuation, or
+terminalize one:
+
+| Adapter | Guard | Refusal reason when it cannot resume |
+|---|---|---|
+| Claude | the recorded session id exists and the binding has not confirmed a different one | `handoff-continuation-session-unavailable` |
+| Codex | the App Server **socket identity** (and in-process generation) is unchanged | `handoff-continuation-server-generation-changed` |
+| Cursor | the exact originating ACP session is currently loaded in the live client | `handoff-continuation-session-unavailable` |
+
+A Codex continuation resumes the **exact originating thread** recorded in the
+continuation — never a thread derived from the child sender or the derived handoff
+conversation — and re-registers it under the **originating** `(sender, conversation)`
+affinity route. Ordinary Codex turns keep their existing per-sender/per-conversation
+affinity unchanged.
+
+A refused continuation records an explicit terminal reason and retires the dispatch; no
+adapter silently starts an unrelated new model session and calls it a resume.
+
+A delegated turn's completed processing receipt deliberately carries no reply correlation
+(`disposition: "handoff"`), so `recoverCompletedReplies()` can never manufacture a parent
+reply for a turn that delegated instead of answering. A resumed turn's receipt carries the
+**parent** correlation, so reply-only recovery answers the right message.
+
+Full specification: [`agent-handoff.md`](agent-handoff.md).
+
 ## Deliberate non-goals
 
-This slice does not add channels, task handoff, workspace/write leases, Cursor
-IDE automation, persistent Claude stream-json, or a claim of exactly-once model
-execution. It also does not manufacture cross-runtime session semantics that the
-native protocol cannot demonstrate.
+This slice does not add channels, workspace/write leases, Cursor IDE automation,
+persistent Claude stream-json, or a claim of exactly-once model execution. It also does
+not manufacture cross-runtime session semantics that the native protocol cannot
+demonstrate. Explicit handoff (added separately) supports exactly **one child handoff per
+causative model turn**; fan-out, planners and DAG scheduling remain out of scope.

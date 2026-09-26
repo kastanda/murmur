@@ -7,6 +7,7 @@
  * Env: DATA_DIR (default: .data)
  */
 import path from "node:path";
+import { peerCapabilityFields } from "./agent-handoff-controller.mjs";
 import { readPrivateJson, writePrivateJson } from "./secure-state.mjs";
 
 const blob = process.argv[2];
@@ -45,11 +46,14 @@ config.peers[reply.agentId] = {
   encryption: { publicKey: reply.encryption.publicKey },
   signing: { publicKey: reply.signing.publicKey },
   subject: reply.subject,
+  // Only what the peer actually advertised. Absent => handoffs to this peer are refused.
+  ...peerCapabilityFields(reply),
 };
 
 await writePrivateJson(configPath, config);
 
 console.log(`[add-peer] Added: ${reply.agentId} (${reply.subject})`);
+console.log(`[add-peer] Peer handoff capability: ${(reply.features || []).includes("handoff-v1") ? "handoff-v1" : "none (handoffs to this peer will be refused)"}`);
 console.log("");
 console.log("Connection complete! Restart your daemon if running:");
 console.log("  sudo systemctl restart murmur-daemon");

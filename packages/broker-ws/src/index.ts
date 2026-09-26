@@ -6,6 +6,7 @@ import {
   createAck,
   type AckV1,
   type DedupeStore,
+  type AnyEnvelope,
   type EnvelopeV1,
   envelopeDigest,
   isEnvelopeV1,
@@ -229,7 +230,11 @@ export class WebSocketBroker {
     this.socket.send(JSON.stringify(frame));
   }
 
-  async publish(subject: string, envelope: EnvelopeV1, policy?: SecurityPolicy): Promise<void> {
+  // Outbound bytes may be either supported wire version so a shared outbox can be
+  // flushed over this transport. The INBOUND path below stays 1.0-only on purpose: the
+  // WebSocket broker implements no handoff admission, so it refuses a 1.1 handoff rather
+  // than delivering one it cannot validate.
+  async publish(subject: string, envelope: AnyEnvelope, policy?: SecurityPolicy): Promise<void> {
     const violations = validateEnvelopePolicy(envelope, policy);
     if (violations.length > 0) {
       throw new Error(`policy-rejected:${violations.join("|")}`);

@@ -9,10 +9,15 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { NatsBroker } from "@murmurv2/broker-nats";
 import {
   ChannelRosterStore,
+  HANDOFF_MAX_ACTIVE_DEPTH,
+  HANDOFF_WIRE_VERSION,
   SQLiteDedupeOutboxStore,
   SQLiteMessageStore,
+  isHandoffEnvelope,
+  isSupportedEnvelope,
   stableAckPayload,
   stableEnvelopePayload,
+  validateHandoffEnvelope,
 } from "@murmurv2/core";
 import { decryptPayload, encryptPayload, signEnvelope, verifyEnvelopeSignature } from "@murmurv2/security";
 import { NotifyQueue, flushNotifyQueue, normalizeNotifyTargets } from "./notify-router.mjs";
@@ -44,6 +49,9 @@ import {
   CursorAcpRuntimeAdapter,
 } from "./agent-runtime-adapter.mjs";
 import { AgentRuntimeRegistry } from "./agent-runtime-registry.mjs";
+import { AgentHandoffStore } from "./agent-handoff-store.mjs";
+import { AgentHandoffController, admitInboundHandoff, buildHandoffFailureText } from "./agent-handoff-controller.mjs";
+import { HandoffTurnCoordinator } from "./agent-handoff-runtime.mjs";
 import { SessionLeaseStore, createNativeLeaseGate } from "./lease.mjs";
 import { ensurePrivateDirectory, readPrivateJson, setPrivateUmask } from "./secure-state.mjs";
 // vault-guard: optional content policy hook (not included in OSS release)
@@ -249,6 +257,7 @@ const verifyAck = async (ack) => {
 const enqueueRuntimeReply = async ({ msgId = randomUUID(), to, conversationId, replyToMessageId, text }) => {
   const peer = peers[to];
   if (!peer) throw new Error(`unknown-reply-recipient:${to}`);
+  if (!replyToMessageId) throw new Error("reply-correlation-required");
   const createdAt = new Date().toISOString();
   const encrypted = await encryptPayload(text, peer.encryption.publicKey, keys.encryption.privateKey);
   const envelope = {
@@ -271,11 +280,132 @@ const enqueueRuntimeReply = async ({ msgId = randomUUID(), to, conversationId, r
     replyToMessageId,
     direction: "outbound",
     sender: agentId,
+    recipientId: to,
     text,
     createdAt,
     transport: "nats",
   });
   return { msgId };
+};
+
+// ---------------------------------------------------------------------------
+// Explicit agent handoff (schemaVersion 1.1)
+// ---------------------------------------------------------------------------
+const handoffConfig = config.handoff || {};
+const handoffMaxDepth = optionalPositiveInteger(
+  "handoff-max-active-depth",
+  firstDefined(handoffConfig.maxActiveDepth, process.env.MURMUR_HANDOFF_MAX_DEPTH),
+) ?? HANDOFF_MAX_ACTIVE_DEPTH;
+
+/**
+ * BUILD (and sign) the outbound handoff envelope. This performs NO durable writes: the
+ * controller inserts the returned envelope into the shared outbox inside the same fenced
+ * transaction that creates the continuation, so a runtime that lost its binding fence can
+ * never leave a continuation row or an outbound handoff behind.
+ *
+ * The subject comes from the paired peer config the controller already authorized; a
+ * model can never supply a NATS subject.
+ */
+const buildHandoffEnvelope = async ({ msgId, to, subject, conversationId, handoff, text }) => {
+  const peer = peers[to];
+  if (!peer) throw new Error(`unknown-handoff-recipient:${to}`);
+  if (!subject || subject !== peer.subject) throw new Error(`handoff-subject-not-from-peer-config:${to}`);
+  const createdAt = new Date().toISOString();
+  const encrypted = await encryptPayload(text, peer.encryption.publicKey, keys.encryption.privateKey);
+  const envelope = {
+    schemaVersion: HANDOFF_WIRE_VERSION,
+    msgId,
+    conversationId,
+    senderAgentId: agentId,
+    recipients: [to],
+    createdAt,
+    payloadCiphertext: encrypted.ciphertext,
+    payloadNonce: encrypted.nonce,
+    handoff,
+    signature: "",
+  };
+  // Self-check before signing: never emit an envelope a conformant receiver must refuse.
+  // This now also enforces the derived-conversation rule on the emit side.
+  const violations = validateHandoffEnvelope(envelope, { maxDepth: handoffMaxDepth });
+  if (violations.length > 0) throw new Error(`handoff-envelope-invalid:${violations.join(",")}`);
+  envelope.signature = await signEnvelope(stableEnvelopePayload(envelope), keys.signing.privateKey);
+  return { subject: peer.subject, envelope };
+};
+
+/** Non-authoritative audit mirror, written only AFTER the fenced commit. Idempotent. */
+const recordHandoffAudit = async ({ continuation, envelope }) => {
+  await msgStore.appendIdempotent({
+    conversationId: continuation.handoffConversationId,
+    msgId: continuation.handoffMsgId,
+    direction: "outbound",
+    sender: agentId,
+    recipientId: continuation.recipientId,
+    text: continuation.taskText,
+    createdAt: envelope.createdAt,
+    transport: "nats",
+    handoff: envelope.handoff,
+  });
+  await msgStore.recordEvent({
+    msgId: continuation.handoffMsgId,
+    conversationId: continuation.handoffConversationId,
+    event: "queued",
+    actor: agentId,
+    detail: `handoff->${continuation.recipientId}`,
+    relatesTo: continuation.rootMessageId,
+  });
+  log("info", "Handoff envelope enqueued", {
+    msgId: continuation.handoffMsgId,
+    to: continuation.recipientId,
+    conversationId: continuation.handoffConversationId,
+    rootMessageId: continuation.rootMessageId,
+    ancestry: continuation.handoffAncestry,
+  });
+};
+
+const handoffStore = runtimeBindingStore ? new AgentHandoffStore(wakeDb) : null;
+const handoffController = handoffStore
+  ? new AgentHandoffController({
+    store: handoffStore,
+    agentId,
+    peers,
+    maxDepth: handoffMaxDepth,
+    buildHandoffEnvelope,
+    recordHandoffAudit,
+    log,
+  })
+  : null;
+const handoffCoordinator = handoffController ? new HandoffTurnCoordinator({ controller: handoffController, log }) : null;
+if (handoffController) {
+  log("info", "Explicit agent handoff enabled", {
+    wireVersion: HANDOFF_WIRE_VERSION,
+    maxActiveDepth: handoffMaxDepth,
+    targets: handoffController.handoffTargets(),
+  });
+}
+
+/**
+ * Exact correlated system failure for a handoff refused deterministically after
+ * transport acceptance but before model execution. It is not model success and it is
+ * not a new handoff; its msgId is derived from the handoff id so a redelivery or an
+ * inbound-backfill replay can never produce a second distinct failure result.
+ */
+const enqueueHandoffFailureReply = async (payload, { reason, detail = null }) => {
+  if (!payload?.msgId || !payload?.from || !payload?.conversationId) return null;
+  if (!peers[payload.from]) {
+    log("error", "Cannot return handoff failure to an unpaired sender", { msgId: payload.msgId, from: payload.from, reason });
+    return null;
+  }
+  const reply = await enqueueRuntimeReply({
+    msgId: `handoff-failed-${payload.msgId}`,
+    to: payload.from,
+    conversationId: payload.conversationId,
+    replyToMessageId: payload.msgId,
+    text: buildHandoffFailureText({ reason, detail, handoffMsgId: payload.msgId }),
+  });
+  log("warn", "Handoff refused before model execution", {
+    handoffMsgId: payload.msgId, from: payload.from, reason, detail, replyMsgId: reply.msgId,
+  });
+  return reply;
 };
 
 const durableSafe = (value) => value.replace(/[^A-Za-z0-9_-]/g, "-");
@@ -341,6 +471,7 @@ const claudeOneShotRuntime = claudeOneShotEnabled ? new ClaudeOneShotRuntime({
   terminateGraceMs: Number(claudeOneShotConfig.terminateGraceMs) || 5_000,
   permissionMode: claudeOneShotConfig.permissionMode || "dontAsk",
   model: claudeOneShotConfig.model,
+  handoff: handoffCoordinator,
   log,
 }) : null;
 
@@ -358,6 +489,7 @@ const cursorAcpRuntime = cursorAcpEnabled ? new CursorAcpRuntime({
   terminateGraceMs: Number(cursorAcpConfig.terminateGraceMs) || 5_000,
   permissionPolicy: cursorAcpConfig.permissionPolicy || "reject-once",
   mode: cursorAcpConfig.mode || "ask",
+  handoff: handoffCoordinator,
   log,
 }) : null;
 const codexAppServerRuntime = codexAppServerRuntimeEnabled ? new CodexAppServerRuntimeAdapter({
@@ -370,6 +502,7 @@ const codexAppServerRuntime = codexAppServerRuntimeEnabled ? new CodexAppServerR
   sendReply: enqueueRuntimeReply,
   heartbeatIntervalMs: Number(codexAppServerRuntimeConfig.heartbeatIntervalMs) || 5_000,
   retryDelayMs: Number(codexAppServerRuntimeConfig.retryDelayMs) || 1_000,
+  handoff: handoffCoordinator,
   log,
 }) : null;
 
@@ -412,6 +545,7 @@ const wakeMonitor = new WakeMonitor({
     processingReceipts: config.onReceiveProcessingReceipts === "completed" ? "completed" : "none",
   }),
   injector: daemonCodexAppServerInjector,
+  onHandoffRejected: enqueueHandoffFailureReply,
   notify: enqueueWakeNotification,
   log,
 });
@@ -434,6 +568,14 @@ const onMessage = async (envelope) => {
 
   if (!peer) throw new Error(`unknown-sender:${senderId}`);
 
+  // Structural gate FIRST. A malformed 1.1 envelope has no defined canonical form, so it
+  // cannot be authenticated and therefore gets no correlated reply — it is refused at the
+  // transport boundary. An unsupported schemaVersion is refused for the same reason.
+  if (!isSupportedEnvelope(envelope)) {
+    throw new Error(`envelope-unsupported:${String(envelope?.schemaVersion)}`);
+  }
+  const handoffInbound = isHandoffEnvelope(envelope);
+
   const sigPayload = stableEnvelopePayload(envelope);
   const valid = await verifyEnvelopeSignature(sigPayload, envelope.signature, peer.signing.publicKey);
   if (!valid) throw new Error(`signature-invalid:${senderId}`);
@@ -448,17 +590,54 @@ const onMessage = async (envelope) => {
   );
 
   const inboundMemberSlot = activeRuntimeAdapter?.memberSlot || null;
-  await msgStore.append({
+  const inboundRow = {
     conversationId: envelope.conversationId,
     msgId: envelope.msgId,
     ...(envelope.replyToMessageId ? { replyToMessageId: envelope.replyToMessageId } : {}),
     direction: "inbound",
     sender: senderId,
+    recipientId: agentId,
     text: plaintext,
     createdAt: envelope.createdAt,
     transport: "nats",
     ...(inboundMemberSlot ? { memberSlot: inboundMemberSlot } : {}),
-  });
+    ...(handoffInbound ? { handoff: envelope.handoff } : {}),
+  };
+  const basePayload = {
+    from: senderId,
+    text: plaintext,
+    msgId: envelope.msgId,
+    ...(envelope.replyToMessageId ? { replyToMessageId: envelope.replyToMessageId } : {}),
+    conversationId: envelope.conversationId,
+    ts: new Date().toISOString(),
+    ...(inboundMemberSlot ? { memberSlot: inboundMemberSlot } : {}),
+    ...(handoffInbound ? { handoff: envelope.handoff } : {}),
+  };
+
+  // The envelope is now authenticated, so a deterministic handoff refusal can be returned
+  // as an EXACT correlated failure result instead of silence. No model ever runs.
+  //
+  // The refusal is recorded in the dispatch ledger BEFORE the audit row is written: inbound
+  // backfill rebuilds dispatches from local_messages, so an audit row with no dispatch row
+  // could otherwise resurrect a refused handoff after a restart as executable work.
+  if (handoffInbound) {
+    const admission = admitInboundHandoff({
+      envelope,
+      localAgentId: agentId,
+      maxDepth: handoffMaxDepth,
+      hasAutonomousRuntime: Boolean(activeRuntimeAdapter),
+    });
+    if (!admission.ok) {
+      wakeDispatchStore.rejectInbound({ ...basePayload, cursor: 0 }, admission.reason);
+      await msgStore.appendIdempotent(inboundRow);
+      await msgStore.recordEvent({ msgId: envelope.msgId, conversationId: envelope.conversationId,
+        event: "wake_failed", actor: agentId, detail: admission.reason });
+      await enqueueHandoffFailureReply(basePayload, admission);
+      return;
+    }
+  }
+
+  await msgStore.append(inboundRow);
 
   log("info", "Message received", {
     msgId: envelope.msgId,
@@ -466,18 +645,11 @@ const onMessage = async (envelope) => {
     from: senderId,
     conversationId: envelope.conversationId,
     textLen: plaintext.length,
+    ...(handoffInbound ? { handoff: { rootMessageId: envelope.handoff.rootMessageId,
+      ancestry: envelope.handoff.ancestry } } : {}),
   });
 
-  const payload = {
-    from: senderId,
-    text: plaintext,
-    msgId: envelope.msgId,
-    ...(envelope.replyToMessageId ? { replyToMessageId: envelope.replyToMessageId } : {}),
-    conversationId: envelope.conversationId,
-    ts: new Date().toISOString(),
-    cursor: inboundCursorForMsg(envelope.msgId),
-    ...(inboundMemberSlot ? { memberSlot: inboundMemberSlot } : {}),
-  };
+  const payload = { ...basePayload, cursor: inboundCursorForMsg(envelope.msgId) };
 
   if (effectiveNotifyTargets.length > 0) {
     notifyQueue.enqueueMessage(payload, effectiveNotifyTargets);
@@ -498,6 +670,7 @@ const flushLoop = async () => {
       wakeMonitor.reconcileProcessingAttempts();
       runtimeBindingStore?.reconcileStale({ processingStartedTtlMs });
       await runtimeRegistry.recoverCompletedReplies();
+      if (handoffController) await handoffController.recoverPendingEnqueues();
       await wakeMonitor.drain();
     } catch (err) {
       log("error", "Wake dispatch retry error", { error: err.message });
@@ -554,6 +727,14 @@ try {
   for (const ps of proxySubjects) {
     const proxyOnMessage = async (envelope, plaintext) => {
       const senderId = envelope.senderAgentId || "unknown";
+      // The proxy path has no signed-lineage validation and no autonomous runtime, so a
+      // handoff must never be laundered through it as ordinary text.
+      if (envelope?.schemaVersion !== "1.0") {
+        log("error", "Proxy subject refused a non-1.0 envelope", {
+          subject: ps, from: senderId, schemaVersion: String(envelope?.schemaVersion), msgId: envelope?.msgId,
+        });
+        return;
+      }
       log("info", "Proxy message received", { subject: ps, from: senderId, len: plaintext?.length });
       await proxyWakeMonitor.onInbound({
         from: senderId,
@@ -605,6 +786,18 @@ try {
   if (pendingNotify > 0) {
     log("info", "Resuming pending notifications", { pendingNotify });
     await flushNotifyQueue({ queue: notifyQueue, log, limit: 250 });
+  }
+
+  if (handoffController) {
+    const openContinuations = handoffStore.listOpen();
+    if (openContinuations.length > 0) {
+      log("warn", "Reloaded open handoff continuations", {
+        count: openContinuations.length,
+        handoffMsgIds: openContinuations.map((row) => row.handoffMsgId),
+      });
+    }
+    const recovered = await handoffController.recoverPendingEnqueues();
+    if (recovered.length > 0) log("warn", "Recovered handoff envelopes at startup", { handoffMsgIds: recovered });
   }
 
   flushLoop();

@@ -1,12 +1,34 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
+import { HANDOFF_REASONS } from "@murmurv2/core";
+import { settleRuntimeTurn } from "./agent-handoff-runtime.mjs";
 
 export const CURSOR_ACP_KIND = "cursor_acp";
 export const CURSOR_ACP_MEMBER_SLOT = "cursor:acp";
 export const normalizeCursorAcpRuntimeConfig = (config = {}) => ({ ...config, enabled: config.enabled === true });
 
 const asError = (value) => value instanceof Error ? value : new Error(String(value));
+
+/**
+ * Cursor continuation guard. Continuity is the LIVE ACP session only: the adapter owns
+ * one persistent `agent acp` child and `session/load` restart continuity is explicitly
+ * not claimed. If the exact originating session is not currently loaded in the running
+ * client, the continuation fails closed instead of pretending a fresh session is a resume.
+ */
+export const cursorHandoffResumeGuard = ({ continuation, binding, liveSessionIds = [] }) => {
+  const sessionId = continuation.originatingRuntimeSessionId;
+  if (!sessionId) {
+    return { ok: false, reason: HANDOFF_REASONS.continuationSessionUnavailable, detail: "no-originating-session" };
+  }
+  if (binding.runtimeSessionId && binding.runtimeSessionId !== sessionId) {
+    return { ok: false, reason: HANDOFF_REASONS.continuationSessionUnavailable, detail: "binding-session-diverged" };
+  }
+  if (!liveSessionIds.includes(sessionId)) {
+    return { ok: false, reason: HANDOFF_REASONS.continuationSessionUnavailable, detail: "acp-session-not-live" };
+  }
+  return { ok: true };
+};
 
 export class CursorAcpClient {
   constructor({
@@ -241,12 +263,12 @@ export class CursorAcpRuntime {
     command = "agent", env = process.env, now = () => Date.now(),
     heartbeatIntervalMs = 5_000, startupTimeoutMs = 30_000,
     turnTimeoutMs = 300_000, terminateGraceMs = 5_000, retryDelayMs = 1_000,
-    permissionPolicy = "reject-once", log = () => {},
+    permissionPolicy = "reject-once", handoff = null, log = () => {},
     mode = "ask",
   }) {
     Object.assign(this, { bindingStore, dispatchStore, agentId, projectId, cwd, sendReply,
       client, clientFactory, command, env, now, heartbeatIntervalMs, startupTimeoutMs,
-      turnTimeoutMs, terminateGraceMs, retryDelayMs, permissionPolicy, mode, log });
+      turnTimeoutMs, terminateGraceMs, retryDelayMs, permissionPolicy, handoff, mode, log });
   }
 
   async start({ bindingId = randomUUID(), runtimeGeneration = 1, leaseTtlMs = 30_000 } = {}) {
@@ -312,19 +334,40 @@ export class CursorAcpRuntime {
     if (!this.bindingStore.validateFence(fence, identity)) throw new Error("cursor-acp-fence-lost-before-wake");
     if (this.bindingStore.markWaking(fence, this.now()) !== 1) throw new Error("cursor-acp-waking-transition-failed");
     const binding = this.bindingStore.get(fence.bindingId);
+    const turn = this.handoff
+      ? this.handoff.prepareTurn({
+        payload,
+        binding,
+        runtimeKind: CURSOR_ACP_KIND,
+        memberSlot: CURSOR_ACP_MEMBER_SLOT,
+        resumeGuard: (context) => cursorHandoffResumeGuard({
+          ...context,
+          liveSessionIds: this.client?.health().sessionIds ?? [],
+        }),
+        fence,
+        identity,
+      })
+      : null;
+    if (turn?.rejection) {
+      return this.handoff.failClosedTurn({
+        turn, dispatch, dispatchStore: this.dispatchStore, bindingStore: this.bindingStore, fence, identity,
+      });
+    }
+    const promptText = turn?.promptText ?? payload.text;
     const attempt = { attemptId: randomUUID(), inboundMessageId: identity.msgId,
       recipientId: identity.recipientId, memberSlot: identity.memberSlot,
       runtime: CURSOR_ACP_KIND, capability: "completed" };
     let submitted = false;
     let started = false;
     try {
-      let sessionId = binding.runtimeSessionId;
+      // A continuation resumes the EXACT originating ACP session the guard just proved live.
+      let sessionId = turn?.resumeSessionId || binding.runtimeSessionId;
       if (!sessionId) sessionId = await this.client.createSession();
       else if (!this.client.health().sessionIds.includes(sessionId)) await this.client.loadSession(sessionId);
       if (!this.bindingStore.validateFence(fence, identity)) return { status: "late-result-dropped" };
       if (this.bindingStore.markRunning(fence, this.now()) !== 1) throw new Error("cursor-acp-running-transition-failed");
       if (this.bindingStore.confirmRuntimeSession(fence, sessionId, this.now()) !== 1) throw new Error("cursor-acp-session-confirm-failed");
-      const result = await this.client.executeTurn({ sessionId, prompt: payload.text,
+      const result = await this.client.executeTurn({ sessionId, prompt: promptText,
         onSubmitted: () => {
           if (!this.bindingStore.validateFence(fence, identity)) throw new Error("cursor-acp-fence-lost-before-submit");
           if (this.dispatchStore.beginHandoff(identity, this.now(), attempt) !== 1) throw new Error("cursor-acp-handoff-claim-lost");
@@ -338,26 +381,24 @@ export class CursorAcpRuntime {
       });
       if (!submitted) throw new Error("cursor-acp-submit-unconfirmed");
       if (!this.bindingStore.validateFence(fence, identity)) return { status: "late-result-dropped" };
-      const receipt = this.dispatchStore.recordProcessingReceipt({ ...attempt, status: "completed", sessionId,
-        metadata: { resultText: result.text, stopReason: result.stopReason,
-          conversationId: payload.conversationId, recipient: payload.from, replyToMessageId: payload.msgId } }, this.now());
-      if (!receipt.accepted) throw new Error(`cursor-acp-completion-rejected:${receipt.reason}`);
-      this.dispatchStore.markHandedOffIfLatestAttemptCompleted(identity, attempt.attemptId, this.now());
-      let reply = null;
-      if (this.bindingStore.validateFence(fence, identity)) {
-        try {
-          reply = await this.sendReply({ msgId: attempt.attemptId, to: payload.from,
-            conversationId: payload.conversationId, replyToMessageId: payload.msgId, text: result.text });
-          this.dispatchStore.recordProcessingReceipt({ ...attempt, status: "completed",
-            sessionId, resultMessageId: reply.msgId }, this.now());
-        } catch (error) {
-          this.log("error", "Cursor ACP reply enqueue failed after durable completion",
-            { msgId: payload.msgId, attemptId: attempt.attemptId, error: asError(error).message });
-        }
-      }
-      if (!this.bindingStore.validateFence(fence, identity)) return { status: "late-result-dropped" };
-      if (this.bindingStore.markIdle(fence, this.now()) !== 1) return { status: "late-result-dropped" };
-      return { status: reply ? "completed" : "completed-reply-pending", attemptId: attempt.attemptId, reply };
+      return await settleRuntimeTurn({
+        runtimeKind: CURSOR_ACP_KIND,
+        dispatchStore: this.dispatchStore,
+        bindingStore: this.bindingStore,
+        fence,
+        identity,
+        attempt,
+        payload,
+        turn,
+        coordinator: this.handoff,
+        resultText: result.text,
+        sessionId,
+        extraMetadata: { stopReason: result.stopReason },
+        runtimeSession: { runtimeSessionId: sessionId },
+        sendReply: this.sendReply,
+        log: this.log,
+        now: this.now,
+      });
     } catch (error) {
       const failure = asError(error);
       if (this.bindingStore.validateFence(fence, identity)) {
