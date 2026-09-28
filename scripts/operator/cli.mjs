@@ -7,6 +7,7 @@
  *   murmur doctor  <project> [--json]
  *   murmur logs    <project> [child] [-n <lines>] [--follow]
  *   murmur send    <project> "<task>" [--timeout <s>] [--no-wait]
+ *   murmur notify  status | migrate [--from <dir>] | test
  *
  * Exit codes: 0 ok · 1 usage/resolution · 2 preflight failed · 3 unhealthy or not
  * running · 4 start failed.
@@ -34,6 +35,7 @@ import {
   profileExists,
   publicProfileSummary,
 } from "./profile.mjs";
+import { commandNotify } from "./notify.mjs";
 import { locateProject, murmurHome } from "./project.mjs";
 import {
   UNKNOWN,
@@ -98,9 +100,13 @@ Usage:
   murmur doctor  <project> [--json]
   murmur logs    <project> [supervisor|root|claude|codex|cursor|codex-app-server] [-n <lines>] [--follow]
   murmur send    <project> "<task>" [--timeout <seconds>] [--no-wait]
+  murmur notify  status | migrate [--from <legacy-data-dir>] | test [--json]
 
 <project> is an absolute path, or a name resolved under ~/Projects/<name>.
 Profiles and all runtime state live under ~/.murmur/projects/<project-id>/.
+
+\`murmur notify\` configures notifications once per USER, in
+~/.murmur/notifications.json — no project ever stores the credential.
 `;
 
 const out = (line = "") => process.stdout.write(`${line}\n`);
@@ -111,7 +117,7 @@ const tilde = (target, homedir = os.homedir()) =>
   target === homedir || target.startsWith(`${homedir}${path.sep}`) ? `~${target.slice(homedir.length)}` : target;
 
 export const parseArgs = (argv) => {
-  const flags = { json: false, foreground: false, follow: false, wait: true, lines: 200, timeoutSeconds: null };
+  const flags = { json: false, foreground: false, follow: false, wait: true, lines: 200, timeoutSeconds: null, from: null };
   const positional = [];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -121,6 +127,7 @@ export const parseArgs = (argv) => {
     else if (arg === "--no-wait") flags.wait = false;
     else if (arg === "-n" || arg === "--lines") flags.lines = Number(argv[++i]);
     else if (arg === "--timeout") flags.timeoutSeconds = Number(argv[++i]);
+    else if (arg === "--from") flags.from = argv[++i];
     else if (arg === "--help" || arg === "-h") flags.help = true;
     else if (arg === "--version" || arg === "-v") flags.version = true;
     else if (arg.startsWith("-")) throw new Error(`unknown-flag:${arg}`);
@@ -130,6 +137,7 @@ export const parseArgs = (argv) => {
   if (flags.timeoutSeconds !== null && (!Number.isFinite(flags.timeoutSeconds) || flags.timeoutSeconds <= 0)) {
     throw new Error("invalid-timeout");
   }
+  if (flags.from !== null && (typeof flags.from !== "string" || !flags.from.trim())) throw new Error("invalid-from");
   return { command: positional[0], args: positional.slice(1), flags };
 };
 
@@ -1159,7 +1167,14 @@ const COMMANDS = {
   doctor: commandDoctor,
   logs: commandLogs,
   send: commandSend,
+  notify: (parsed) => commandNotify({ ...parsed, out, err }),
 };
+
+/**
+ * Commands that operate on the USER's Murmur state rather than on one project, and so
+ * must not be rejected for a missing `<project>`.
+ */
+const PROJECTLESS_COMMANDS = new Set(["notify"]);
 
 export const run = async (argv = process.argv.slice(2)) => {
   let parsed;
@@ -1180,7 +1195,7 @@ export const run = async (argv = process.argv.slice(2)) => {
     err(USAGE);
     return 1;
   }
-  if (!parsed.args[0]) {
+  if (!parsed.args[0] && !PROJECTLESS_COMMANDS.has(parsed.command)) {
     err(`murmur: ${parsed.command} requires <project>`);
     err(USAGE);
     return 1;

@@ -13,6 +13,7 @@ import path from "node:path";
 import { createKeyPair, createSigningKeyPair, getCryptoProvider } from "@murmurv2/security";
 import { localHandoffCapabilities, peerCapabilityFields } from "../agent-handoff-controller.mjs";
 import { ensurePrivateDirectory, readPrivateJson, writePrivateJson } from "../secure-state.mjs";
+import { defaultScopeForRole, isNotifyScope } from "../notify-config.mjs";
 import { CLAUDE_AUTO_MEMBER_SLOT } from "../claude-one-shot-runtime.mjs";
 import { CURSOR_ACP_MEMBER_SLOT } from "../cursor-acp-runtime.mjs";
 import { CODEX_APP_SERVER_MEMBER_SLOT } from "../agent-runtime-adapter.mjs";
@@ -85,6 +86,24 @@ const runtimeConfigFor = (agent, { projectId, projectPath, codexSocketPath }) =>
   }
 };
 
+/**
+ * The identity's NOTIFICATION POLICY — a derivable, NON-SECRET field.
+ *
+ * The credential itself lives once per machine in $MURMUR_HOME/notifications.json; a
+ * project profile only ever records WHICH events this identity forwards, so no agent
+ * config, project profile or repository holds a copy of a bot token.
+ *
+ *   root (operator) -> `all`: it receives only the coordinator's final correlated reply,
+ *                      so this is one notification per completed operator task;
+ *   every other role -> `errors`: runtime failures only. Internal handoffs are not
+ *                      notified, which is what keeps one task from producing one message
+ *                      per agent.
+ *
+ * An operator may hand-edit `scope` (including to `off`) or set `source: "none"`, and a
+ * repair preserves that choice — only a MISSING or INVALID policy is regenerated.
+ */
+const notificationsFor = (agent) => ({ source: "global", scope: defaultScopeForRole(agent.role) });
+
 /** The public half of an identity, in the shape the pairing helpers already consume. */
 const advertiseBlob = (agent, config) => ({
   agentId: config.agentId,
@@ -129,6 +148,7 @@ const createIdentityConfig = async (agent, { projectId, projectPath, paths, nats
     features: advertised.features,
     keys: { encryption, signing },
     ackSecurity: { emitSigned: true, requireSigned: false, maxAgeMs: 300_000 },
+    notifications: notificationsFor(agent),
     peers: {},
     ...(runtime ? { runtime } : {}),
   };
@@ -171,6 +191,18 @@ const reconcileIdentityConfig = (agent, config, { projectId, projectPath, paths,
     config.protocolVersions = advertised.protocolVersions;
     config.features = advertised.features;
     repairs.push(`capabilities:${agent.name}`);
+  }
+
+  // The notification policy is derivable from the role, so a profile created before
+  // global notifications existed is repaired in place — without regenerating an identity,
+  // touching a key, or writing a credential anywhere near the profile.
+  const notifications = config.notifications;
+  const policyUsable = notifications && typeof notifications === "object" && !Array.isArray(notifications)
+    && (notifications.source === "global" || notifications.source === "none")
+    && isNotifyScope(notifications.scope);
+  if (!policyUsable) {
+    config.notifications = notificationsFor(agent);
+    repairs.push(`notifications:${agent.name}`);
   }
 
   const derivable = derivableRuntimeFields(agent, { projectId, projectPath, codexSocketPath });

@@ -83,7 +83,7 @@ test("argument parsing covers the documented flags and rejects unknown ones", ()
   assert.deepEqual(parseArgs(["status", "murmur", "--json"]), {
     command: "status",
     args: ["murmur"],
-    flags: { json: true, foreground: false, follow: false, wait: true, lines: 200, timeoutSeconds: null },
+    flags: { json: true, foreground: false, follow: false, wait: true, lines: 200, timeoutSeconds: null, from: null },
   });
   const started = parseArgs(["start", "/a/b", "--foreground", "--timeout", "30"]);
   assert.equal(started.flags.foreground, true);
@@ -92,6 +92,13 @@ test("argument parsing covers the documented flags and rejects unknown ones", ()
   assert.throws(() => parseArgs(["status", "p", "--nope"]), /unknown-flag:--nope/);
   assert.throws(() => parseArgs(["logs", "p", "-n", "0"]), /invalid-lines/);
   assert.throws(() => parseArgs(["start", "p", "--timeout", "x"]), /invalid-timeout/);
+  // `notify` is a USER-level command: it carries no <project>, and --from selects one
+  // legacy source when several disagree.
+  const migrate = parseArgs(["notify", "migrate", "--from", ".data-cursor"]);
+  assert.equal(migrate.command, "notify");
+  assert.deepEqual(migrate.args, ["migrate"]);
+  assert.equal(migrate.flags.from, ".data-cursor");
+  assert.throws(() => parseArgs(["notify", "migrate", "--from"]), /invalid-from/);
 });
 
 test("no command prints usage; an unknown command and a missing project are usage errors", async () => {

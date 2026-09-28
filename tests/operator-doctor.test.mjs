@@ -16,7 +16,6 @@ import {
   formatReport,
   hasFatal,
   runDiagnostics,
-  worstStatus,
 } from "../scripts/operator/doctor.mjs";
 import { bootstrapProfile } from "../scripts/operator/profile.mjs";
 import { projectIdFor, projectPathsFor } from "../scripts/operator/project.mjs";
@@ -124,7 +123,12 @@ test("a freshly bootstrapped project passes every check", async () => {
     const results = await ctx.diagnose();
     const failures = results.filter((result) => result.status === FAIL);
     assert.deepEqual(failures, [], JSON.stringify(failures, null, 2));
-    assert.equal(worstStatus(results), PASS);
+    assert.equal(hasFatal(results), false);
+    // Notifications are an optional subsystem configured once per USER, not per project,
+    // so an unconfigured notifier is the one expected WARN here — and it is never fatal.
+    const warnings = results.filter((result) => result.status === WARN).map((result) => result.name);
+    assert.deepEqual(warnings, ["telegram-notify"]);
+    assert.equal(byName(results, "telegram-notify").fatal, false);
     assert.equal(byName(results, "identity:claude").status, PASS);
     assert.equal(byName(results, "pairing:claude<->codex").status, PASS);
     assert.equal(byName(results, "handoff-v1:claude->codex").status, PASS);

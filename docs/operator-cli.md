@@ -10,6 +10,7 @@ murmur start  <project>
 murmur status <project>
 murmur stop   <project>
 murmur doctor <project>
+murmur notify status          # notifications are configured once per user, not per project
 ```
 
 ## Installation
@@ -735,6 +736,103 @@ evidence, and completes normally once the processes can be measured.
 
 If the supervisor dies without stopping its children, they keep running; `murmur status`
 reports it, and `murmur stop` reaps exactly those recorded PIDs.
+
+## Notifications (`murmur notify`)
+
+Operator notifications are a **Murmur-user setting, not per-project state**. The
+credential lives in exactly one file, outside every repository:
+
+```
+$MURMUR_HOME/notifications.json      # default ~/.murmur/notifications.json, mode 0600
+```
+
+```json
+{
+  "version": 1,
+  "telegram": { "botToken": "...", "chatId": "...", "topicId": "optional" },
+  "webhook":  { "url": "https://...", "headers": { "x-token": "..." } }
+}
+```
+
+`telegram` and `webhook` are the same shapes the pre-CLI `notify` block used, so the
+existing `notify-router.mjs` transport consumes them unchanged. Nothing about the
+Telegram bridge is redesigned.
+
+```bash
+murmur notify status                      # "Telegram: configured" / "not configured"
+murmur notify migrate                     # one-time import from a legacy .data-* config
+murmur notify migrate --from .data-cursor  # choose a source when several disagree
+murmur notify test                         # send ONE explicit test notification
+```
+
+`status` and `--json` report **presence and shape only** — never a bot token, chat id,
+topic id or webhook URL. A transport error is redacted before it is printed, because the
+Telegram endpoint embeds the token in its path. `start` never sends a test notification.
+
+### One credential, never N copies
+
+A project profile stores a **policy**, never a credential:
+
+```json
+"notifications": { "source": "global", "scope": "all" }
+```
+
+That field is derivable from the agent's role, so `murmur start` repairs it in place on
+an existing profile — no identity is regenerated, no key rotated, no database or history
+touched. Once the global config exists, **every** `murmur start <project>` has
+notifications available; there is no per-project `notify init`.
+
+### Notification policy
+
+`scope` decides which events reach the operator, and exists so that one task does not
+produce one message per agent:
+
+| Scope | Meaning | Default for |
+|---|---|---|
+| `all` | every inbound message, plus runtime-failure alerts | `root` (operator) |
+| `errors` | runtime-failure alerts only (WakeMonitor fallback) | `claude`, `codex`, `cursor` |
+| `off` | nothing | — |
+
+Root only ever receives the coordinator's **final correlated reply**, so `all` at root is
+exactly one notification per completed operator task. Internal `claude → codex`,
+`claude → cursor` and worker → coordinator hops are deliberately silent. A runtime that
+never picked up its work still alerts from the identity where it failed, whatever its
+scope, because that is what the operator has to act on.
+
+Resolution order for one daemon, so nothing that already worked changes:
+
+1. an inline `notify` block in the agent config (the pre-CLI `.data-*` layout) — used
+   as-is, with the historical all-inbound behaviour;
+2. the global config, with this identity's `scope`;
+3. the `MURMUR_TELEGRAM_BOT_TOKEN` / `MURMUR_TELEGRAM_CHAT_ID` environment fallback.
+
+### Migration from a legacy config
+
+`murmur notify migrate` reads `notify.telegram` out of `.data`, `.data-claude`,
+`.data-codex` and `.data-cursor` under the current directory and writes the global config
+atomically at 0600. It is deliberately conservative:
+
+- legacy files are **read-only inputs** — never modified, moved or deleted;
+- identical Claude/Cursor configs **deduplicate** into one migration;
+- materially different configs **fail closed**, reporting only a short fingerprint and
+  the directory names, so the operator chooses with `--from`;
+- a malformed legacy notifier aborts the migration rather than being skipped;
+- it is **idempotent**: a second run changes nothing, and an existing global config is
+  never overwritten.
+
+### Notifications never gate the bus
+
+`doctor` reports notifications as a **non-blocking** check:
+
+```
+  PASS  telegram-notify  configured (global: telegram:telegram)
+  WARN  telegram-notify  not configured
+  WARN  telegram-notify  configured but invalid (...)
+  PASS  notify-policy    root=all claude=errors codex=errors cursor=errors
+```
+
+None of these is ever `fatal`. An absent or malformed notification config is a WARN for
+the notification subsystem and never prevents the multi-agent runtime from starting.
 
 ## Running without one of the agents
 

@@ -20,7 +20,8 @@ import {
   validateHandoffEnvelope,
 } from "@murmurv2/core";
 import { decryptPayload, encryptPayload, signEnvelope, verifyEnvelopeSignature } from "@murmurv2/security";
-import { NotifyQueue, flushNotifyQueue, normalizeNotifyTargets } from "./notify-router.mjs";
+import { NotifyQueue, flushNotifyQueue } from "./notify-router.mjs";
+import { planNotifiesErrors, planNotifiesInbound, resolveNotifyPlan } from "./notify-config.mjs";
 import {
   createChannelThreadStartBindingResolver,
   createCodexAppServerDaemonInjector,
@@ -128,15 +129,26 @@ const ackWindow = ackWindowEnabled
       ) ?? 4 * 1024 * 1024,
     }
   : undefined;
-const notifyTargets = normalizeNotifyTargets(config.notify);
-const envTelegramFallback = (() => {
-  const botToken = process.env.MURMUR_TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.MURMUR_TELEGRAM_CHAT_ID || process.env.TELEGRAM_CHAT_ID;
-  const topicId = process.env.MURMUR_TELEGRAM_TOPIC_ID || process.env.TELEGRAM_TOPIC_ID;
-  if (notifyTargets.length > 0 || !botToken || !chatId) return [];
-  return [{ type: "telegram", channel: "telegram", botToken, chatId, ...(topicId ? { topicId } : {}) }];
-})();
-const effectiveNotifyTargets = notifyTargets.length > 0 ? notifyTargets : envTelegramFallback;
+// Notification credentials are a MURMUR-USER setting, not per-project state. The plan is
+// resolved from the inline `notify` block (the pre-CLI `.data-*` layout), else the global
+// $MURMUR_HOME/notifications.json, else the MURMUR_TELEGRAM_* environment fallback — and
+// the identity's non-secret `notifications.scope` decides WHICH events reach it, so one
+// operator task does not produce one Telegram message per agent in the topology.
+// A missing or malformed notification config is never fatal: the bus keeps running.
+let notifyPlan = { source: "none", scope: "off", targets: [], global: null };
+try {
+  notifyPlan = await resolveNotifyPlan({ config, env: process.env });
+} catch (err) {
+  log("error", "Notification config could not be resolved; continuing without notifications", { error: err.message });
+}
+if (notifyPlan.source === "invalid") {
+  log("warn", "Global notification config is invalid; continuing without notifications", {
+    reason: notifyPlan.global?.reason,
+  });
+}
+const effectiveNotifyTargets = notifyPlan.targets;
+const notifyInbound = planNotifiesInbound(notifyPlan);
+const notifyErrors = planNotifiesErrors(notifyPlan);
 const notifyQueue = new NotifyQueue(dbPath);
 const wakeDb = new DatabaseSync(dbPath);
 const wakeDispatchStore = new WakeDispatchStore(dbPath, {
@@ -206,7 +218,8 @@ log("info", "Daemon starting", {
   },
   ackWindow,
   notifyTargets: effectiveNotifyTargets.map((t) => `${t.type}:${t.channel}`),
-  notifyFallbackFromEnv: envTelegramFallback.length > 0,
+  notifySource: notifyPlan.source,
+  notifyScope: notifyPlan.scope,
 });
 
 const store = new SQLiteDedupeOutboxStore(dbPath);
@@ -450,9 +463,12 @@ const loadInboundAfter = async (cursor) => {
   }));
 };
 
+// Runtime-failure notifications are the one class every scope except `off` receives:
+// a worker whose runtime never picked the work up is exactly what the operator has to
+// hear about, even though that identity does not notify ordinary inbound traffic.
 const enqueueWakeNotification = async (payload, reason) => {
   log("warn", "WakeMonitor fallback notify", { reason, msgId: payload.msgId, from: payload.from });
-  if (effectiveNotifyTargets.length === 0) return;
+  if (!notifyErrors) return;
   notifyQueue.enqueueMessage({
     ...payload,
     text: `[WakeMonitor ${reason}] ${payload.text}`,
@@ -651,7 +667,10 @@ const onMessage = async (envelope) => {
 
   const payload = { ...basePayload, cursor: inboundCursorForMsg(envelope.msgId) };
 
-  if (effectiveNotifyTargets.length > 0) {
+  // Scope `errors` deliberately does NOT notify inbound traffic: coordinator -> worker
+  // handoffs and worker -> coordinator results are internal, and the operator already
+  // receives the final correlated reply through the root identity.
+  if (notifyInbound) {
     notifyQueue.enqueueMessage(payload, effectiveNotifyTargets);
     log("info", "Notifications queued", {
       msgId: envelope.msgId,

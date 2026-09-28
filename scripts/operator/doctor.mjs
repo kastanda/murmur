@@ -12,6 +12,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { peerSupportsHandoffV1 } from "@murmurv2/core";
 import { readPrivateJson } from "../secure-state.mjs";
+import { SCOPE_OFF, describeNotifyConfig, isNotifyScope, loadNotifyConfig, notifyConfigPath } from "../notify-config.mjs";
 import { CODEX_SOURCES, discoverCodexExecutable } from "./codex.mjs";
 import { DEFAULT_AGENTS, DEFAULT_NATS_URL, agentIdFor, enabledAgents, loadProfile, peersForAgent } from "./profile.mjs";
 import { socketPathFits, UNIX_SOCKET_PATH_MAX } from "./project.mjs";
@@ -340,6 +341,69 @@ const checkCodexSocket = async ({ project, paths, socketProbe = probeUnixSocket 
   return results;
 };
 
+/**
+ * NOTIFICATIONS — always NON-BLOCKING.
+ *
+ * Operator notifications are a convenience layer over the bus, never a prerequisite for
+ * it, so nothing here is ever `fatal`: an absent or malformed notification config must
+ * not stop `murmur start` from bringing the multi-agent runtime up.
+ *
+ * Nothing printed here is derived from a credential — only presence, shape and the
+ * per-identity scope. `describeNotifyConfig()` is the sole formatted view.
+ */
+export const checkNotifications = async ({ project = null, paths = null, env = process.env, home = undefined, load = loadNotifyConfig } = {}) => {
+  const configPath = notifyConfigPath(env, home);
+  const loaded = await load({ env, home, configPath });
+  const summary = describeNotifyConfig(loaded);
+  const results = [];
+
+  if (summary.state === "absent") {
+    results.push(check("telegram-notify", WARN, "not configured", {
+      fix: "murmur notify migrate (or murmur notify status) — notifications are optional and never block a start",
+    }));
+    return results;
+  }
+  if (summary.state === "invalid") {
+    results.push(check("telegram-notify", WARN, `configured but invalid (${summary.reason})`, {
+      fix: `fix or remove ${configPath}; Murmur starts without notifications either way`,
+    }));
+    return results;
+  }
+  results.push(check("telegram-notify", PASS, `${summary.telegram} (global${summary.channels.length > 0 ? `: ${summary.channels.join(", ")}` : ""})`));
+
+  // With a global config in place, every identity's POLICY is what decides whether one
+  // operator task turns into one notification or one per agent. Report it, and flag a
+  // topology in which nothing at all would be notified.
+  if (!project || !paths) return results;
+  const scopes = [];
+  for (const agent of enabledAgents(project)) {
+    let config;
+    try {
+      config = await readPrivateJson(paths.agentConfigFile(agent.name));
+    } catch {
+      continue; // the identity check already reported this
+    }
+    const declared = config.notifications;
+    const scope = declared && isNotifyScope(declared.scope) && declared.source === "global"
+      ? declared.scope
+      : declared?.source === "none"
+        ? SCOPE_OFF
+        : null;
+    if (scope === null) {
+      results.push(repairable(`notify-policy:${agent.name}`, "notification policy missing or unrecognised"));
+      continue;
+    }
+    scopes.push({ name: agent.name, scope });
+  }
+  if (scopes.length > 0) {
+    const describe = scopes.map((entry) => `${entry.name}=${entry.scope}`).join(" ");
+    results.push(scopes.every((entry) => entry.scope === SCOPE_OFF)
+      ? check("notify-policy", WARN, `every identity has notifications off (${describe})`)
+      : check("notify-policy", PASS, describe));
+  }
+  return results;
+};
+
 const checkSupervisor = async ({ paths }) => {
   const results = [];
   const state = await readRunState(paths);
@@ -468,6 +532,11 @@ export const runDiagnostics = async ({
   socketProbe = probeUnixSocket,
   includeNats = true,
   includeTools = true,
+  includeNotifications = true,
+  // The notification config lives in the SAME Murmur home as the profiles being
+  // diagnosed, so it is derived from `paths` rather than re-read from the ambient
+  // environment. A diagnostic run against one home can never inspect another's.
+  notifyHome = paths?.home,
 } = {}) => {
   const results = [];
 
@@ -498,6 +567,7 @@ export const runDiagnostics = async ({
     // Without a profile there is nothing to verify about identities or pairing, but the
     // host-level prerequisites are exactly what the operator needs to know BEFORE the
     // first `murmur start`.
+    if (includeNotifications) results.push(...await checkNotifications({ env, home: notifyHome }));
     if (includeNats) results.push(await checkNats({ natsUrl: DEFAULT_NATS_URL, connectImpl }));
     if (includeTools) {
       results.push(...await checkTools({
@@ -521,6 +591,7 @@ export const runDiagnostics = async ({
   results.push(...await checkRuntimeConfig({ project, paths }));
   results.push(...await checkCodexSocket({ project, paths, socketProbe }));
   results.push(...await checkSupervisor({ paths }));
+  if (includeNotifications) results.push(...await checkNotifications({ project, paths, env, home: notifyHome }));
 
   if (includeNats) results.push(await checkNats({ natsUrl: project.natsUrl, natsToken: project.natsToken, connectImpl }));
 
