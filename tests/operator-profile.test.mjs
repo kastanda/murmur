@@ -73,24 +73,32 @@ test("only handoff-capable agents advertise protocol 1.1 + handoff-v1", async ()
   }
 });
 
-test("pairing implements exactly the required trust edges (no codex<->cursor)", async () => {
+test("pairing implements exactly the worker mesh: codex<->cursor paired, root coordinator-only", async () => {
   const ctx = setup();
   try {
     const { project } = await bootstrapProfile({ projectId: ctx.projectId, projectPath: ctx.projectPath, paths: ctx.paths });
     assert.deepEqual(project.trustEdges, DEFAULT_TRUST_EDGES.map((edge) => [...edge]));
     assert.deepEqual(peersForAgent("claude").sort(), ["codex", "cursor", "root"]);
-    assert.deepEqual(peersForAgent("codex"), ["claude"]);
+    assert.deepEqual(peersForAgent("codex").sort(), ["claude", "cursor"]);
+    assert.deepEqual(peersForAgent("cursor").sort(), ["claude", "codex"]);
 
+    // Root stays the coordinator's counterpart and NOTHING else: a worker must never be
+    // able to take work from, or answer directly to, the human operator slot.
+    assert.deepEqual(peersForAgent("root"), ["claude"]);
+
+    const root = await readPrivateJson(ctx.paths.agentConfigFile("root"));
     const codex = await readPrivateJson(ctx.paths.agentConfigFile("codex"));
     const cursor = await readPrivateJson(ctx.paths.agentConfigFile("cursor"));
-    assert.deepEqual(Object.keys(codex.peers), [agentIdFor(ctx.projectId, "claude")]);
-    assert.equal(codex.peers[agentIdFor(ctx.projectId, "cursor")], undefined);
-    assert.equal(cursor.peers[agentIdFor(ctx.projectId, "codex")], undefined);
+    assert.deepEqual(Object.keys(root.peers), [agentIdFor(ctx.projectId, "claude")]);
+    assert.equal(codex.peers[agentIdFor(ctx.projectId, "root")], undefined);
+    assert.equal(cursor.peers[agentIdFor(ctx.projectId, "root")], undefined);
 
     // Pairing is mutual: each side holds the other's real public signing key.
     const claude = await readPrivateJson(ctx.paths.agentConfigFile("claude"));
     assert.equal(codex.peers[claude.agentId].signing.publicKey, claude.keys.signing.publicKey);
     assert.equal(claude.peers[codex.agentId].signing.publicKey, codex.keys.signing.publicKey);
+    assert.equal(codex.peers[cursor.agentId].signing.publicKey, cursor.keys.signing.publicKey);
+    assert.equal(cursor.peers[codex.agentId].signing.publicKey, codex.keys.signing.publicKey);
   } finally {
     ctx.cleanup();
   }

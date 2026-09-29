@@ -393,10 +393,15 @@ export const checkNotifications = async ({ project = null, paths = null, env = p
       results.push(repairable(`notify-policy:${agent.name}`, "notification policy missing or unrecognised"));
       continue;
     }
-    scopes.push({ name: agent.name, scope });
+    // Report the EFFECTIVE scope, not only the stored one. A machine-wide
+    // `murmur notify mode` overrides every per-role default, so printing the stored value
+    // alone would tell an operator who just switched to `activity` that nothing changed.
+    // An explicit opt-out is never overridden, and is reported as the opt-out it is.
+    const effective = scope === SCOPE_OFF || summary.mode === "default" ? scope : summary.mode;
+    scopes.push({ name: agent.name, scope: effective });
   }
   if (scopes.length > 0) {
-    const describe = scopes.map((entry) => `${entry.name}=${entry.scope}`).join(" ");
+    const describe = `mode=${summary.mode} ${scopes.map((entry) => `${entry.name}=${entry.scope}`).join(" ")}`;
     results.push(scopes.every((entry) => entry.scope === SCOPE_OFF)
       ? check("notify-policy", WARN, `every identity has notifications off (${describe})`)
       : check("notify-policy", PASS, describe));

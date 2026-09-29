@@ -86,10 +86,20 @@ export class NotifyQueue {
     `);
   }
 
+  /**
+   * Enqueue one payload per target, idempotently.
+   *
+   * The dedupe identity is `payload.dedupeId` when the caller has one, else the raw
+   * msgId. Activity notifications pass `activity:<class>:<msgId>`, so one LOGICAL message
+   * produces at most one Telegram message per class: a transport retry, a JetStream
+   * redelivery or an inbound backfill replay all reuse the same msgId, collapse onto the
+   * same key, and are dropped here by `INSERT OR IGNORE` on `UNIQUE(dedupe_key)` — which
+   * is durable, so the guarantee survives a daemon restart rather than living in memory.
+   */
   enqueueMessage(payload, targets) {
     const now = nowIso();
     for (const target of targets) {
-      const dedupeKey = `${payload.msgId}:${target.type}:${target.channel}`;
+      const dedupeKey = `${payload.dedupeId ?? payload.msgId}:${target.type}:${target.channel}`;
       this.db.prepare(`
         INSERT OR IGNORE INTO notify_queue
         (dedupe_key, msg_id, channel_type, channel_name, target_json, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
@@ -150,7 +160,17 @@ export class NotifyQueue {
   }
 }
 
-const formatNotifyText = (payload) => `📨 [${payload.from}]\n${payload.text}`;
+/**
+ * What a human transport actually shows.
+ *
+ * An activity payload already carries its finished, redacted, human-readable rendering —
+ * it is used verbatim. Everything else keeps the original `📨 [sender]` telemetry shape,
+ * so the `all` and `errors` scopes are byte-for-byte unchanged.
+ */
+const formatNotifyText = (payload) =>
+  (typeof payload.activityText === "string" && payload.activityText
+    ? payload.activityText
+    : `📨 [${payload.from}]\n${payload.text}`);
 
 const TG_MAX_LENGTH = 4000; // Telegram limit is 4096, leave margin
 

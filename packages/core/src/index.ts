@@ -496,7 +496,7 @@ export class JsonFileDedupeStore implements DedupeStore {
   }
 }
 
-export type OutboxStatus = "pending" | "sent" | "acked" | "failed" | "dlq";
+export type OutboxStatus = "pending" | "sent" | "acked" | "failed" | "dlq" | "retired";
 
 /**
  * Statuses a row can never be moved out of: the message is settled for good.
@@ -515,9 +515,18 @@ export type OutboxStatus = "pending" | "sent" | "acked" | "failed" | "dlq";
  * row against *any* concurrent transition, not just the two statuses someone
  * remembered to enumerate.
  */
+/**
+ * `retired` is OPERATOR RETIREMENT: a truthful terminal state for a message that must
+ * stop retrying without anything claiming it was delivered. It is deliberately not
+ * `acked` (no peer ever acknowledged it), not `dlq` (the *transport's* verdict, which
+ * feeds the dead-letter alarm) and not `failed` (scheduled for retry). The payload,
+ * msgId, attempt count and audit history are all retained and the reason is kept in
+ * `last_error`. Nothing produces it on its own — only `scripts/murmur-outbox-retire.mjs`.
+ */
 export const TERMINAL_OUTBOX_STATUSES: ReadonlySet<OutboxStatus> = new Set<OutboxStatus>([
   "acked",
   "dlq",
+  "retired",
 ]);
 
 export interface OutboxRecord {
@@ -552,6 +561,14 @@ export interface OutboxStore {
   markAcked(msgId: string): Promise<void>;
   markFailed(msgId: string, error: string, nextAttemptAt: string): Promise<void>;
   markDlq(msgId: string, error: string): Promise<void>;
+  /**
+   * Operator retirement. Optional: a store that does not implement it simply cannot be
+   * retired, which fails closed rather than silently doing something else.
+   *
+   * Refuses to move an already-settled row, so a delivered message is never rewritten as
+   * "never delivered" and a retired row is never resurrected.
+   */
+  markRetired?(msgId: string, reason: string): Promise<"retired" | "not-found" | "already-settled">;
   applyAckTransition(
     msgId: string,
     status: AckV1["status"],
@@ -669,6 +686,20 @@ export class JsonFileOutboxStore implements OutboxStore {
     row.updatedAt = new Date().toISOString();
     row.version = (row.version ?? 0) + 1;
     await this.save(state);
+  }
+
+  async markRetired(msgId: string, reason: string): Promise<"retired" | "not-found" | "already-settled"> {
+    const state = await this.load();
+    const row = state.records.find((r) => r.msgId === msgId);
+    if (!row) return "not-found";
+    if (TERMINAL_OUTBOX_STATUSES.has(row.status)) return "already-settled";
+    // `attempts` is deliberately NOT incremented: retirement is not a delivery attempt.
+    row.status = "retired";
+    row.lastError = reason;
+    row.updatedAt = new Date().toISOString();
+    row.version = (row.version ?? 0) + 1;
+    await this.save(state);
+    return "retired";
   }
 
   async applyAckTransition(
@@ -899,6 +930,51 @@ export class SQLiteDedupeOutboxStore implements DedupeStore, OutboxStore, AckRec
       lastError: error,
       updatedAt: new Date().toISOString(),
     }));
+  }
+
+  /**
+   * One guarded statement, so the "is it still retryable?" check and the write cannot be
+   * split by the sender loop running concurrently in the live daemon. A row that settled
+   * (acked/dlq/retired) in between is reported back as `already-settled` and left alone.
+   */
+  async markRetired(msgId: string, reason: string): Promise<"retired" | "not-found" | "already-settled"> {
+    const terminal = [...TERMINAL_OUTBOX_STATUSES];
+    const placeholders = terminal.map(() => "?").join(", ");
+    const changed = this.db
+      .prepare(
+        `UPDATE outbox
+         SET status = 'retired', last_error = ?, updated_at = ?, version = version + 1
+         WHERE msg_id = ? AND status NOT IN (${placeholders})`,
+      )
+      .run(reason, new Date().toISOString(), msgId, ...terminal);
+    if (Number(changed.changes ?? 0) > 0) return "retired";
+    return this.getOutboxRow(msgId) ? "already-settled" : "not-found";
+  }
+
+  /**
+   * Retire an EXACT set of msgIds in ONE transaction: either every listed row is settled
+   * or none is. Rows not listed are never read, locked longer than the statement, or
+   * touched. Returns one outcome per requested id, in the order given, so the caller can
+   * report exactly what happened without a second read.
+   */
+  async markManyRetired(
+    msgIds: readonly string[],
+    reason: string,
+  ): Promise<Array<{ msgId: string; outcome: "retired" | "not-found" | "already-settled"; before?: OutboxRecord }>> {
+    const results: Array<{ msgId: string; outcome: "retired" | "not-found" | "already-settled"; before?: OutboxRecord }> = [];
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const msgId of msgIds) {
+        const before = this.getOutboxRow(msgId);
+        const outcome = await this.markRetired(msgId, reason);
+        results.push({ msgId, outcome, ...(before ? { before } : {}) });
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    return results;
   }
 
   async applyAckTransition(

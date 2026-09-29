@@ -18,7 +18,8 @@
  *
  * Shape (v1)
  * ----------
- *   { "version": 1, "telegram": { "botToken", "chatId", "topicId"? },
+ *   { "version": 1, "mode": "activity" | "errors" (optional),
+ *                   "telegram": { "botToken", "chatId", "topicId"? },
  *                   "webhook": { "url", "headers"? } | [ ... ] }
  *
  * `telegram` / `webhook` are deliberately the SAME shape the legacy `notify` block
@@ -44,18 +45,43 @@ export const NOTIFY_CONFIG_BASENAME = "notifications.json";
  * Notification SCOPE — the per-identity policy that keeps one operator task from
  * producing one Telegram message per agent in the topology.
  *
- *   all    — every inbound message plus runtime-failure notifications. The operator/root
- *            identity only ever receives the coordinator's FINAL correlated reply, so at
- *            root this is exactly one notification per completed task.
- *   errors — runtime-failure notifications only (WakeMonitor fallback). Internal
- *            coordinator -> worker handoffs and worker -> coordinator results are NOT
- *            notified, because the operator already gets the final result from root.
- *   off    — nothing.
+ *   all      — every inbound message, raw, plus runtime-failure notifications. The
+ *              operator/root identity only ever receives the coordinator's FINAL
+ *              correlated reply, so at root this is one notification per completed task.
+ *   activity — the HUMAN feed: one rendered event per logical message (who asked whom,
+ *              the topic, the answer, the final result), produced from the recipient's
+ *              durable inbound message so a hop is never notified twice. Runtime failures
+ *              are still forwarded. See `notify-activity.mjs`.
+ *   errors   — runtime-failure notifications only (WakeMonitor fallback). Internal
+ *              coordinator -> worker handoffs and worker -> coordinator results are NOT
+ *              notified, because the operator already gets the final result from root.
+ *   off      — nothing.
  */
 export const SCOPE_ALL = "all";
+export const SCOPE_ACTIVITY = "activity";
 export const SCOPE_ERRORS = "errors";
 export const SCOPE_OFF = "off";
-export const NOTIFY_SCOPES = Object.freeze([SCOPE_ALL, SCOPE_ERRORS, SCOPE_OFF]);
+export const NOTIFY_SCOPES = Object.freeze([SCOPE_ALL, SCOPE_ACTIVITY, SCOPE_ERRORS, SCOPE_OFF]);
+
+/**
+ * The GLOBAL notification MODE — one machine-wide switch, in the one file that already
+ * holds the credential.
+ *
+ *   activity — every identity renders the human activity feed (see notify-activity.mjs):
+ *              who asked whom, the topic, the answer, the final result. This is a policy,
+ *              not a per-project setting, because the feed only reads as a conversation
+ *              when every agent in the topology follows the same rule.
+ *   errors   — every identity notifies runtime failures only.
+ *   (absent) — exactly the historical behaviour: each identity uses its own role default
+ *              (`all` at root, `errors` at a worker).
+ *
+ * An identity that opted OUT (`scope: "off"` or `source: "none"`) is never dragged back
+ * in by the mode: a deliberate silence outranks a global default.
+ */
+export const MODE_ACTIVITY = SCOPE_ACTIVITY;
+export const MODE_ERRORS = SCOPE_ERRORS;
+export const NOTIFY_MODES = Object.freeze([MODE_ACTIVITY, MODE_ERRORS]);
+export const isNotifyMode = (value) => NOTIFY_MODES.includes(value);
 
 /** Legacy inline `notify` blocks predate scopes and must keep behaving exactly as before. */
 export const LEGACY_INLINE_SCOPE = SCOPE_ALL;
@@ -134,8 +160,16 @@ export const validateNotifyConfig = (raw) => {
   const telegram = normalizeTelegramSection(raw.telegram);
   const webhook = normalizeWebhookSection(raw.webhook);
   if (!telegram && !webhook) refuse("no-notifier-configured");
+  // `mode` is a NON-SECRET policy field. Absent keeps the pre-mode behaviour exactly; an
+  // unrecognised value fails closed rather than silently falling back to a default that
+  // notifies more than the operator asked for.
+  if (raw.mode !== undefined && raw.mode !== null && !isNotifyMode(raw.mode)) {
+    refuse("mode-unsupported", String(raw.mode));
+  }
+  const mode = isNotifyMode(raw.mode) ? raw.mode : undefined;
   return {
     version: NOTIFY_CONFIG_VERSION,
+    ...(mode ? { mode } : {}),
     ...(telegram ? { telegram } : {}),
     ...(webhook ? { webhook } : {}),
   };
@@ -181,13 +215,14 @@ export const writeNotifyConfig = async (config, { env = process.env, home = unde
  * token, a chat id, a topic id or a webhook URL.
  */
 export const describeNotifyConfig = (result) => {
-  if (result.state === "absent") return { state: "absent", telegram: "not configured", channels: [] };
-  if (result.state === "invalid") return { state: "invalid", telegram: "invalid", channels: [], reason: result.reason };
+  if (result.state === "absent") return { state: "absent", telegram: "not configured", channels: [], mode: "default" };
+  if (result.state === "invalid") return { state: "invalid", telegram: "invalid", channels: [], mode: "unknown", reason: result.reason };
   const channels = (result.targets || []).map((target) => `${target.type}:${target.channel}`);
   return {
     state: "configured",
     telegram: result.config.telegram ? "configured" : "not configured",
     channels,
+    mode: result.config.mode ?? "default",
   };
 };
 
@@ -216,20 +251,28 @@ export const resolveNotifyPlan = async ({
   configPath = undefined,
   loadGlobal = loadNotifyConfig,
 } = {}) => {
+  // The global config is read FIRST, even on the inline path. A legacy `.data-*` identity
+  // carries its own credential but no policy, and the machine-wide mode has to reach it
+  // too — otherwise the activity feed would show the operator project and silently omit
+  // every legacy hop happening on the same bus.
+  const global = await loadGlobal({ env, home, configPath });
+  const mode = global.state === "configured" && isNotifyMode(global.config.mode) ? global.config.mode : null;
+
   const inline = normalizeNotifyTargets(config?.notify);
   if (inline.length > 0) {
-    return { source: "inline", scope: LEGACY_INLINE_SCOPE, targets: inline, global: null };
+    return { source: "inline", scope: mode ?? LEGACY_INLINE_SCOPE, targets: inline, global, mode };
   }
 
   const declared = config?.notifications && typeof config.notifications === "object" ? config.notifications : {};
-  const scope = isNotifyScope(declared.scope) ? declared.scope : SCOPE_ALL;
-  if (declared.source === "none" || scope === SCOPE_OFF) {
-    return { source: "none", scope: SCOPE_OFF, targets: [], global: null };
+  const declaredScope = isNotifyScope(declared.scope) ? declared.scope : SCOPE_ALL;
+  if (declared.source === "none" || declaredScope === SCOPE_OFF) {
+    return { source: "none", scope: SCOPE_OFF, targets: [], global: null, mode };
   }
+  // A configured mode outranks the per-role default; an explicit opt-out never loses.
+  const scope = mode ?? declaredScope;
 
-  const global = await loadGlobal({ env, home, configPath });
   if (global.state === "configured" && global.targets.length > 0) {
-    return { source: "global", scope, targets: global.targets, global };
+    return { source: "global", scope, targets: global.targets, global, mode };
   }
 
   const botToken = env.MURMUR_TELEGRAM_BOT_TOKEN || env.TELEGRAM_BOT_TOKEN;
@@ -241,12 +284,18 @@ export const resolveNotifyPlan = async ({
       scope,
       targets: [{ type: "telegram", channel: "telegram", botToken, chatId, ...(topicId ? { topicId } : {}) }],
       global,
+      mode,
     };
   }
 
-  return { source: global.state === "invalid" ? "invalid" : "none", scope, targets: [], global };
+  return { source: global.state === "invalid" ? "invalid" : "none", scope, targets: [], global, mode };
 };
 
-/** Does this plan notify ordinary inbound messages, or only runtime failures? */
+/** Raw inbound message text (the historical `all` scope). Never true in activity mode. */
 export const planNotifiesInbound = (plan) => plan.targets.length > 0 && plan.scope === SCOPE_ALL;
+
+/** The human activity feed: one rendered event per logical message. */
+export const planNotifiesActivity = (plan) => plan.targets.length > 0 && plan.scope === SCOPE_ACTIVITY;
+
+/** Runtime failures reach every scope except an explicit opt-out. */
 export const planNotifiesErrors = (plan) => plan.targets.length > 0 && plan.scope !== SCOPE_OFF;

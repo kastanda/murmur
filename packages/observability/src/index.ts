@@ -122,7 +122,10 @@ export const renderPrometheusMetrics = (snapshot: PrometheusSnapshot): string =>
     "# TYPE murmur_outbox_depth gauge",
   ];
 
-  for (const status of ["pending", "failed", "sent", "acked", "dlq"]) {
+  // `retired` is exported as its own series and deliberately stays OUT of
+  // murmur_dead_letters / murmur_error_rows: an operator retiring a superseded message is
+  // not a delivery failure and must not keep a dead-letter alarm latched forever.
+  for (const status of ["pending", "failed", "sent", "acked", "dlq", "retired"]) {
     lines.push(metricLine("murmur_outbox_depth", snapshot.outboxDepth[status] ?? 0, { status }));
   }
 

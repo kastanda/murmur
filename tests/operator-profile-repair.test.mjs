@@ -39,6 +39,7 @@ test("A. project.json exists but the Cursor identity directory is gone: only Cur
   const ctx = await setup();
   try {
     const before = { root: ctx.raw("root"), claude: ctx.raw("claude"), codex: ctx.raw("codex") };
+    const codexKeysBefore = (await readPrivateJson(ctx.paths.agentConfigFile("codex"))).keys;
     const cursorKeysBefore = (await readPrivateJson(ctx.paths.agentConfigFile("cursor"))).keys;
     rmSync(ctx.paths.agentDir("cursor"), { recursive: true, force: true });
     assert.equal(existsSync(ctx.paths.projectFile), true, "project.json must still be there");
@@ -55,14 +56,23 @@ test("A. project.json exists but the Cursor identity directory is gone: only Cur
     assert.notEqual(cursorAfter.keys.signing.privateKey, cursorKeysBefore.signing.privateKey,
       "a destroyed identity is regenerated, not resurrected");
 
-    // Root and Codex are untouched; Claude changes only because it must learn the new
-    // Cursor public key.
+    // Root is untouched: it is not paired to a worker, so a regenerated Cursor is none of
+    // its business. Claude AND Codex both change, and for exactly one reason — each is
+    // paired to Cursor in the worker mesh and must learn the new Cursor public key.
     assert.equal(ctx.raw("root"), before.root);
-    assert.equal(ctx.raw("codex"), before.codex);
-    const claudeAfter = await readPrivateJson(ctx.paths.agentConfigFile("claude"));
-    assert.equal(claudeAfter.peers[cursorAfter.agentId].signing.publicKey, cursorAfter.keys.signing.publicKey);
-    assert.equal(claudeAfter.keys.signing.privateKey, JSON.parse(before.claude).keys.signing.privateKey,
-      "Claude's own key is never rotated by a repair");
+    assert.notEqual(ctx.raw("codex"), before.codex, "Codex is paired to Cursor and must re-learn its key");
+
+    for (const [name, rawBefore] of [["claude", before.claude], ["codex", before.codex]]) {
+      const after = await readPrivateJson(ctx.paths.agentConfigFile(name));
+      assert.equal(after.peers[cursorAfter.agentId].signing.publicKey, cursorAfter.keys.signing.publicKey, name);
+      assert.equal(after.keys.signing.privateKey, JSON.parse(rawBefore).keys.signing.privateKey,
+        `${name}'s own key is never rotated by a repair`);
+    }
+    assert.equal(
+      (await readPrivateJson(ctx.paths.agentConfigFile("codex"))).keys.encryption.privateKey,
+      codexKeysBefore.encryption.privateKey,
+      "re-pairing rewrites a peer entry, never an identity's own keypair",
+    );
   } finally {
     ctx.cleanup();
   }

@@ -33,13 +33,29 @@ export const DEFAULT_AGENTS = Object.freeze([
 export const COORDINATOR = "claude";
 
 /**
- * Trust edges. Sibling delegation goes THROUGH the coordinator, so codex <-> cursor is
- * deliberately absent: a worker cannot delegate directly to its sibling.
+ * Trust edges — the WORKER MESH, not an arbitrary trust mesh.
+ *
+ *   root <-> claude     the operator submits work through the coordinator, and only
+ *                       through it. Root is deliberately NOT paired to any worker: a
+ *                       worker can never take work from, or answer directly to, the human.
+ *   claude <-> codex    the coordinator delegates to either worker.
+ *   claude <-> cursor
+ *   codex  <-> cursor   siblings may delegate to each other DIRECTLY. Routing a
+ *                       worker-to-worker sub-check through the coordinator cost a full
+ *                       extra model turn on each leg and made the coordinator re-read a
+ *                       result it had no opinion about.
+ *
+ * This does not widen what a delegation may do: `AgentHandoffController.planDelegation`
+ * still refuses a target already on the ACTIVE ancestry and still enforces max depth, so
+ * `Claude -> Codex -> Cursor` is allowed and `Claude -> Codex -> Cursor -> Claude` is a
+ * cycle, refused, exactly as before. Pairing decides who MAY be asked; ancestry decides
+ * whether asking right now would close a loop.
  */
 export const DEFAULT_TRUST_EDGES = Object.freeze([
   Object.freeze(["root", "claude"]),
   Object.freeze(["claude", "codex"]),
   Object.freeze(["claude", "cursor"]),
+  Object.freeze(["codex", "cursor"]),
 ]);
 
 const exists = async (target) => {
@@ -104,6 +120,22 @@ const runtimeConfigFor = (agent, { projectId, projectPath, codexSocketPath }) =>
  */
 const notificationsFor = (agent) => ({ source: "global", scope: defaultScopeForRole(agent.role) });
 
+/**
+ * The identity's PROJECT DESCRIPTOR — derivable, non-secret, and the only thing that lets
+ * the activity feed name a project and a role instead of a generated agent id.
+ *
+ * Without it a daemon can only see `murmur-f6a3a362f2bb-codex` on the wire and would have
+ * to GUESS which part is the project and which the role. Two projects can produce ids
+ * that look alike, and a wrong guess mislabels who spoke — so the answer is recorded here
+ * by the component that actually knows it, and read, never inferred, at runtime.
+ *
+ * `label` is the project directory's basename: what the operator calls this project.
+ */
+export const projectDescriptorFor = ({ projectId, projectPath }) => ({
+  id: projectId,
+  label: path.basename(path.resolve(projectPath)),
+});
+
 /** The public half of an identity, in the shape the pairing helpers already consume. */
 const advertiseBlob = (agent, config) => ({
   agentId: config.agentId,
@@ -149,6 +181,7 @@ const createIdentityConfig = async (agent, { projectId, projectPath, paths, nats
     keys: { encryption, signing },
     ackSecurity: { emitSigned: true, requireSigned: false, maxAgeMs: 300_000 },
     notifications: notificationsFor(agent),
+    project: projectDescriptorFor({ projectId, projectPath }),
     peers: {},
     ...(runtime ? { runtime } : {}),
   };
@@ -203,6 +236,14 @@ const reconcileIdentityConfig = (agent, config, { projectId, projectPath, paths,
   if (!policyUsable) {
     config.notifications = notificationsFor(agent);
     repairs.push(`notifications:${agent.name}`);
+  }
+
+  // Fully derivable from the project identity, so a profile created before the activity
+  // feed existed is repaired in place — no identity regenerated, no key touched.
+  const descriptor = projectDescriptorFor({ projectId, projectPath });
+  if (JSON.stringify(config.project) !== JSON.stringify(descriptor)) {
+    config.project = descriptor;
+    repairs.push(`project:${agent.name}`);
   }
 
   const derivable = derivableRuntimeFields(agent, { projectId, projectPath, codexSocketPath });

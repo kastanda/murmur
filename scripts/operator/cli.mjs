@@ -100,13 +100,15 @@ Usage:
   murmur doctor  <project> [--json]
   murmur logs    <project> [supervisor|root|claude|codex|cursor|codex-app-server] [-n <lines>] [--follow]
   murmur send    <project> "<task>" [--timeout <seconds>] [--no-wait]
-  murmur notify  status | migrate [--from <legacy-data-dir>] | test [--json]
+  murmur notify  status | mode <activity|errors|default> | migrate [--from <dir>] | test
 
 <project> is an absolute path, or a name resolved under ~/Projects/<name>.
 Profiles and all runtime state live under ~/.murmur/projects/<project-id>/.
 
 \`murmur notify\` configures notifications once per USER, in
 ~/.murmur/notifications.json — no project ever stores the credential.
+\`murmur notify mode activity\` turns Telegram into a human activity feed: who asked
+whom, the topic, the answer and the final result — no ACK/heartbeat/retry noise.
 `;
 
 const out = (line = "") => process.stdout.write(`${line}\n`);

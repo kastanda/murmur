@@ -21,7 +21,8 @@ import {
 } from "@murmurv2/core";
 import { decryptPayload, encryptPayload, signEnvelope, verifyEnvelopeSignature } from "@murmurv2/security";
 import { NotifyQueue, flushNotifyQueue } from "./notify-router.mjs";
-import { planNotifiesErrors, planNotifiesInbound, resolveNotifyPlan } from "./notify-config.mjs";
+import { planNotifiesActivity, planNotifiesErrors, planNotifiesInbound, resolveNotifyPlan } from "./notify-config.mjs";
+import { buildActivityErrorNotification, buildActivityNotification } from "./notify-activity.mjs";
 import {
   createChannelThreadStartBindingResolver,
   createCodexAppServerDaemonInjector,
@@ -146,10 +147,84 @@ if (notifyPlan.source === "invalid") {
     reason: notifyPlan.global?.reason,
   });
 }
-const effectiveNotifyTargets = notifyPlan.targets;
-const notifyInbound = planNotifiesInbound(notifyPlan);
-const notifyErrors = planNotifiesErrors(notifyPlan);
+/**
+ * The notification policy is MUTABLE at runtime.
+ *
+ * `$MURMUR_HOME/notifications.json` is a user-level file that an operator changes with
+ * `murmur notify mode ...` while agents are mid-task. Resolving it once at startup meant
+ * every such change needed a daemon restart — and restarting a daemon that is holding an
+ * open handoff continuation is exactly the thing worth avoiding. So the plan is re-read
+ * on a slow timer and swapped atomically; nothing else in the daemon is reconfigured.
+ */
+let notifyPolicy = {
+  targets: notifyPlan.targets,
+  inbound: planNotifiesInbound(notifyPlan),
+  activity: planNotifiesActivity(notifyPlan),
+  errors: planNotifiesErrors(notifyPlan),
+  scope: notifyPlan.scope,
+  source: notifyPlan.source,
+};
 const notifyQueue = new NotifyQueue(dbPath);
+
+/** Minimum gap between policy re-reads. A notification policy is not hot-path state. */
+const notifyReloadIntervalMs = Number(process.env.MURMUR_NOTIFY_RELOAD_MS) || 30_000;
+// The plan above IS the first read, so the timer starts now rather than firing again on
+// the very first flush.
+let notifyReloadedAt = Date.now();
+
+const reloadNotifyPolicy = async () => {
+  if (Date.now() - notifyReloadedAt < notifyReloadIntervalMs) return;
+  notifyReloadedAt = Date.now();
+  let plan;
+  try {
+    plan = await resolveNotifyPlan({ config, env: process.env });
+  } catch (err) {
+    log("error", "Notification policy reload failed; keeping the current policy", { error: err.message });
+    return;
+  }
+  const next = {
+    targets: plan.targets,
+    inbound: planNotifiesInbound(plan),
+    activity: planNotifiesActivity(plan),
+    errors: planNotifiesErrors(plan),
+    scope: plan.scope,
+    source: plan.source,
+  };
+  // The policy is ALWAYS swapped, not only when the printable summary changed: a rotated
+  // bot token keeps the same scope, source and channel list, and comparing only those
+  // would leave the daemon posting to a credential the operator has already replaced.
+  const changed = next.scope !== notifyPolicy.scope || next.source !== notifyPolicy.source;
+  notifyPolicy = next;
+  if (!changed) return;
+  log("info", "Notification policy reloaded", {
+    notifySource: next.source,
+    notifyScope: next.scope,
+    notifyTargets: next.targets.map((t) => `${t.type}:${t.channel}`),
+  });
+};
+
+/**
+ * What this identity calls itself and its project in a human feed. Both come from the
+ * agent config written by `murmur start`; a legacy `.data-*` identity has neither, and is
+ * labelled honestly as legacy rather than being attributed to a project it may not be in.
+ */
+const activityProjectId = typeof config.project?.id === "string" ? config.project.id : null;
+const activityProjectLabel = typeof config.project?.label === "string" && config.project.label
+  ? config.project.label
+  : "Legacy Murmur";
+
+/** The delegated task a reply answers, when this identity actually holds it locally. */
+const parentTextFor = (replyToMessageId) => {
+  if (!replyToMessageId) return null;
+  try {
+    const row = wakeDb
+      .prepare("SELECT text FROM local_messages WHERE msg_id = ? AND direction = 'outbound' ORDER BY rowid DESC LIMIT 1")
+      .get(replyToMessageId);
+    return row?.text ? String(row.text) : null;
+  } catch {
+    return null;
+  }
+};
 const wakeDb = new DatabaseSync(dbPath);
 const wakeDispatchStore = new WakeDispatchStore(dbPath, {
   maxAttempts: Number(process.env.MURMUR_WAKE_MAX_ATTEMPTS) || 5,
@@ -217,9 +292,10 @@ log("info", "Daemon starting", {
     maxAgeMs: maxAckAgeMs,
   },
   ackWindow,
-  notifyTargets: effectiveNotifyTargets.map((t) => `${t.type}:${t.channel}`),
-  notifySource: notifyPlan.source,
-  notifyScope: notifyPlan.scope,
+  notifyTargets: notifyPolicy.targets.map((t) => `${t.type}:${t.channel}`),
+  notifySource: notifyPolicy.source,
+  notifyScope: notifyPolicy.scope,
+  activityProject: activityProjectLabel,
 });
 
 const store = new SQLiteDedupeOutboxStore(dbPath);
@@ -468,11 +544,24 @@ const loadInboundAfter = async (cursor) => {
 // hear about, even though that identity does not notify ordinary inbound traffic.
 const enqueueWakeNotification = async (payload, reason) => {
   log("warn", "WakeMonitor fallback notify", { reason, msgId: payload.msgId, from: payload.from });
-  if (!notifyErrors) return;
-  notifyQueue.enqueueMessage({
+  if (!notifyPolicy.errors) return;
+  // In activity mode this is the ONE technical event a human is shown, and it is rendered
+  // like every other feed entry so it reads in the same conversation.
+  const rendered = notifyPolicy.activity
+    ? buildActivityErrorNotification({
+      localAgentId: agentId,
+      senderId: payload.from,
+      msgId: payload.msgId,
+      reason,
+      text: payload.text,
+      projectId: activityProjectId,
+      projectLabel: activityProjectLabel,
+    })
+    : null;
+  notifyQueue.enqueueMessage(rendered ?? {
     ...payload,
     text: `[WakeMonitor ${reason}] ${payload.text}`,
-  }, effectiveNotifyTargets);
+  }, notifyPolicy.targets);
 };
 
 const claudeOneShotRuntime = claudeOneShotEnabled ? new ClaudeOneShotRuntime({
@@ -667,15 +756,42 @@ const onMessage = async (envelope) => {
 
   const payload = { ...basePayload, cursor: inboundCursorForMsg(envelope.msgId) };
 
-  // Scope `errors` deliberately does NOT notify inbound traffic: coordinator -> worker
-  // handoffs and worker -> coordinator results are internal, and the operator already
-  // receives the final correlated reply through the root identity.
-  if (notifyInbound) {
-    notifyQueue.enqueueMessage(payload, effectiveNotifyTargets);
+  // Three distinct behaviours, in priority order:
+  //   `all`      — forward the raw message text (the historical scope, unchanged);
+  //   `activity` — render ONE human feed event for this logical message;
+  //   `errors`   — nothing here. Coordinator -> worker handoffs and worker -> coordinator
+  //                results are internal, and the operator already receives the final
+  //                correlated reply through the root identity.
+  if (notifyPolicy.inbound) {
+    notifyQueue.enqueueMessage(payload, notifyPolicy.targets);
     log("info", "Notifications queued", {
       msgId: envelope.msgId,
-      targetCount: effectiveNotifyTargets.length,
+      targetCount: notifyPolicy.targets.length,
     });
+  } else if (notifyPolicy.activity) {
+    // ONE activity event per LOGICAL message, produced HERE — at the recipient, from the
+    // message it has just durably stored. Rendering at the sender instead would notify
+    // every hop twice (once by each side) and would fire again on every transport retry;
+    // the notify queue's durable dedupe key closes the redelivery case on top of that.
+    const activity = buildActivityNotification({
+      localAgentId: agentId,
+      senderId,
+      msgId: envelope.msgId,
+      replyToMessageId: envelope.replyToMessageId ?? null,
+      handoff: handoffInbound ? envelope.handoff : null,
+      text: plaintext,
+      parentText: parentTextFor(envelope.replyToMessageId),
+      projectId: activityProjectId,
+      projectLabel: activityProjectLabel,
+    });
+    if (activity) {
+      notifyQueue.enqueueMessage(activity, notifyPolicy.targets);
+      log("info", "Activity notification queued", {
+        msgId: envelope.msgId,
+        activityKind: activity.activityKind,
+        targetCount: notifyPolicy.targets.length,
+      });
+    }
   }
 
   await wakeMonitor.onInbound(payload);
@@ -702,6 +818,7 @@ const flushLoop = async () => {
     }
 
     try {
+      await reloadNotifyPolicy();
       await flushNotifyQueue({ queue: notifyQueue, log, limit: 100 });
     } catch (err) {
       log("error", "Notify flush error", { error: err.message });

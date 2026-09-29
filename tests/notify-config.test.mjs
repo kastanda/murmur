@@ -93,7 +93,8 @@ test("an absent global config is an ordinary state, not an error", async () => {
   try {
     const loaded = await loadNotifyConfig({ home });
     assert.equal(loaded.state, "absent");
-    assert.deepEqual(describeNotifyConfig(loaded), { state: "absent", telegram: "not configured", channels: [] });
+    assert.deepEqual(describeNotifyConfig(loaded),
+      { state: "absent", telegram: "not configured", channels: [], mode: "default" });
   } finally {
     cleanup();
   }

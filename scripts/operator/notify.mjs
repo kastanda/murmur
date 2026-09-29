@@ -2,6 +2,7 @@
  * notify.mjs — operator surface for the GLOBAL notification config.
  *
  *   murmur notify status
+ *   murmur notify mode <activity|errors|default>
  *   murmur notify migrate [--from <data-dir>]
  *   murmur notify test
  *
@@ -19,13 +20,16 @@ import path from "node:path";
 import { readPrivateJson } from "../secure-state.mjs";
 import {
   NOTIFY_CONFIG_VERSION,
+  NOTIFY_MODES,
   describeNotifyConfig,
+  isNotifyMode,
   loadNotifyConfig,
   notifyConfigPath,
   validateNotifyConfig,
   writeNotifyConfig,
 } from "../notify-config.mjs";
 import { dispatchNotification } from "../notify-router.mjs";
+import { redactSecrets } from "../notify-activity.mjs";
 
 /**
  * Where a pre-CLI Murmur kept its per-agent state. `DATA_DIR` defaulted to `.data`, and
@@ -193,10 +197,29 @@ export const sendNotifyTest = async ({
  */
 export const redactTransportError = (error) => {
   const message = error instanceof Error ? error.message : String(error);
-  return message
+  return redactSecrets(message)
     .replace(/https?:\/\/\S+/g, "<url-redacted>")
     .replace(/\/bot[^/\s]+/g, "/bot<redacted>")
     .slice(0, 200);
+};
+
+/**
+ * Set (or clear) the machine-wide notification MODE.
+ *
+ * Rewrites ONLY the `mode` field: the credential is read back and written through the
+ * same validated shape, so this never reformats, re-derives or re-prints a token. Passing
+ * `default` removes the field and restores the per-role behaviour.
+ */
+export const setNotifyMode = async ({ mode, env = process.env, home = undefined, configPath = undefined } = {}) => {
+  const file = configPath ?? notifyConfigPath(env, home);
+  if (mode !== "default" && !isNotifyMode(mode)) return { ok: false, reason: "mode-unsupported", path: file, mode };
+  const loaded = await loadNotifyConfig({ env, home, configPath: file });
+  if (loaded.state !== "configured") return { ok: false, reason: loaded.state, path: file };
+  const { mode: previous, ...rest } = loaded.config;
+  const next = mode === "default" ? rest : { ...rest, mode };
+  if ((previous ?? "default") === mode) return { ok: true, changed: false, path: file, mode, previous: previous ?? "default" };
+  await writeNotifyConfig(next, { env, home, configPath: file });
+  return { ok: true, changed: true, path: file, mode, previous: previous ?? "default" };
 };
 
 // ---------------------------------------------------------------------------
@@ -207,8 +230,14 @@ export const NOTIFY_USAGE = `murmur notify — global (user-level) notification 
 
 Usage:
   murmur notify status
+  murmur notify mode <activity|errors|default>
   murmur notify migrate [--from <legacy-data-dir>]
   murmur notify test
+
+Modes:
+  activity   human activity feed — who asked whom, the topic, the answer, the result
+  errors     runtime failures only
+  default    per-role behaviour (all at root, errors at a worker)
 
 The configuration lives in $MURMUR_HOME/notifications.json (0600, default
 ~/.murmur/notifications.json) and is shared by every Murmur project. No token is ever
@@ -237,12 +266,40 @@ export const commandNotify = async ({ args, flags, out, err, env = process.env, 
     } else {
       out(`Config:    ${configPath}`);
       out(`Telegram:  ${summary.telegram}`);
+      out(`Mode:      ${summary.mode}`);
       if (summary.channels.length > 0) out(`Channels:  ${summary.channels.join(", ")}`);
       if (summary.state === "invalid") out(`State:     invalid (${summary.reason})`);
       if (summary.state === "absent") out("Run `murmur notify migrate` (or write the config by hand) to configure notifications.");
     }
     if (summary.state === "configured") return 0;
     return summary.state === "invalid" ? 1 : 3;
+  }
+
+  if (subcommand === "mode") {
+    const mode = args[1];
+    if (!mode) {
+      err(`murmur: notify mode requires one of: ${[...NOTIFY_MODES, "default"].join(", ")}`);
+      return 1;
+    }
+    const result = await setNotifyMode({ mode, env, home, configPath });
+    if (result.reason === "absent") {
+      err("murmur: notifications are not configured. Run `murmur notify migrate` first.");
+      return 3;
+    }
+    if (result.reason === "invalid") {
+      err(`murmur: the notification config is invalid: ${configPath}`);
+      return 1;
+    }
+    if (!result.ok) {
+      err(`murmur: unsupported notify mode '${mode}' — expected ${[...NOTIFY_MODES, "default"].join(", ")}`);
+      return 1;
+    }
+    out(result.changed ? `Notification mode: ${result.previous} -> ${result.mode}` : `Notification mode is already ${result.mode}`);
+    if (result.mode === "activity") {
+      out("Running daemons pick this up on their next policy reload; a daemon started");
+      out("before this change reads it at its next restart.");
+    }
+    return 0;
   }
 
   if (subcommand === "migrate") {
