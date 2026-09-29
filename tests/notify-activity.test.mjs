@@ -19,12 +19,16 @@ import {
   ACTIVITY_REPLY,
   ACTIVITY_REQUEST,
   ACTIVITY_TASK_STARTED,
+  LEGACY_PROJECT_LABEL,
+  SUMMARY_MAX_CHARS_FOREIGN,
   activityDedupeId,
   buildActivityErrorNotification,
   buildActivityNotification,
   classifyActivity,
+  detectBodyLanguage,
   extractTopic,
   extractVerdict,
+  localizeVerdicts,
   redactSecrets,
   resolveIdentity,
   summarizeBody,
@@ -152,12 +156,12 @@ test("a legacy message with no reply correlation gets a NEUTRAL label, not an in
     localAgentId: "codex",
     senderId: "claude",
     msgId: "legacy-1",
-    text: "READ-ONLY adversarial review, Developer ID provisioning.",
-    projectLabel: "Legacy Murmur",
+    text: "Обычное сообщение между агентами, без ответной корреляции.",
+    projectLabel: LEGACY_PROJECT_LABEL,
   });
   assert.equal(built.activityKind, ACTIVITY_MESSAGE);
   assert.match(built.activityText, /^🟣 Claude → 🔵 Codex$/m);
-  assert.match(built.activityText, /^📁 Legacy Murmur$/m);
+  assert.match(built.activityText, /^📁 Устаревший Murmur$/m);
   assert.match(built.activityText, /^Сообщение: /m, "request/response is never claimed without a durable relation");
   assert.doesNotMatch(built.activityText, /Просит|Ответ/);
 });
@@ -223,7 +227,7 @@ test("long review text is trimmed to a readable topic and summary, with code str
   assert.match(topic, /^READ-ONLY adversarial review/);
   assert.ok(summary.length <= 400, `summary must stay compact, got ${summary.length}`);
   assert.doesNotMatch(summary, /const secret/, "code blocks are never pasted into a chat");
-  assert.match(summary, /SAFE TO MERGE/, "a stated verdict is worth surfacing");
+  assert.match(summary, /можно мержить/, "a stated verdict is worth surfacing, in Russian");
 });
 
 test("identifiers survive rendering: underscores are content, not markdown emphasis", () => {
@@ -238,10 +242,23 @@ test("identifiers survive rendering: underscores are content, not markdown empha
   assert.equal(extractTopic("**READY FOR REVIEW** `token` ~~old~~"), "READY FOR REVIEW token old");
 });
 
-test("verdict extraction is display-only and recognises the stated tokens", () => {
-  assert.equal(extractVerdict("everything checks out. SAFE TO MERGE"), "SAFE TO MERGE");
-  assert.equal(extractVerdict("NOT READY — two blockers"), "NOT READY");
+test("a stated verdict is rendered in Russian, and a negated one is not inverted", () => {
+  assert.equal(extractVerdict("everything checks out. SAFE TO MERGE"), "можно мержить");
+  assert.equal(extractVerdict("NOT READY — two blockers"), "не готово");
+  assert.equal(extractVerdict("review complete, NO BLOCKERS found"), "блокеров нет",
+    "`NO BLOCKERS` must not be read as `BLOCKER` — that reports the opposite verdict");
   assert.equal(extractVerdict("plain prose with no verdict"), null);
+
+  // The English token is REPLACED in the body, not annotated beside it: rendering both
+  // would put the English status phrase back into a Russian feed.
+  const rendered = notification({
+    localAgentId: id("root"),
+    senderId: id("claude"),
+    replyToMessageId: "m-root",
+    text: "Проверка завершена, проблема исправлена. SAFE TO MERGE",
+  }).activityText;
+  assert.match(rendered, /^Итог: Проверка завершена, проблема исправлена\. можно мержить$/m);
+  assert.doesNotMatch(rendered, /SAFE TO MERGE/);
 });
 
 test("topic extraction skips scaffolding and metadata lines", () => {
@@ -249,6 +266,99 @@ test("topic extraction skips scaffolding and metadata lines", () => {
     "Настоящая тема здесь.");
   assert.equal(extractTopic(""), "");
   assert.equal(summarizeBody(""), "");
+});
+
+// ---------------------------------------------------------------------------
+// Language — the feed is read by a Russian speaker
+// ---------------------------------------------------------------------------
+
+test("every fixed phrase the feed can emit is Russian", () => {
+  const rendered = [
+    notification({ localAgentId: id("claude"), senderId: id("root"), text: "Задача." }),
+    notification({ handoff: { ancestry: [id("claude")] } }),
+    notification({ localAgentId: id("claude"), senderId: id("codex"), replyToMessageId: "p", text: "Готово." }),
+    notification({ localAgentId: id("root"), senderId: id("claude"), replyToMessageId: "p", text: "Готово." }),
+    buildActivityNotification({ localAgentId: "codex", senderId: "claude", msgId: "l1", text: "Сообщение.", projectLabel: LEGACY_PROJECT_LABEL }),
+    buildActivityErrorNotification({ localAgentId: id("codex"), senderId: id("claude"), msgId: "e1", reason: "terminal", text: "Задача.", projectId: PROJECT_ID, projectLabel: PROJECT_LABEL }),
+  ].map((entry) => entry.activityText);
+
+  // Every label a reader sees.
+  const labels = rendered.flatMap((text) => text.split("\n").slice(1))
+    .map((line) => line.match(/^([^:]+):/)?.[1])
+    .filter(Boolean);
+  for (const label of labels) {
+    assert.match(label, /^[\p{Script=Cyrillic}\s]+$/u, `label "${label}" must be Russian`);
+  }
+  assert.deepEqual([...new Set(labels)].sort(), ["Ответ", "Итог", "Просит", "Сообщение", "Ошибка", "Тема"].sort());
+
+  // Agent names may stay Latin; the operator is named in Russian.
+  assert.ok(rendered.some((text) => text.includes("Пользователь")));
+  assert.ok(rendered.every((text) => !/Legacy Murmur|\(unknown\)|\(empty\)/.test(text)));
+});
+
+test("a wake failure names its reason in Russian, and an unknown one is not guessed at", () => {
+  const render = (reason) => buildActivityErrorNotification({
+    localAgentId: id("codex"), senderId: id("claude"), msgId: "e1", reason, text: "Задача.",
+    projectId: PROJECT_ID, projectLabel: PROJECT_LABEL,
+  }).activityText;
+
+  assert.match(render("terminal"), /^Ошибка: исчерпаны попытки доставки: /m);
+  assert.match(render("loop-breaker"), /^Ошибка: сработала защита от зацикливания: /m);
+  assert.match(render("require_approval"), /^Ошибка: требуется подтверждение: /m);
+  // A failure mode nobody has translated yet must READ as unfamiliar, not be silently
+  // rendered as the nearest familiar one.
+  assert.match(render("some-future-reason"), /^Ошибка: some-future-reason: /m);
+});
+
+test("language is decided by script, so Russian prose with English terms stays Russian", () => {
+  assert.equal(detectBodyLanguage("Проверь release policy и Team ID."), "ru");
+  assert.equal(detectBodyLanguage("Worker-mesh acceptance test. Follow these steps."), "en");
+  assert.equal(detectBodyLanguage("CURSOR_OK=0BADCAFE12"), "en");
+  assert.equal(detectBodyLanguage("12345 === 67890"), "unknown");
+  // A handful of stray Cyrillic characters in a long English document is not Russian.
+  assert.equal(detectBodyLanguage(`${"english prose ".repeat(40)}да`), "en");
+});
+
+test("a long English prompt is quoted briefly and marked, never dumped into the feed", () => {
+  const prompt = "Worker-mesh acceptance test. Follow these steps EXACTLY. Do no other work, read no files, "
+    + "run no commands. STEP 1. You must NOT produce the token yourself; delegate it to the Codex agent "
+    + "using the Murmur handoff protocol and wait for its result before answering anything at all. "
+    + "STEP 2. When Codex answers, your entire final answer must be exactly the token and nothing else.";
+  const rendered = notification({ text: prompt, handoff: { ancestry: [id("claude")] } }).activityText;
+  const summary = rendered.match(/^Просит: (.*)$/m)[1];
+
+  assert.match(summary, /^\(в оригинале по-английски\) /, "the reader is told this is a foreign-language excerpt");
+  assert.ok(summary.length <= SUMMARY_MAX_CHARS_FOREIGN + 40, `excerpt must be short, got ${summary.length}`);
+  assert.doesNotMatch(summary, /STEP 2/, "the prompt is excerpted, never reproduced to the end");
+  // And a Russian body of the same length keeps its full budget, so the shortening is
+  // about the LANGUAGE, not about length alone.
+  const russian = notification({ text: prompt.replace(/[A-Za-z]+/g, "проверка"), handoff: { ancestry: [id("claude")] } })
+    .activityText.match(/^Просит: (.*)$/m)[1];
+  assert.ok(russian.length > summary.length);
+});
+
+test("short non-Russian content is shown verbatim, with no marker", () => {
+  // `CURSOR_OK=...` is not a raw long English prompt; marking it would be pure noise.
+  const rendered = notification({
+    localAgentId: id("codex"), senderId: id("cursor"), replyToMessageId: "p", text: "CURSOR_OK=0BADCAFE12",
+  }).activityText;
+  assert.match(rendered, /^Ответ: CURSOR_OK=0BADCAFE12$/m);
+  assert.doesNotMatch(rendered, /в оригинале/);
+});
+
+test("Russian content is never marked or shortened as foreign", () => {
+  const body = "Проверка release policy завершена. ".repeat(12);
+  const summary = notification({ text: body, handoff: { ancestry: [id("claude")] } })
+    .activityText.match(/^Просит: (.*)$/m)[1];
+  assert.doesNotMatch(summary, /в оригинале|не на русском/);
+  assert.ok(summary.length > SUMMARY_MAX_CHARS_FOREIGN, "Russian prose keeps the full summary budget");
+});
+
+test("verdict substitution is a closed vocabulary applied in order", () => {
+  assert.equal(localizeVerdicts("result: NO BLOCKERS"), "result: блокеров нет");
+  assert.equal(localizeVerdicts("result: BLOCKER found"), "result: блокирующая проблема found");
+  // Lowercase prose is not a verdict token and must not be rewritten mid-sentence.
+  assert.equal(localizeVerdicts("the tests passed and nothing failed"), "the tests passed and nothing failed");
 });
 
 // ---------------------------------------------------------------------------

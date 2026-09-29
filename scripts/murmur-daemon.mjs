@@ -22,7 +22,7 @@ import {
 import { decryptPayload, encryptPayload, signEnvelope, verifyEnvelopeSignature } from "@murmurv2/security";
 import { NotifyQueue, flushNotifyQueue } from "./notify-router.mjs";
 import { planNotifiesActivity, planNotifiesErrors, planNotifiesInbound, resolveNotifyPlan } from "./notify-config.mjs";
-import { buildActivityErrorNotification, buildActivityNotification } from "./notify-activity.mjs";
+import { LEGACY_PROJECT_LABEL, buildActivityErrorNotification, buildActivityNotification } from "./notify-activity.mjs";
 import {
   createChannelThreadStartBindingResolver,
   createCodexAppServerDaemonInjector,
@@ -211,7 +211,7 @@ const reloadNotifyPolicy = async () => {
 const activityProjectId = typeof config.project?.id === "string" ? config.project.id : null;
 const activityProjectLabel = typeof config.project?.label === "string" && config.project.label
   ? config.project.label
-  : "Legacy Murmur";
+  : LEGACY_PROJECT_LABEL;
 
 /** The delegated task a reply answers, when this identity actually holds it locally. */
 const parentTextFor = (replyToMessageId) => {
