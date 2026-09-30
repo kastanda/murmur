@@ -1,0 +1,3 @@
+# Swift build products. The app bundle is assembled here by scripts/build.sh.
+.build/
+*.xcodeproj

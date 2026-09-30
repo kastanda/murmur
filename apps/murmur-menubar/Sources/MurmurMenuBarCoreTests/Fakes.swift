@@ -1,0 +1,110 @@
+import Foundation
+import MurmurMenuBarCore
+
+// Every test runs against a FAKE CLI. Nothing starts Murmur, spawns a process, touches a
+// database or needs a network — the properties worth proving (argv shape, no shell,
+// decoding, health mapping, the concurrency guard, secret hygiene) are all decidable
+// without any of that.
+
+/// Records what would have been executed and replays canned output.
+final class FakeRunner: CommandRunner, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _invocations: [CommandInvocation] = []
+    private var _timeouts: [TimeInterval] = []
+    private let respond: @Sendable (CommandInvocation) -> CommandOutcome
+    /// Held open so a test can observe two commands overlapping.
+    var gate: (@Sendable () async -> Void)?
+
+    init(respond: @escaping @Sendable (CommandInvocation) -> CommandOutcome) {
+        self.respond = respond
+    }
+
+    var invocations: [CommandInvocation] { lock.withLock { _invocations } }
+    var timeouts: [TimeInterval] { lock.withLock { _timeouts } }
+
+    func run(_ invocation: CommandInvocation, timeout: TimeInterval) async throws -> CommandOutcome {
+        lock.withLock { _invocations.append(invocation); _timeouts.append(timeout) }
+        await gate?()
+        return respond(invocation)
+    }
+}
+
+final class MemoryPreferences: PreferenceStore, @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String: String] = [:]
+    func string(forKey key: String) -> String? { lock.withLock { storage[key] } }
+    func set(_ value: String?, forKey key: String) { lock.withLock { storage[key] = value } }
+    var keys: [String] { lock.withLock { Array(storage.keys) } }
+}
+
+func ok(_ stdout: String) -> CommandOutcome { CommandOutcome(exitCode: 0, stdout: stdout, stderr: "") }
+
+let projectsJSON = """
+{"projects":[
+  {"projectId":"murmur-000000000001","name":"murmur","projectPath":"/Users/x/Projects/murmur",
+   "profileRoot":"/Users/x/.murmur/projects/murmur-000000000001",
+   "logsDir":"/Users/x/.murmur/projects/murmur-000000000001/logs","valid":true},
+  {"projectId":"other-aaaaaaaaaaaa","name":"other","projectPath":"/Users/x/Projects/other",
+   "profileRoot":"/Users/x/.murmur/projects/other-aaaaaaaaaaaa",
+   "logsDir":"/Users/x/.murmur/projects/other-aaaaaaaaaaaa/logs","valid":true}]}
+"""
+
+let healthyStatusJSON = """
+{"projectId":"murmur-000000000001","projectPath":"/Users/x/Projects/murmur",
+ "supervisor":{"pid":4242,"alive":true,"phase":"ready"},
+ "nats":{"name":"nats","status":"PASS","detail":"reachable at 127.0.0.1:4222"},
+ "agents":[{"name":"root","role":"operator","alive":true,"pid":1,"childState":"alive","memberSlot":null},
+           {"name":"claude","role":"coordinator","alive":true,"pid":2,"childState":"alive","memberSlot":"claude:auto"},
+           {"name":"codex","role":"worker","alive":true,"pid":3,"childState":"alive","memberSlot":"codex:app-server"},
+           {"name":"cursor","role":"worker","alive":true,"pid":4,"childState":"alive","memberSlot":"cursor:acp"}],
+ "totals":{"openContinuations":0,"activeDispatch":0,"pendingDispatch":0},
+ "healthy":true,"problems":[]}
+"""
+
+let stoppedStatusJSON = """
+{"projectId":"murmur-000000000001","projectPath":"/Users/x/Projects/murmur",
+ "supervisor":{"pid":null,"alive":false,"phase":"not-started"},
+ "nats":{"name":"nats","status":"PASS","detail":"reachable"},
+ "agents":[{"name":"claude","role":"coordinator","alive":false,"pid":null,"childState":"not-started","memberSlot":"claude:auto"}],
+ "totals":{"openContinuations":0,"activeDispatch":0,"pendingDispatch":0},
+ "healthy":false,"problems":["supervisor is not running"]}
+"""
+
+let notifyJSON = """
+{"path":"/Users/x/.murmur/notifications.json","state":"configured","telegram":"configured",
+ "channels":["telegram:telegram"],"mode":"activity"}
+"""
+
+let doctorJSON = """
+{"status":"PASS","checks":[{"name":"nats","status":"PASS","detail":"reachable"},
+                           {"name":"telegram-notify","status":"PASS","detail":"configured (global: telegram:telegram)"}]}
+"""
+
+/// The default fake: a healthy project, two projects, Telegram configured.
+func healthyRunner() -> FakeRunner {
+    FakeRunner { invocation in
+        switch invocation.arguments.first {
+        case "projects": return ok(projectsJSON)
+        case "status": return ok(healthyStatusJSON)
+        case "notify": return ok(notifyJSON)
+        case "doctor": return ok(doctorJSON)
+        default: return ok("")
+        }
+    }
+}
+
+@MainActor
+func makeController(
+    runner: FakeRunner,
+    preferences: PreferenceStore = MemoryPreferences(),
+    cliPath: String? = "/opt/homebrew/bin/murmur"
+) -> MurmurController {
+    let locator = CLILocator(isExecutable: { path in cliPath != nil && path == cliPath })
+    if let cliPath { preferences.set(cliPath, forKey: PreferenceKey.cliPath) }
+    return MurmurController(
+        locator: locator,
+        preferences: preferences,
+        pollInterval: 3600,
+        makeCLI: { path in MurmurCLI(executable: path, runner: runner) }
+    )
+}

@@ -14,7 +14,7 @@
  */
 import { spawn } from "node:child_process";
 import { createReadStream, existsSync, openSync, closeSync, statSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,7 +36,7 @@ import {
   publicProfileSummary,
 } from "./profile.mjs";
 import { commandNotify } from "./notify.mjs";
-import { locateProject, murmurHome } from "./project.mjs";
+import { locateProject, murmurHome, projectPathsFor } from "./project.mjs";
 import {
   UNKNOWN,
   establishOwnership,
@@ -100,6 +100,7 @@ Usage:
   murmur doctor  <project> [--json]
   murmur logs    <project> [supervisor|root|claude|codex|cursor|codex-app-server] [-n <lines>] [--follow]
   murmur send    <project> "<task>" [--timeout <seconds>] [--no-wait]
+  murmur projects [--json]
   murmur notify  status | mode <activity|errors|default> | migrate [--from <dir>] | test
 
 <project> is an absolute path, or a name resolved under ~/Projects/<name>.
@@ -833,6 +834,79 @@ const commandStart = async ({ args, flags }) => {
 };
 
 // ---------------------------------------------------------------------------
+// projects
+// ---------------------------------------------------------------------------
+
+/**
+ * Enumerate the profiles this user already has, newest-looking first by name.
+ *
+ * This exists so a GUI does not have to read `project.json` itself. That file carries a
+ * NATS token when one is configured, and nothing outside Murmur should have to know which
+ * fields are safe to read — `publicProfileSummary` is the redacted view, and it is the
+ * only thing that leaves here.
+ *
+ * A profile that is unreadable or invalid is REPORTED, not skipped: a project that has
+ * silently vanished from a picker is worse than one shown as broken.
+ */
+export const listProfiles = async ({ home = murmurHome() } = {}) => {
+  const root = path.join(home, "projects");
+  let entries;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+  const profiles = [];
+  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    if (!entry.isDirectory()) continue;
+    const paths = projectPathsFor(entry.name, { home });
+    try {
+      const project = await loadProfile(paths);
+      profiles.push({
+        projectId: project.projectId,
+        // What the operator calls this project — never the hashed profile directory.
+        name: path.basename(project.projectPath),
+        projectPath: project.projectPath,
+        profileRoot: paths.root,
+        logsDir: paths.logsDir,
+        valid: true,
+        profile: publicProfileSummary(project),
+      });
+    } catch (error) {
+      profiles.push({
+        projectId: entry.name,
+        name: entry.name,
+        projectPath: null,
+        profileRoot: paths.root,
+        logsDir: paths.logsDir,
+        valid: false,
+        reason: error?.message || "unreadable",
+      });
+    }
+  }
+  return profiles;
+};
+
+const commandProjects = async ({ flags }) => {
+  const profiles = await listProfiles();
+  if (flags.json) {
+    out(JSON.stringify({ projects: profiles }, null, 2));
+    return 0;
+  }
+  if (profiles.length === 0) {
+    out("No Murmur projects yet. Run `murmur start <project>` to create one.");
+    return 0;
+  }
+  for (const profile of profiles) {
+    out(profile.valid
+      ? `${profile.name.padEnd(24)} ${profile.projectPath}`
+      : `${profile.name.padEnd(24)} (invalid profile: ${profile.reason})`);
+  }
+  return 0;
+};
+
+// ---------------------------------------------------------------------------
 // status
 // ---------------------------------------------------------------------------
 const commandStatus = async ({ args, flags }) => {
@@ -1095,26 +1169,46 @@ export const coordinatorGate = (status, { root = "root", coordinator = "claude" 
   return { ok: true, reason: null };
 };
 
+/**
+ * `send` in ONE machine-readable object.
+ *
+ * A GUI would otherwise have to scrape the human transcript — "Sent <id> -> ...", a blank
+ * line, then the reply — and would silently misread the day someone improves the wording.
+ * This changes nothing about correlation: the same enqueue and the same strict wait
+ * produce it, and `--json` only decides how the outcome is printed.
+ */
+const sendResult = (payload) => {
+  out(JSON.stringify(payload, null, 2));
+};
+
 const commandSend = async ({ args, flags }) => {
   const { paths } = locate(args[0]);
   const text = args.slice(1).join(" ").trim();
+  const fail = (reason, detail = null) => {
+    if (flags.json) sendResult({ ok: false, reason, ...(detail ? { detail } : {}) });
+    return null;
+  };
   if (!text) {
-    err("murmur: send requires a task, e.g. murmur send <project> \"summarise README.md\"");
+    if (!flags.json) err("murmur: send requires a task, e.g. murmur send <project> \"summarise README.md\"");
+    fail("task-required");
     return 1;
   }
   if (!(await profileExists(paths))) {
-    err("murmur: no profile for this project. Run `murmur start <project>` first.");
+    if (!flags.json) err("murmur: no profile for this project. Run `murmur start <project>` first.");
+    fail("no-profile");
     return 3;
   }
   const project = await loadProfile(paths);
   const root = agentByName(project, "root");
   const coordinator = agentByName(project, project.coordinator || "claude");
   if (!root || !coordinator) {
-    err("murmur: profile has no root/coordinator pair.");
+    if (!flags.json) err("murmur: profile has no root/coordinator pair.");
+    fail("no-root-coordinator-pair");
     return 3;
   }
   if (!enabledAgents(project).some((agent) => agent.name === root.name)) {
-    err("murmur: the root/operator identity is disabled in this profile.");
+    if (!flags.json) err("murmur: the root/operator identity is disabled in this profile.");
+    fail("root-disabled");
     return 3;
   }
 
@@ -1125,8 +1219,11 @@ const commandSend = async ({ args, flags }) => {
   const status = await collectStatus({ project, paths, includeNats: false });
   const gate = coordinatorGate(status, { root: root.name, coordinator: coordinator.name });
   if (!gate.ok) {
-    err(`murmur: refusing to send — ${gate.reason}`);
-    if (gate.fix) err(gate.fix);
+    if (!flags.json) {
+      err(`murmur: refusing to send — ${gate.reason}`);
+      if (gate.fix) err(gate.fix);
+    }
+    fail("coordinator-unavailable", gate.reason);
     return 3;
   }
 
@@ -1136,8 +1233,13 @@ const commandSend = async ({ args, flags }) => {
     to: coordinator.agentId,
     text,
   });
-  out(`Sent ${sent.msgId} -> ${coordinator.agentId} (conversation ${sent.conversationId})`);
-  if (!flags.wait) return 0;
+  if (!flags.json) out(`Sent ${sent.msgId} -> ${coordinator.agentId} (conversation ${sent.conversationId})`);
+  if (!flags.wait) {
+    if (flags.json) {
+      sendResult({ ok: true, waited: false, msgId: sent.msgId, conversationId: sent.conversationId, to: coordinator.agentId });
+    }
+    return 0;
+  }
 
   // Strict correlation: exact replyToMessageId AND the expected coordinator sender AND
   // the original root conversation.
@@ -1149,12 +1251,35 @@ const commandSend = async ({ args, flags }) => {
   const timeoutMs = (flags.timeoutSeconds ?? 600) * 1000;
   const reply = await waitForCorrelatedReply(paths.agentDbFile(root.name), correlation, { timeoutMs });
   if (!reply) {
-    err(`murmur: no correlated reply within ${Math.round(timeoutMs / 1000)}s (msgId ${sent.msgId}).`);
     const rejected = findRejectedCandidates(paths.agentDbFile(root.name), correlation);
+    if (flags.json) {
+      sendResult({
+        ok: false,
+        reason: "timeout",
+        msgId: sent.msgId,
+        conversationId: sent.conversationId,
+        timeoutSeconds: Math.round(timeoutMs / 1000),
+        ignoredReplies: rejected.length,
+      });
+      return 3;
+    }
+    err(`murmur: no correlated reply within ${Math.round(timeoutMs / 1000)}s (msgId ${sent.msgId}).`);
     for (const candidate of rejected) {
       err(`  ignored ${candidate.msgId}: sender=${candidate.sender} conversation=${candidate.conversationId} (not the expected coordinator/conversation)`);
     }
     return 3;
+  }
+  if (flags.json) {
+    sendResult({
+      ok: true,
+      waited: true,
+      msgId: sent.msgId,
+      conversationId: sent.conversationId,
+      replyMsgId: reply.msgId,
+      from: reply.sender,
+      text: reply.text,
+    });
+    return 0;
   }
   out("");
   out(reply.text);
@@ -1165,6 +1290,7 @@ const commandSend = async ({ args, flags }) => {
 const COMMANDS = {
   start: commandStart,
   status: commandStatus,
+  projects: commandProjects,
   stop: commandStop,
   doctor: commandDoctor,
   logs: commandLogs,
@@ -1176,7 +1302,7 @@ const COMMANDS = {
  * Commands that operate on the USER's Murmur state rather than on one project, and so
  * must not be rejected for a missing `<project>`.
  */
-const PROJECTLESS_COMMANDS = new Set(["notify"]);
+const PROJECTLESS_COMMANDS = new Set(["notify", "projects"]);
 
 export const run = async (argv = process.argv.slice(2)) => {
   let parsed;
