@@ -22,7 +22,14 @@ import {
 import { decryptPayload, encryptPayload, signEnvelope, verifyEnvelopeSignature } from "@murmurv2/security";
 import { NotifyQueue, flushNotifyQueue } from "./notify-router.mjs";
 import { planNotifiesActivity, planNotifiesErrors, planNotifiesInbound, resolveNotifyPlan } from "./notify-config.mjs";
-import { LEGACY_PROJECT_LABEL, buildActivityErrorNotification, buildActivityNotification } from "./notify-activity.mjs";
+import {
+  buildActivityErrorNotification,
+  buildActivityNotification,
+  classifyActivity,
+  needsRussianSummary,
+  redactSecrets,
+} from "./notify-activity.mjs";
+import { createClaudeSummarizer } from "./notify-summarizer.mjs";
 import {
   createChannelThreadStartBindingResolver,
   createCodexAppServerDaemonInjector,
@@ -36,6 +43,7 @@ import {
   CLAUDE_AUTO_MEMBER_SLOT,
   CLAUDE_ONE_SHOT_KIND,
   ClaudeOneShotRuntime,
+  runClaudeOneShot,
 } from "./claude-one-shot-runtime.mjs";
 import {
   CURSOR_ACP_KIND,
@@ -209,9 +217,43 @@ const reloadNotifyPolicy = async () => {
  * labelled honestly as legacy rather than being attributed to a project it may not be in.
  */
 const activityProjectId = typeof config.project?.id === "string" ? config.project.id : null;
+// A pre-CLI `.data-*` identity has no project descriptor. The project line is then
+// omitted entirely rather than filled with a placeholder presented as a project name.
 const activityProjectLabel = typeof config.project?.label === "string" && config.project.label
   ? config.project.label
-  : LEGACY_PROJECT_LABEL;
+  : null;
+
+/**
+ * The Russian summarizer for long non-Russian agent content.
+ *
+ * It reuses the `claude` CLI this project is already configured and authenticated with —
+ * no new provider, dependency or credential — invoked as one bounded text call with tools
+ * disabled. Disabled with MURMUR_ACTIVITY_SUMMARY=0; the feed then keeps its deterministic
+ * English excerpt, which is exactly the fallback every failure path already uses.
+ *
+ * It is NOT configured through $MURMUR_HOME/notifications.json: that file holds the
+ * credential and the machine-wide mode, and a rendering detail does not belong beside a
+ * secret.
+ */
+const activitySummaryEnabled = process.env.MURMUR_ACTIVITY_SUMMARY !== "0";
+const activitySummaryDebug = process.env.MURMUR_ACTIVITY_SUMMARY_DEBUG === "1";
+const activitySummarizer = activitySummaryEnabled
+  ? createClaudeSummarizer({
+    runner: runClaudeOneShot,
+    ...(process.env.MURMUR_ACTIVITY_SUMMARY_MODEL ? { model: process.env.MURMUR_ACTIVITY_SUMMARY_MODEL } : {}),
+    ...(Number(process.env.MURMUR_ACTIVITY_SUMMARY_TIMEOUT_MS) > 0
+      ? { timeoutMs: Number(process.env.MURMUR_ACTIVITY_SUMMARY_TIMEOUT_MS) }
+      : {}),
+    cwd: path.resolve(config.runtime?.claudeOneShot?.cwd
+      || config.runtime?.codexAppServer?.cwd
+      || config.runtime?.cursorAcp?.cwd
+      || process.cwd()),
+    // A failed summary is an ordinary outcome with a good fallback, not an incident: it
+    // stays out of the log unless an operator asked to see it, and it NEVER reaches
+    // Telegram, which would turn an observability aid into its own source of noise.
+    log: activitySummaryDebug ? log : () => {},
+  })
+  : null;
 
 /** The delegated task a reply answers, when this identity actually holds it locally. */
 const parentTextFor = (replyToMessageId) => {
@@ -539,6 +581,88 @@ const loadInboundAfter = async (cursor) => {
   }));
 };
 
+/**
+ * Build and durably enqueue ONE activity notification.
+ *
+ * Deliberately NOT awaited by the inbound path. A summary costs a model call, and the
+ * inbound handler is on the critical path of actually doing the work: awaiting here would
+ * put a multi-second observability call in front of `wakeMonitor.onInbound()` and delay
+ * the task itself. So the message is dispatched to the runtime immediately and this runs
+ * alongside it.
+ *
+ * The consequence is that the notification is enqueued ONCE, already final, after the
+ * summary has resolved or given up. That is what keeps the durable dedupe honest: the
+ * rendered payload is written before it is enqueued, so `activity:<class>:<msgId>` always
+ * maps to one row and one Telegram message. A transport retry re-reads that stored row
+ * and can never trigger a second model call, and model variation can never produce a
+ * second notification.
+ */
+const enqueueActivityNotification = async ({
+  senderId, msgId, replyToMessageId, handoff, text, parentText,
+}) => {
+  const input = {
+    localAgentId: agentId,
+    senderId,
+    msgId,
+    replyToMessageId,
+    handoff,
+    text,
+    parentText,
+    projectId: activityProjectId,
+    projectLabel: activityProjectLabel,
+  };
+
+  // AT MOST ONE model call per event, for whichever half of the render actually needs it.
+  //
+  //   - a long non-Russian BODY is retold, and the retelling replaces the excerpt;
+  //   - otherwise a long non-Russian PARENT is retold, and the retelling becomes the
+  //     topic. This is the short-reply case: `Ответ: RELEASE_CHECK_OK` is already perfect,
+  //     but the request it answers is English, and without this the feed would head a
+  //     Russian conversation with an English line.
+  //
+  // Never both: two calls would double the cost and latency of an observability aid.
+  let summary = null;
+  let topicSummary = null;
+  let attempted = "none";
+  if (activitySummarizer) {
+    const event = classifyActivity({ localAgentId: agentId, senderId, replyToMessageId, handoff, projectId: activityProjectId });
+    const summarizeFor = needsRussianSummary(text)
+      ? { field: "summary", source: text }
+      : needsRussianSummary(parentText)
+        ? { field: "topicSummary", source: parentText }
+        : null;
+    if (summarizeFor) {
+      // REDACTION FIRST. This is the one point where message content leaves this process
+      // tree, so the text handed over is already sanitized — never the original, never
+      // sanitized afterwards.
+      const produced = await activitySummarizer({
+        msgId,
+        text: redactSecrets(String(summarizeFor.source ?? "")),
+        kind: event.kind,
+        from: event.from.label,
+        to: event.to.label,
+        project: activityProjectLabel,
+      });
+      if (summarizeFor.field === "summary") summary = produced;
+      else topicSummary = produced;
+      // Remember that a summary was ASKED FOR even when it did not arrive: "none" and
+      // "it timed out" are different diagnoses, and a log that conflates them sends an
+      // operator looking at the trigger rule when the budget is what needs tuning.
+      attempted = produced ? summarizeFor.field : "failed";
+    }
+  }
+
+  const activity = buildActivityNotification({ ...input, summary, topicSummary });
+  if (!activity) return;
+  notifyQueue.enqueueMessage(activity, notifyPolicy.targets);
+  log("info", "Activity notification queued", {
+    msgId,
+    activityKind: activity.activityKind,
+    summarized: attempted,
+    targetCount: notifyPolicy.targets.length,
+  });
+};
+
 // Runtime-failure notifications are the one class every scope except `off` receives:
 // a worker whose runtime never picked the work up is exactly what the operator has to
 // hear about, even though that identity does not notify ordinary inbound traffic.
@@ -773,25 +897,20 @@ const onMessage = async (envelope) => {
     // message it has just durably stored. Rendering at the sender instead would notify
     // every hop twice (once by each side) and would fire again on every transport retry;
     // the notify queue's durable dedupe key closes the redelivery case on top of that.
-    const activity = buildActivityNotification({
-      localAgentId: agentId,
+    //
+    // Not awaited: see `enqueueActivityNotification`. A notification must never sit
+    // between an inbound message and the runtime that has to act on it.
+    void enqueueActivityNotification({
       senderId,
       msgId: envelope.msgId,
       replyToMessageId: envelope.replyToMessageId ?? null,
       handoff: handoffInbound ? envelope.handoff : null,
       text: plaintext,
       parentText: parentTextFor(envelope.replyToMessageId),
-      projectId: activityProjectId,
-      projectLabel: activityProjectLabel,
+    }).catch((error) => {
+      // Observability must not be able to take the bus down.
+      log("error", "Activity notification failed", { msgId: envelope.msgId, error: error?.message || String(error) });
     });
-    if (activity) {
-      notifyQueue.enqueueMessage(activity, notifyPolicy.targets);
-      log("info", "Activity notification queued", {
-        msgId: envelope.msgId,
-        activityKind: activity.activityKind,
-        targetCount: notifyPolicy.targets.length,
-      });
-    }
   }
 
   await wakeMonitor.onInbound(payload);

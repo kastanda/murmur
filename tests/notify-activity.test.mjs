@@ -19,7 +19,6 @@ import {
   ACTIVITY_REPLY,
   ACTIVITY_REQUEST,
   ACTIVITY_TASK_STARTED,
-  LEGACY_PROJECT_LABEL,
   SUMMARY_MAX_CHARS_FOREIGN,
   activityDedupeId,
   buildActivityErrorNotification,
@@ -27,6 +26,8 @@ import {
   classifyActivity,
   detectBodyLanguage,
   extractTopic,
+  needsRussianSummary,
+  normalizeForComparison,
   extractVerdict,
   localizeVerdicts,
   redactSecrets,
@@ -91,7 +92,7 @@ test("root task start renders as the operator asking the coordinator", () => {
     text: "Проверь provisioning profile проекта и вернись с результатом.",
   }).activityText;
   assert.match(rendered, /^▶️ Пользователь → 🟣 Claude$/m);
-  assert.match(rendered, /^📁 murmur$/m);
+  assert.match(rendered, /^📁 Проект: murmur$/m);
   assert.match(rendered, /^Просит: /m);
 });
 
@@ -157,11 +158,11 @@ test("a legacy message with no reply correlation gets a NEUTRAL label, not an in
     senderId: "claude",
     msgId: "legacy-1",
     text: "Обычное сообщение между агентами, без ответной корреляции.",
-    projectLabel: LEGACY_PROJECT_LABEL,
   });
   assert.equal(built.activityKind, ACTIVITY_MESSAGE);
   assert.match(built.activityText, /^🟣 Claude → 🔵 Codex$/m);
-  assert.match(built.activityText, /^📁 Устаревший Murmur$/m);
+  assert.doesNotMatch(built.activityText, /📁/,
+    "a legacy identity has no authoritative project, so the line is omitted, not invented");
   assert.match(built.activityText, /^Сообщение: /m, "request/response is never claimed without a durable relation");
   assert.doesNotMatch(built.activityText, /Просит|Ответ/);
 });
@@ -196,14 +197,16 @@ test("a reply inherits the parent request's topic when the parent is available l
   }).activityText;
   assert.match(withParent, /^Тема: проверка provisioning profile$/m);
 
-  // Without the parent, the message speaks for itself. Nothing is invented.
+  // Without the parent there is no distinct topic to inherit, so the message speaks for
+  // itself on ONE line instead of saying the same thing twice. Nothing is invented.
   const withoutParent = notification({
     localAgentId: id("claude"),
     senderId: id("codex"),
     replyToMessageId: "m-handoff",
     text: "Найден один блокирующий риск.",
   }).activityText;
-  assert.match(withoutParent, /^Тема: Найден один блокирующий риск\.$/m);
+  assert.match(withoutParent, /^Ответ: Найден один блокирующий риск\.$/m);
+  assert.doesNotMatch(withoutParent, /^Тема:/m);
 });
 
 test("long review text is trimmed to a readable topic and summary, with code stripped", () => {
@@ -257,7 +260,9 @@ test("a stated verdict is rendered in Russian, and a negated one is not inverted
     replyToMessageId: "m-root",
     text: "Проверка завершена, проблема исправлена. SAFE TO MERGE",
   }).activityText;
-  assert.match(rendered, /^Итог: Проверка завершена, проблема исправлена\. можно мержить$/m);
+  // The topic takes the sentence; the verdict is what actually remains to be said.
+  assert.match(rendered, /^Тема: Проверка завершена, проблема исправлена\.$/m);
+  assert.match(rendered, /^Итог: можно мержить$/m);
   assert.doesNotMatch(rendered, /SAFE TO MERGE/);
 });
 
@@ -278,22 +283,23 @@ test("every fixed phrase the feed can emit is Russian", () => {
     notification({ handoff: { ancestry: [id("claude")] } }),
     notification({ localAgentId: id("claude"), senderId: id("codex"), replyToMessageId: "p", text: "Готово." }),
     notification({ localAgentId: id("root"), senderId: id("claude"), replyToMessageId: "p", text: "Готово." }),
-    buildActivityNotification({ localAgentId: "codex", senderId: "claude", msgId: "l1", text: "Сообщение.", projectLabel: LEGACY_PROJECT_LABEL }),
+    buildActivityNotification({ localAgentId: "codex", senderId: "claude", msgId: "l1", text: "Сообщение." }),
     buildActivityErrorNotification({ localAgentId: id("codex"), senderId: id("claude"), msgId: "e1", reason: "terminal", text: "Задача.", projectId: PROJECT_ID, projectLabel: PROJECT_LABEL }),
   ].map((entry) => entry.activityText);
 
   // Every label a reader sees.
   const labels = rendered.flatMap((text) => text.split("\n").slice(1))
-    .map((line) => line.match(/^([^:]+):/)?.[1])
+    .map((line) => line.match(/^(?:\p{Emoji_Presentation}\s*)?([^:]+):/u)?.[1])
     .filter(Boolean);
   for (const label of labels) {
     assert.match(label, /^[\p{Script=Cyrillic}\s]+$/u, `label "${label}" must be Russian`);
   }
-  assert.deepEqual([...new Set(labels)].sort(), ["Ответ", "Итог", "Просит", "Сообщение", "Ошибка", "Тема"].sort());
+  assert.deepEqual([...new Set(labels)].sort(),
+    ["Ответ", "Итог", "Проект", "Просит", "Сообщение", "Ошибка", "Тема"].sort());
 
   // Agent names may stay Latin; the operator is named in Russian.
   assert.ok(rendered.some((text) => text.includes("Пользователь")));
-  assert.ok(rendered.every((text) => !/Legacy Murmur|\(unknown\)|\(empty\)/.test(text)));
+  assert.ok(rendered.every((text) => !/Legacy Murmur|Устаревший|\(unknown\)|\(empty\)/.test(text)));
 });
 
 test("a wake failure names its reason in Russian, and an unknown one is not guessed at", () => {
