@@ -36,6 +36,7 @@ import {
   publicProfileSummary,
 } from "./profile.mjs";
 import { commandClaude } from "./claude.mjs";
+import { commandCursor } from "./cursor.mjs";
 import { commandNotify } from "./notify.mjs";
 import { locateProject, murmurHome, projectPathsFor } from "./project.mjs";
 import {
@@ -103,6 +104,7 @@ Usage:
   murmur send    <project> "<task>" [--timeout <seconds>] [--no-wait]
   murmur projects [--json]
   murmur claude   <project> config [--json] | model <sonnet|opus|inherit> | effort <level>
+  murmur cursor   <project> config [--json]
   murmur notify  status | mode <activity|errors|default> | migrate [--from <dir>] | test
 
 <project> is an absolute path, or a name resolved under ~/Projects/<name>.
@@ -1299,6 +1301,7 @@ const COMMANDS = {
   send: commandSend,
   notify: (parsed) => commandNotify({ ...parsed, out, err }),
   claude: (parsed) => commandClaude({ ...parsed, out, err }),
+  cursor: (parsed) => commandCursor({ ...parsed, out, err }),
 };
 
 /**

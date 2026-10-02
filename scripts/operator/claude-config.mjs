@@ -27,7 +27,7 @@
  * fixed Murmur-side list — see `discoverClaudeCapabilities()`.
  */
 import { readPrivateJson, writePrivateJson } from "../secure-state.mjs";
-import { discoverClaudeCapabilities } from "../claude-capabilities.mjs";
+import { canonicalModelLabel, discoverClaudeCapabilities } from "../claude-capabilities.mjs";
 
 export const CLAUDE_PREFERENCES_VERSION = 1;
 export const INHERIT = "inherit";
@@ -146,6 +146,27 @@ export const readClaudeCodeDefaultModel = async ({ claudeSettingsPath }) => {
 };
 
 /**
+ * The opportunistically cached CANONICAL model id from `claude-one-shot-runtime.mjs`
+ * (e.g. "claude-sonnet-5"), read back for display — only USABLE when its
+ * `selectedAlias` still matches the alias actually in effect right now. If the operator
+ * switched aliases since the cache was written, the cached id belongs to the PREVIOUS
+ * selection and must not be shown as if it described the new one; the caller then falls
+ * back to the bare alias label until a turn runs under the new alias and refreshes it.
+ * Absent, unreadable or stale is reported as unknown, never guessed at.
+ */
+export const readCachedCanonicalModel = async ({ claudeRuntimeCacheFile, effectiveAlias }) => {
+  if (!claudeRuntimeCacheFile) return null;
+  try {
+    const raw = await readPrivateJson(claudeRuntimeCacheFile);
+    if (raw?.version !== 1 || typeof raw.canonicalModel !== "string" || !raw.canonicalModel) return null;
+    if (raw.selectedAlias !== effectiveAlias) return null;
+    return raw.canonicalModel;
+  } catch {
+    return null;
+  }
+};
+
+/**
  * One live binding's recorded `{ model, effort }`, if the project's Claude daemon is
  * currently running. `readLiveClaudeBinding` is injected so this never has to know
  * about SQLite directly — see `operator/status.mjs`'s `readAgentRuntimeState`, which
@@ -174,6 +195,7 @@ export const resolveClaudeConfig = async ({
   capabilities,
   claudeSettingsPath,
   readLiveClaudeBinding,
+  claudeRuntimeCacheFile = paths?.claudeRuntimeCacheFile,
 } = {}) => {
   const loaded = await loadClaudePreferences(paths);
   const selected = loaded.state === "configured" ? loaded.preferences : { model: INHERIT, effort: INHERIT };
@@ -214,11 +236,45 @@ export const resolveClaudeConfig = async ({
     };
   };
 
+  const modelDescribed = describe(selected.model, running?.model ?? null, inheritedModel, modelLabel);
+
+  // The CANONICAL model id (e.g. "claude-sonnet-5") is a THIRD, separate concept from the
+  // selected alias ("sonnet") and the human label ("Sonnet") — never inferred from the
+  // alias, only ever read back from a real completed turn's own evidence (see
+  // `readCachedCanonicalModel`). When it correlates to the alias actually in effect, the
+  // human label is upgraded from the bare tier name to the precise version ("Sonnet 5");
+  // when it does not (no turn has run yet under this alias, or the cache is stale), the
+  // bare alias label is kept rather than ever guessing a version.
+  //
+  // SELECTED and RUNNING/EFFECTIVE are upgraded INDEPENDENTLY, against whichever alias
+  // each one actually names — not both against the same "effective" value. Without this,
+  // a pending-restart operator who just selected "opus" while "sonnet" is still running
+  // would see the bare word "Opus" for their new choice (correct — nothing has executed
+  // under it yet) but ALSO a bare "Sonnet" for `Сейчас:`, even though the running daemon
+  // has already revealed its exact version. Each label is upgraded by correlating the
+  // cache against the matching alias, so "Sonnet 5" / "Opus 5" appear exactly where each
+  // is actually known, per Part A4's worked example.
+  const canonicalFor = async (alias) => (alias && alias !== INHERIT
+    ? readCachedCanonicalModel({ claudeRuntimeCacheFile, effectiveAlias: alias })
+    : null);
+  const selectedCanonical = await canonicalFor(selected.model);
+  const runningCanonical = runningIsLive ? await canonicalFor(running.model) : null;
+  const effectiveCanonical = runningIsLive ? runningCanonical : selectedCanonical;
+  const upgrade = (label, canonical) => (canonical ? canonicalModelLabel(canonical) ?? label : label);
+
+  const model = {
+    ...modelDescribed,
+    canonicalModel: effectiveCanonical,
+    selectedLabel: upgrade(modelDescribed.selectedLabel, selectedCanonical),
+    runningLabel: modelDescribed.runningLabel ? upgrade(modelDescribed.runningLabel, runningCanonical) : modelDescribed.runningLabel,
+    effectiveLabel: upgrade(modelDescribed.effectiveLabel, effectiveCanonical),
+  };
+
   return {
     configState,
     configReason: loaded.state === "invalid" ? loaded.reason : null,
     capabilities,
-    model: describe(selected.model, running?.model ?? null, inheritedModel, modelLabel),
+    model,
     // Effort has no local non-network way to read Claude Code's own inherited default
     // (unlike `model`, it is not a plain settings.json field we can safely attribute);
     // an inherited effort is reported as unresolved rather than guessed.

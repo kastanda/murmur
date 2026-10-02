@@ -12,7 +12,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  canonicalModelLabel,
   discoverClaudeCapabilities,
+  extractCanonicalModel,
   findClaudeExecutable,
   parseClaudeHelp,
 } from "../scripts/claude-capabilities.mjs";
@@ -126,4 +128,77 @@ test("the ACTUAL installed Claude CLI on this machine is discovered and matches 
   if (!caps.available) return; // no claude installed in this environment; nothing to assert
   assert.ok(caps.supportedModels.includes("sonnet") || caps.supportedModels.includes("opus"),
     "the installed CLI's own --help no longer mentions either alias Murmur offers");
+});
+
+// ---------------------------------------------------------------------------
+// Canonical model id -> human label (Part A: exact Claude model version display)
+// ---------------------------------------------------------------------------
+
+test("canonical claude-sonnet-5 renders as Sonnet 5", () => {
+  assert.equal(canonicalModelLabel("claude-sonnet-5"), "Sonnet 5");
+});
+
+test("canonical claude-opus-5 renders as Opus 5", () => {
+  assert.equal(canonicalModelLabel("claude-opus-5"), "Opus 5");
+});
+
+test("a future-shaped synthetic canonical id renders its version precisely, without claiming it exists today", () => {
+  // This is a PARSER test only: it proves the parsing RULE handles a two-part version
+  // correctly. It does not assert, imply or cache that "claude-sonnet-5-5" is a real,
+  // currently available model — the installed CLI's own discovery is what decides that.
+  assert.equal(canonicalModelLabel("claude-sonnet-5-5"), "Sonnet 5.5");
+  assert.equal(canonicalModelLabel("claude-opus-5-5"), "Opus 5.5");
+});
+
+test("an unknown or malformed canonical id renders no fabricated label", () => {
+  for (const bogus of ["not-a-model-id", "claude-sonnet", "claude-", "", null, undefined, 42]) {
+    assert.equal(canonicalModelLabel(bogus), null, JSON.stringify(bogus));
+  }
+});
+
+test("a dated snapshot id is never mistaken for a dotted version number", () => {
+  // claude-haiku-4-5-20251001 has THREE numeric segments; real Anthropic ids are at most
+  // major.minor, so this must stay unparsed rather than rendering "Haiku 4.5.20251001".
+  assert.equal(canonicalModelLabel("claude-haiku-4-5-20251001"), null);
+});
+
+test("alias only (no canonical evidence yet) is exactly the bare tier label", () => {
+  // This documents the FALLBACK path end-to-end: `modelLabel` (from claude-config.mjs) is
+  // what a caller actually renders when `canonicalModelLabel` has nothing to offer.
+  assert.equal(canonicalModelLabel("sonnet"), null, "an alias is not a canonical id and must not be parsed as one");
+  assert.equal(canonicalModelLabel("opus"), null);
+});
+
+// ---------------------------------------------------------------------------
+// Extracting the canonical id from a real completed turn's modelUsage
+// ---------------------------------------------------------------------------
+
+test("extracts the model matching the configured alias, ignoring an unrelated helper entry", () => {
+  const modelUsage = {
+    "claude-haiku-4-5-20251001": { outputTokens: 13 },
+    "claude-sonnet-5": { outputTokens: 212 },
+  };
+  assert.equal(extractCanonicalModel(modelUsage, "sonnet"), "claude-sonnet-5");
+  assert.equal(extractCanonicalModel(modelUsage, "opus"), null, "no opus entry exists in this turn");
+});
+
+test("extracts opus just as precisely", () => {
+  const modelUsage = { "claude-opus-5": { outputTokens: 44 }, "claude-haiku-4-5-20251001": { outputTokens: 3 } };
+  assert.equal(extractCanonicalModel(modelUsage, "opus"), "claude-opus-5");
+});
+
+test("a short main turn next to a larger helper call is still attributed by NAME, not by size", () => {
+  // The whole point of matching by alias substring rather than "pick the biggest entry":
+  // a trivial one-word answer from the configured model must not be misattributed to a
+  // larger auxiliary call.
+  const modelUsage = { "claude-haiku-4-5-20251001": { outputTokens: 500 }, "claude-sonnet-5": { outputTokens: 2 } };
+  assert.equal(extractCanonicalModel(modelUsage, "sonnet"), "claude-sonnet-5");
+});
+
+test("no modelUsage, no alias, or no match all resolve to null rather than guessing", () => {
+  assert.equal(extractCanonicalModel(null, "sonnet"), null);
+  assert.equal(extractCanonicalModel({}, "sonnet"), null);
+  assert.equal(extractCanonicalModel({ "claude-opus-5": {} }, "sonnet"), null);
+  assert.equal(extractCanonicalModel({ "claude-sonnet-5": {} }, undefined), null);
+  assert.equal(extractCanonicalModel({ "claude-sonnet-5": {} }, ""), null);
 });

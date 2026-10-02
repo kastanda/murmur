@@ -110,6 +110,12 @@ export const projectPathsFor = (projectId, { home = murmurHome() } = {}) => {
     // kind, ever, so it can be read/written freely by the operator CLI and the menu bar
     // app without going anywhere near key material.
     claudePreferencesFile: path.join(root, "claude-preferences.json"),
+    // Opportunistic, best-effort cache of the CANONICAL Claude model id actually observed
+    // on a completed real turn (e.g. "claude-sonnet-5"), so the menu can show "Sonnet 5"
+    // instead of the bare alias "Sonnet" — without ever spending tokens on a turn whose
+    // only purpose would be painting a label. Written by the daemon, read by the CLI;
+    // losing a write or a stale read is harmless (the UI falls back to the bare alias).
+    claudeRuntimeCacheFile: path.join(root, "claude-runtime-cache.json"),
     agentsDir,
     agentDir: (agentName) => path.join(agentsDir, agentName),
     agentConfigFile: (agentName) => path.join(agentsDir, agentName, "agent-config.json"),

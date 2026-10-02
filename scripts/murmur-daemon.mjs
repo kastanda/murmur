@@ -322,11 +322,16 @@ const claudeProjectId = claudeOneShotConfig.projectId || path.resolve(claudeOneS
  */
 let resolvedClaudeModel;
 let resolvedClaudeEffort;
+// Hoisted so the "claudeRuntimeCacheFile" path is also available where
+// `ClaudeOneShotRuntime` is constructed, further below — the opportunistic
+// canonical-model cache is a project-scoped, display-only file exactly like
+// `claude-preferences.json`, not something worth re-deriving twice.
+let claudeProjectPaths;
 if (claudeOneShotEnabled) {
   const murmurProjectId = typeof process.env.MURMUR_PROJECT_ID === "string" ? process.env.MURMUR_PROJECT_ID : null;
   if (murmurProjectId) {
-    const projectPaths = projectPathsFor(murmurProjectId, { home: murmurHome() });
-    const loadedClaudePrefs = await loadClaudePreferences(projectPaths);
+    claudeProjectPaths = projectPathsFor(murmurProjectId, { home: murmurHome() });
+    const loadedClaudePrefs = await loadClaudePreferences(claudeProjectPaths);
     if (loadedClaudePrefs.state === "configured") {
       const capabilities = await discoverClaudeCapabilities();
       const { model: selectedModel, effort: selectedEffort } = loadedClaudePrefs.preferences;
@@ -760,6 +765,7 @@ const claudeOneShotRuntime = claudeOneShotEnabled ? new ClaudeOneShotRuntime({
   // already worked stops working.
   model: resolvedClaudeModel ?? claudeOneShotConfig.model,
   effort: resolvedClaudeEffort,
+  canonicalModelCacheFile: claudeProjectPaths?.claudeRuntimeCacheFile,
   handoff: handoffCoordinator,
   log,
 }) : null;

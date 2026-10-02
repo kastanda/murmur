@@ -2,6 +2,8 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { HANDOFF_REASONS } from "@murmurv2/core";
 import { settleRuntimeTurn } from "./agent-handoff-runtime.mjs";
+import { extractCanonicalModel } from "./claude-capabilities.mjs";
+import { writePrivateJson } from "./secure-state.mjs";
 
 export const CLAUDE_ONE_SHOT_KIND = "claude_one_shot";
 export const CLAUDE_AUTO_MEMBER_SLOT = "claude:auto";
@@ -140,12 +142,43 @@ export class ClaudeOneShotRuntime {
     effort,
     handoff = null,
     log = () => {},
+    // Opportunistic, best-effort cache of the CANONICAL model id a completed real turn
+    // reveals (e.g. "claude-sonnet-5") — see `maybeCacheCanonicalModel`. Undefined for a
+    // legacy `.data-claude` identity, which simply never gets this cache file.
+    canonicalModelCacheFile = undefined,
   }) {
     Object.assign(this, {
       bindingStore, dispatchStore, agentId, projectId, cwd, sendReply, runner, now,
       heartbeatIntervalMs, turnTimeoutMs, terminateGraceMs, retryDelayMs,
-      permissionMode, model, effort, handoff, log,
+      permissionMode, model, effort, handoff, log, canonicalModelCacheFile,
     });
+  }
+
+  /**
+   * Cache the canonical model id a completed turn's own `modelUsage` reveals — NEVER from
+   * a dedicated probe, only as a side effect of real work this runtime was already doing.
+   * Correlated to the alias that was ACTUALLY configured when the turn ran (`this.model`):
+   * if the operator later switches aliases, a reader of this cache must be able to tell
+   * the cached id belongs to the PREVIOUS selection and fall back to the bare alias label
+   * until a turn runs under the new one. Best-effort and fire-and-forget: a failed write
+   * here must never fail, delay or retry the turn itself.
+   */
+  async maybeCacheCanonicalModel(result) {
+    if (!this.canonicalModelCacheFile || !this.model) return;
+    const canonicalModel = extractCanonicalModel(result?.raw?.modelUsage, this.model);
+    if (!canonicalModel) return;
+    try {
+      await writePrivateJson(this.canonicalModelCacheFile, {
+        version: 1,
+        selectedAlias: this.model,
+        canonicalModel,
+        observedAt: new Date(this.now()).toISOString(),
+      });
+    } catch (error) {
+      this.log("warn", "Could not cache observed canonical Claude model (display only, non-fatal)", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   start({ bindingId = randomUUID(), runtimeGeneration = 1, leaseTtlMs = 30_000 } = {}) {
@@ -312,6 +345,9 @@ export class ClaudeOneShotRuntime {
         throw new Error("claude-one-shot-session-confirm-failed");
       }
       if (!this.bindingStore.validateFence(fence, identity)) return { status: "late-result-dropped" };
+      // Display-only and fire-and-forget: never awaited into the fenced/correlated path
+      // above, and never allowed to affect the result the turn actually settles with.
+      void this.maybeCacheCanonicalModel(result);
       return await settleRuntimeTurn({
         runtimeKind: CLAUDE_ONE_SHOT_KIND,
         dispatchStore: this.dispatchStore,

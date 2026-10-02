@@ -230,6 +230,13 @@ public struct MurmurCLI: Sendable {
         CommandInvocation(executable: executable, arguments: ["claude", project, "effort", value])
     }
 
+    /// Read-only — there is deliberately no `setCursorModelInvocation`. See
+    /// `cursor-config.mjs`'s header: Cursor's own model selection is real but ACCOUNT-
+    /// GLOBAL, not project-scoped, so this app only ever displays it.
+    public func cursorConfigInvocation(project: String) -> CommandInvocation {
+        CommandInvocation(executable: executable, arguments: ["cursor", project, "config", "--json"])
+    }
+
     // MARK: execution
 
     public func status(project: String) async throws -> ProjectStatus {
@@ -253,6 +260,13 @@ public struct MurmurCLI: Sendable {
 
     public func claudeConfig(project: String) async throws -> ClaudeConfigReport {
         try await decode(ClaudeConfigReport.self, from: claudeConfigInvocation(project: project), timeout: 20, allowNonZeroExit: true)
+    }
+
+    /// A project with no Cursor identity exits 3 with no JSON on stdout — callers treat
+    /// a thrown error here as "no Cursor section to show", exactly like an absent
+    /// `claudeConfig` would.
+    public func cursorConfig(project: String) async throws -> CursorConfigReport {
+        try await decode(CursorConfigReport.self, from: cursorConfigInvocation(project: project), timeout: 20, allowNonZeroExit: true)
     }
 
     /// Writes THROUGH the CLI, exactly like every other preference change in this app;

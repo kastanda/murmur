@@ -136,6 +136,24 @@ let claudeConfigUnsupportedJSON = """
    "source":"claude-code","effortSource":"claude-code","pendingRestart":false,"configState":"absent"}}
 """
 
+/// Read-only, non-controllable, exactly as the real `cursor-config.mjs` reports it.
+let cursorConfigJSON = """
+{"project":"murmur",
+ "cursor":{"controllable":false,"reason":"cursor-model-selection-is-account-global",
+   "selectedModel":null,"selectedModelLabel":null,
+   "effectiveModel":"claude-opus-5","effectiveModelLabel":"Claude Opus 5 300K High",
+   "source":"cursor-global","supportedModels":[],"requiresRestart":false,"requiresNewSession":false}}
+"""
+
+/// Nothing Cursor has ever picked: the "default"/"Auto" state Cursor itself uses.
+let cursorConfigAutoJSON = """
+{"project":"murmur",
+ "cursor":{"controllable":false,"reason":"cursor-model-selection-is-account-global",
+   "selectedModel":null,"selectedModelLabel":null,
+   "effectiveModel":"default","effectiveModelLabel":"Auto",
+   "source":"cursor-global","supportedModels":[],"requiresRestart":false,"requiresNewSession":false}}
+"""
+
 /// The default fake: a healthy project, two projects, Telegram configured.
 func healthyRunner() -> FakeRunner {
     FakeRunner { invocation in
@@ -145,6 +163,7 @@ func healthyRunner() -> FakeRunner {
         case "notify": return ok(notifyJSON)
         case "doctor": return ok(doctorJSON)
         case "claude": return ok(claudeConfigJSON)
+        case "cursor": return ok(cursorConfigJSON)
         default: return ok("")
         }
     }

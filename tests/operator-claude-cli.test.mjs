@@ -284,3 +284,15 @@ test("the JSON carries a value->label map for every selectable option, not just 
     ctx.cleanup();
   }
 });
+
+test("config --json includes canonicalModel, null until a real turn has run", async () => {
+  const ctx = await setup();
+  try {
+    const { out } = await run(ctx, ["config"], { json: true });
+    const report = JSON.parse(out.join("\n"));
+    assert.equal(report.claude.canonicalModel, null);
+    assert.equal(report.claude.effectiveModelLabel, "Sonnet", "bare label with no canonical evidence yet");
+  } finally {
+    ctx.cleanup();
+  }
+});

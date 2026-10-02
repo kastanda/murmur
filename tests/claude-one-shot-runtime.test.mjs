@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -529,4 +529,86 @@ test("binding metadata records the configured model/effort, explicitly, as 'inhe
   const inheritBinding = inheritCtx.bindingStore.get("binding-a");
   assert.equal(inheritBinding.metadata.model, "inherit");
   assert.equal(inheritBinding.metadata.effort, "inherit");
+});
+
+// ---------------------------------------------------------------------------
+// Opportunistic canonical-model caching (Part A: exact version display)
+// ---------------------------------------------------------------------------
+
+test("a completed turn with real modelUsage caches the canonical model, correlated to the configured alias", async () => {
+  const cacheFile = path.join(mkdtempSync(path.join(os.tmpdir(), "murmur-canonical-cache-")), "claude-runtime-cache.json");
+  const ctx = setup({
+    model: "sonnet",
+    runner: async (options) => {
+      options.onSpawn({ pid: 1, processStartIdentity: "1:test" });
+      return {
+        text: "answer", sessionId: options.sessionId,
+        raw: { modelUsage: { "claude-haiku-4-5-20251001": { outputTokens: 5 }, "claude-sonnet-5": { outputTokens: 99 } } },
+      };
+    },
+  });
+  ctx.runtime.canonicalModelCacheFile = cacheFile;
+  const { payload, dispatch } = claim(ctx);
+  await ctx.runtime.executeTurn(payload, dispatch);
+  // The write is deliberately fire-and-forget (Part A: never add turn latency just for a
+  // display cache) — poll rather than a flat sleep, since a fixed delay is a race under
+  // the load of the full suite running concurrently, not just this one file.
+  const fsp = await import("node:fs/promises");
+  let cached;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    try {
+      cached = JSON.parse(await fsp.readFile(cacheFile, "utf8"));
+      break;
+    } catch {
+      await delay(20);
+    }
+  }
+  assert.ok(cached, "the canonical-model cache file was never written");
+  assert.deepEqual(cached, {
+    version: 1,
+    selectedAlias: "sonnet",
+    canonicalModel: "claude-sonnet-5",
+    observedAt: cached.observedAt,
+  });
+  assert.match(cached.observedAt, /^\d{4}-\d{2}-\d{2}T/);
+});
+
+test("no canonical cache is written when inherit (no configured alias) is in effect", async () => {
+  const cacheFile = path.join(mkdtempSync(path.join(os.tmpdir(), "murmur-canonical-cache-")), "claude-runtime-cache.json");
+  const ctx = setup({
+    runner: async (options) => {
+      options.onSpawn({ pid: 1, processStartIdentity: "1:test" });
+      return { text: "answer", sessionId: options.sessionId, raw: { modelUsage: { "claude-sonnet-5": { outputTokens: 10 } } } };
+    },
+  });
+  ctx.runtime.canonicalModelCacheFile = cacheFile;
+  const { payload, dispatch } = claim(ctx);
+  await ctx.runtime.executeTurn(payload, dispatch);
+  await delay(20);
+  assert.equal(existsSync(cacheFile), false, "inherit has no alias to correlate a canonical id against");
+});
+
+test("no canonical cache is written when the turn's result carries no modelUsage", async () => {
+  const cacheFile = path.join(mkdtempSync(path.join(os.tmpdir(), "murmur-canonical-cache-")), "claude-runtime-cache.json");
+  const ctx = setup({ model: "sonnet" }); // default fake runner returns no `raw` field at all
+  ctx.runtime.canonicalModelCacheFile = cacheFile;
+  const { payload, dispatch } = claim(ctx);
+  await ctx.runtime.executeTurn(payload, dispatch);
+  await delay(20);
+  assert.equal(existsSync(cacheFile), false);
+});
+
+test("a failed canonical-model cache write never fails, delays or retries the turn itself", async () => {
+  const ctx = setup({
+    model: "sonnet",
+    runner: async (options) => {
+      options.onSpawn({ pid: 1, processStartIdentity: "1:test" });
+      return { text: "answer", sessionId: options.sessionId, raw: { modelUsage: { "claude-sonnet-5": { outputTokens: 1 } } } };
+    },
+  });
+  // A directory, not a file: writePrivateJson() will fail to write here.
+  ctx.runtime.canonicalModelCacheFile = mkdtempSync(path.join(os.tmpdir(), "murmur-canonical-cache-dir-"));
+  const { payload, dispatch } = claim(ctx);
+  const result = await ctx.runtime.executeTurn(payload, dispatch);
+  assert.equal(result.status, "completed", "the turn itself must succeed regardless of the cache write outcome");
 });

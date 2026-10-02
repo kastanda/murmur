@@ -244,6 +244,12 @@ public struct ClaudePreference: Codable, Equatable, Sendable {
     public let pendingRestart: Bool
     public let configState: String
     public let configReason: String?
+    /// The THIRD, separate concept (selected alias / canonical id / human label): the
+    /// exact model id observed on a completed real turn (e.g. "claude-sonnet-5"), never
+    /// inferred from the alias. `nil` until a real turn has run under the effective
+    /// alias — `effectiveModelLabel`/`modelLabel` above already fall back to the bare
+    /// alias label in that case, so this field is informational, not required to render.
+    public let canonicalModel: String?
 
     public init(
         model: String, modelLabel: String, effort: String, effortLabel: String,
@@ -251,7 +257,7 @@ public struct ClaudePreference: Codable, Equatable, Sendable {
         effectiveModel: String?, effectiveModelLabel: String?,
         effectiveEffort: String?, effectiveEffortLabel: String?,
         source: String, effortSource: String, pendingRestart: Bool,
-        configState: String, configReason: String? = nil
+        configState: String, configReason: String? = nil, canonicalModel: String? = nil
     ) {
         self.model = model
         self.modelLabel = modelLabel
@@ -268,6 +274,54 @@ public struct ClaudePreference: Codable, Equatable, Sendable {
         self.pendingRestart = pendingRestart
         self.configState = configState
         self.configReason = configReason
+        self.canonicalModel = canonicalModel
+    }
+}
+
+// MARK: - cursor model (read-only, non-controllable — see `operator/cursor-config.mjs`)
+
+/// The truthful, read-only picture of Cursor's model: Murmur has no selection of its own
+/// (`selectedModel`/`supportedModels` are honestly empty — see the JS module header for
+/// why there is deliberately no writer), and `effectiveModel`/`effectiveModelLabel` are
+/// read straight from Cursor's own global config. `controllable` must be checked before
+/// a client ever considers building a selector; it is always `false` in this slice.
+public struct CursorModelInfo: Codable, Equatable, Sendable {
+    public let controllable: Bool
+    public let reason: String?
+    public let selectedModel: String?
+    public let selectedModelLabel: String?
+    public let effectiveModel: String?
+    public let effectiveModelLabel: String?
+    public let source: String?
+    public let supportedModels: [String]
+    public let requiresRestart: Bool
+    public let requiresNewSession: Bool
+
+    public init(
+        controllable: Bool, reason: String?, selectedModel: String?, selectedModelLabel: String?,
+        effectiveModel: String?, effectiveModelLabel: String?, source: String?,
+        supportedModels: [String], requiresRestart: Bool, requiresNewSession: Bool
+    ) {
+        self.controllable = controllable
+        self.reason = reason
+        self.selectedModel = selectedModel
+        self.selectedModelLabel = selectedModelLabel
+        self.effectiveModel = effectiveModel
+        self.effectiveModelLabel = effectiveModelLabel
+        self.source = source
+        self.supportedModels = supportedModels
+        self.requiresRestart = requiresRestart
+        self.requiresNewSession = requiresNewSession
+    }
+}
+
+public struct CursorConfigReport: Codable, Equatable, Sendable {
+    public let project: String
+    public let cursor: CursorModelInfo
+
+    public init(project: String, cursor: CursorModelInfo) {
+        self.project = project
+        self.cursor = cursor
     }
 }
 

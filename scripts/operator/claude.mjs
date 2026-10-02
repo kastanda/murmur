@@ -97,6 +97,12 @@ export const buildClaudeConfigReport = async ({
       runningEffort: resolved.effort.running,
       effectiveModel: resolved.model.effective,
       effectiveModelLabel: resolved.model.effectiveLabel,
+      // The THIRD, separate concept (Part A1): the canonical model id actually observed
+      // on a completed real turn (e.g. "claude-sonnet-5"), never inferred from the alias.
+      // `null` whenever no real turn has run yet under the currently effective alias —
+      // `effectiveModelLabel` above already falls back to the bare alias label in that
+      // case, so a client never has to branch on this field just to render correctly.
+      canonicalModel: resolved.model.canonicalModel,
       effectiveEffort: resolved.effort.effective,
       effectiveEffortLabel: resolved.effort.effectiveLabel,
       source: resolved.model.source,

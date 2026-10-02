@@ -646,6 +646,68 @@ await test("no fabricated minor version ever appears in a Claude label") {
     }
 }
 
+// MARK: - Cursor model (read-only, non-controllable)
+
+await test("argv for reading the Cursor policy is read-only") {
+    // There is deliberately no `setCursorModelInvocation`/`setCursorModel` on `MurmurCLI`
+    // to call here — that absence is enforced at COMPILE time (adding one would be a
+    // reviewable diff to this file and to `MurmurCLI.swift`), not something a runtime
+    // reflection check could meaningfully assert. This test proves the one argv that does
+    // exist is exactly the read-only query, with no shell and no model value in it at all.
+    let cli = MurmurCLI(executable: "/opt/homebrew/bin/murmur", runner: FakeRunner { _ in ok("") })
+    let invocation = cli.cursorConfigInvocation(project: "murmur")
+    await expectEqual(invocation.arguments, ["cursor", "murmur", "config", "--json"])
+    await expect(!invocation.arguments.contains("-c"))
+}
+
+await test("cursorConfig decodes the real non-controllable shape exactly as the CLI reports it") {
+    let cli = MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(cursorConfigJSON) })
+    let report = try await cli.cursorConfig(project: "murmur")
+    await expectEqual(report.cursor.controllable, false)
+    await expectEqual(report.cursor.selectedModel, nil)
+    await expectEqual(report.cursor.effectiveModel, "claude-opus-5")
+    await expectEqual(report.cursor.effectiveModelLabel, "Claude Opus 5 300K High")
+    await expectEqual(report.cursor.source, "cursor-global")
+    await expectEqual(report.cursor.supportedModels, [])
+}
+
+await test("refresh loads the Cursor config alongside status, read-only") {
+    let controller = await makeController(runner: healthyRunner())
+    await controller.refresh()
+    await expectEqual(await controller.cursorConfig?.cursor.effectiveModelLabel, "Claude Opus 5 300K High")
+    await expectEqual(await controller.cursorConfig?.cursor.controllable, false)
+}
+
+await test("switching project clears the previous project's Cursor config immediately") {
+    let controller = await makeController(runner: healthyRunner())
+    await controller.refresh()
+    await expect(await controller.cursorConfig != nil)
+    await controller.selectProject("other-aaaaaaaaaaaa")
+    await expectNil(await controller.cursorConfig, "the old project's Cursor info must not be shown for the new selection even briefly")
+}
+
+await test("the 'Auto' default state is shown exactly as Cursor reports it, never translated into a Claude-style label") {
+    let runner = FakeRunner { invocation in
+        switch invocation.arguments.first {
+        case "projects": return ok(projectsJSON)
+        case "status": return ok(healthyStatusJSON)
+        case "notify": return ok(notifyJSON)
+        case "claude": return ok(claudeConfigJSON)
+        case "cursor": return ok(cursorConfigAutoJSON)
+        default: return ok("")
+        }
+    }
+    let controller = await makeController(runner: runner)
+    await controller.refresh()
+    await expectEqual(await controller.cursorConfig?.cursor.effectiveModelLabel, "Auto")
+}
+
+await test("the Cursor line and its explanatory note are Russian, and the note says Murmur does not control it") {
+    await expect(isRussian(L.cursorByCursorSettings))
+    await expect(isRussian(L.cursorNotControlledByMurmur))
+    await expect(L.cursorNotControlledByMurmur.lowercased().contains("не управляет"), "must explicitly say Murmur does not control Cursor's model")
+}
+
 // MARK: - error rendering and secret hygiene
 
 suite("rendering and secrets")

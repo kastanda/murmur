@@ -8,6 +8,7 @@
  */
 import { execFile } from "node:child_process";
 import { accessSync, constants, existsSync, statSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { peerSupportsHandoffV1 } from "@murmurv2/core";
@@ -16,7 +17,8 @@ import { SCOPE_OFF, describeNotifyConfig, isNotifyScope, loadNotifyConfig, notif
 import { CODEX_SOURCES, discoverCodexExecutable } from "./codex.mjs";
 import { discoverClaudeCapabilities } from "../claude-capabilities.mjs";
 import { isSupportedEffort, isSupportedModel, loadClaudePreferences } from "./claude-config.mjs";
-import { DEFAULT_AGENTS, DEFAULT_NATS_URL, agentIdFor, enabledAgents, loadProfile, peersForAgent } from "./profile.mjs";
+import { resolveCursorModelInfo, cursorCliConfigPath } from "./cursor-config.mjs";
+import { DEFAULT_AGENTS, DEFAULT_NATS_URL, agentByName, agentIdFor, enabledAgents, loadProfile, peersForAgent } from "./profile.mjs";
 import { socketPathFits, UNIX_SOCKET_PATH_MAX } from "./project.mjs";
 import { OWNED, UNKNOWN, ownedProcessState, provenGone } from "./proc.mjs";
 import {
@@ -300,6 +302,17 @@ export const checkClaudeModelConfig = async ({ paths, discoverCapabilities = dis
       fix: `murmur claude <project> effort <${[...capabilities.supportedEfforts, "inherit"].join("|")}>`,
     }));
   return results;
+};
+
+/**
+ * Purely informational — ALWAYS passes. There is nothing to validate: Murmur offers no
+ * Cursor model selection to be wrong (see `cursor-config.mjs`'s header for why), so this
+ * exists only to make the currently-effective Cursor model visible in `murmur doctor`
+ * without a separate `murmur cursor config` call.
+ */
+const checkCursorModelInfo = async ({ homedir = os.homedir() } = {}) => {
+  const info = await resolveCursorModelInfo({ cursorCliConfigPath: cursorCliConfigPath(homedir) });
+  return [check("cursor-model", PASS, `${info.effectiveModelLabel ?? "по настройкам Cursor"} (настройки Cursor, не Murmur)`)];
 };
 
 const checkRuntimeConfig = async ({ project, paths }) => {
@@ -632,6 +645,7 @@ export const runDiagnostics = async ({
   results.push(...await checkPairing({ project, paths }));
   results.push(...await checkRuntimeConfig({ project, paths }));
   results.push(...await checkClaudeModelConfig({ paths }));
+  if (agentByName(project, "cursor")) results.push(...await checkCursorModelInfo({}));
   results.push(...await checkCodexSocket({ project, paths, socketProbe }));
   results.push(...await checkSupervisor({ paths }));
   if (includeNotifications) results.push(...await checkNotifications({ project, paths, env, home: notifyHome }));

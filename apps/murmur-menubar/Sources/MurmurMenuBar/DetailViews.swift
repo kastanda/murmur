@@ -33,6 +33,12 @@ struct StatusWindow: View {
                         row(L.claudeSelected, "\(claude.modelLabel) · \(claude.effortLabel)")
                         row(L.claudeEffective, "\(claude.effectiveModelLabel ?? L.unknown) · \(claude.effectiveEffortLabel ?? L.unknown)")
                     }
+                    if let cursor = controller.cursorConfig?.cursor {
+                        // Read-only, same as `cursorSection` in the main menu — no
+                        // selected/effective split to show, since Murmur has no
+                        // selection of its own for an account-global setting.
+                        row(L.cursor, cursor.effectiveModelLabel ?? L.cursorByCursorSettings)
+                    }
                 }
                 if controller.claudeConfig?.claude.pendingRestart == true {
                     Text(L.claudePendingRestart).font(.callout).foregroundStyle(.orange)

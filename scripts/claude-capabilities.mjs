@@ -113,6 +113,55 @@ const EMPTY_CAPABILITIES = Object.freeze({
 });
 
 /**
+ * The CANONICAL model id actually used for a completed turn, e.g. `claude-sonnet-5` —
+ * distinct from the ALIAS Murmur configured (`sonnet`) and from the human LABEL
+ * ("Sonnet 5"). Extracted from the real `modelUsage` object a completed
+ * `--output-format json` turn already returns (see `claude-one-shot-runtime.mjs`) —
+ * never from a dedicated probe turn, so establishing it costs nothing beyond work
+ * Murmur was already doing.
+ *
+ * `modelUsage` can carry more than one entry (a tiny Haiku helper call alongside the
+ * main answering model is routinely observed), so the entry is chosen by matching the
+ * CONFIGURED alias as a case-insensitive substring of the key — "sonnet" only ever
+ * matches a key containing "sonnet" — rather than by picking the largest entry, which
+ * would silently misattribute the helper call's model on a very short main turn.
+ */
+export const extractCanonicalModel = (modelUsage, alias) => {
+  if (!modelUsage || typeof modelUsage !== "object" || typeof alias !== "string" || !alias) return null;
+  const needle = alias.toLowerCase();
+  const matches = Object.keys(modelUsage).filter((key) => key.toLowerCase().includes(needle));
+  if (matches.length === 0) return null;
+  if (matches.length === 1) return matches[0];
+  // More than one match (unlikely for "sonnet"/"opus", but not impossible): the entry
+  // with the most output tokens is the one that actually produced the answer.
+  return matches.reduce((best, key) => {
+    const tokens = (entry) => Number(modelUsage[entry]?.outputTokens) || 0;
+    return tokens(key) > tokens(best) ? key : best;
+  });
+};
+
+/**
+ * Parse a canonical model id into a truthful human label — "Sonnet 5", "Opus 5", and
+ * (only if the installed CLI ever actually reports one) "Sonnet 5.5" for a hypothetical
+ * `claude-sonnet-5-5`. This NEVER invents a version: an id that does not match the
+ * expected `claude-<tier>-<version-parts>` shape returns `null`, and every caller falls
+ * back to the bare alias label ("Sonnet") rather than guessing.
+ */
+export const canonicalModelLabel = (canonicalId) => {
+  if (typeof canonicalId !== "string") return null;
+  // Exactly one or two numeric version segments — "5" or "5-5" (→ "5.5") — never more.
+  // An unbounded segment count would also match a dated snapshot id like
+  // `claude-haiku-4-5-20251001` and render a nonsensical "Haiku 4.5.20251001"; real
+  // Anthropic version identifiers are at most major.minor, so this stays a precise parse
+  // rather than a loose one that happens to work for today's two known ids.
+  const match = canonicalId.match(/^claude-([a-z]+)-(\d+)(?:-(\d+))?$/i);
+  if (!match) return null;
+  const [, tier, major, minor] = match;
+  const tierLabel = tier.charAt(0).toUpperCase() + tier.slice(1).toLowerCase();
+  return `${tierLabel} ${minor ? `${major}.${minor}` : major}`;
+};
+
+/**
  * Discover what the installed `claude` CLI supports, right now, with zero network
  * access: one local `--help` invocation (argv only — `execFile`, never a shell), parsed
  * with {@link parseClaudeHelp}.

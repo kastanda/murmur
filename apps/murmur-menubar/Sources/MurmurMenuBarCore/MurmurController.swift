@@ -45,6 +45,7 @@ public final class MurmurController: ObservableObject {
     @Published public private(set) var notify: NotifyStatus?
     @Published public private(set) var doctor: DoctorReport?
     @Published public private(set) var claudeConfig: ClaudeConfigReport?
+    @Published public private(set) var cursorConfig: CursorConfigReport?
     @Published public private(set) var operation: LifecycleOperation?
     @Published public private(set) var lastError: String?
     @Published public private(set) var cliLocation: CLILocation = .missing
@@ -167,6 +168,7 @@ public final class MurmurController: ObservableObject {
         status = nil
         doctor = nil
         claudeConfig = nil
+        cursorConfig = nil
         Task { await refresh() }
     }
 
@@ -203,6 +205,7 @@ public final class MurmurController: ObservableObject {
 
         guard let project = selectedProject?.cliArgument else {
             status = nil
+            cursorConfig = nil
             return
         }
         do {
@@ -214,6 +217,9 @@ public final class MurmurController: ObservableObject {
             lastError = describeFailure(error)
         }
         claudeConfig = try? await cli.claudeConfig(project: project)
+        // `nil` whenever the project has no Cursor identity (exit 3, no JSON) — the menu
+        // simply omits the Cursor section in that case, same pattern as `claudeConfig`.
+        cursorConfig = try? await cli.cursorConfig(project: project)
     }
 
     // MARK: internals

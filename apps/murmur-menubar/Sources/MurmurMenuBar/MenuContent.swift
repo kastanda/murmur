@@ -71,6 +71,7 @@ struct MenuContent: View {
         .disabled(controller.isBusy || controller.selectedProject == nil)
         logsMenu
         claudeSection
+        cursorSection
         Text("\(L.telegram): \(controller.telegramLabel)")
     }
 
@@ -111,6 +112,20 @@ struct MenuContent: View {
             } else {
                 Text(L.claudeEffortUnsupported)
             }
+        }
+    }
+
+    // MARK: Cursor model (read-only — see `cursor-config.mjs`'s header)
+
+    /// Cursor's own model selection is real but ACCOUNT-GLOBAL, not scoped to this
+    /// project or to Murmur — so, unlike `claudeSection`, this is a single line with no
+    /// submenu and no button. Building a selector here would silently reach into the
+    /// operator's personal Cursor settings with no way to undo that scoping; truthful
+    /// display beats a fake control that looks symmetric with Claude's.
+    @ViewBuilder private var cursorSection: some View {
+        if let config = controller.cursorConfig {
+            Text("\(L.cursor): \(config.cursor.effectiveModelLabel ?? L.cursorByCursorSettings)")
+            Text(L.cursorNotControlledByMurmur)
         }
     }
 

@@ -16,6 +16,7 @@ import {
   isSupportedModel,
   loadClaudePreferences,
   modelLabel,
+  readCachedCanonicalModel,
   readClaudeCodeDefaultModel,
   resolveClaudeConfig,
   validateClaudePreferences,
@@ -302,4 +303,125 @@ test("effort labels are Russian and bounded to the known set", () => {
   assert.equal(effortLabel("medium"), "Среднее");
   assert.equal(effortLabel("high"), "Высокое");
   assert.equal(effortLabel(INHERIT), "По настройкам Claude Code");
+});
+
+// ---------------------------------------------------------------------------
+// Canonical model id display (Part A: exact Claude model version display)
+// ---------------------------------------------------------------------------
+
+const withCache = async (cache) => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "mur-canonical-"));
+  const file = path.join(dir, "claude-runtime-cache.json");
+  if (cache) writeFileSync(file, JSON.stringify(cache));
+  return { dir, file };
+};
+
+test("a cached canonical model correlated to the current alias is returned", async () => {
+  const { dir, file } = await withCache({ version: 1, selectedAlias: "sonnet", canonicalModel: "claude-sonnet-5", observedAt: "2026-01-01T00:00:00.000Z" });
+  try {
+    assert.equal(await readCachedCanonicalModel({ claudeRuntimeCacheFile: file, effectiveAlias: "sonnet" }), "claude-sonnet-5");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a cached canonical model for a DIFFERENT alias than what is effective now is not returned", async () => {
+  // The operator switched from sonnet to opus; the cache still says sonnet's canonical id
+  // and must not be shown as if it described opus.
+  const { dir, file } = await withCache({ version: 1, selectedAlias: "sonnet", canonicalModel: "claude-sonnet-5", observedAt: "2026-01-01T00:00:00.000Z" });
+  try {
+    assert.equal(await readCachedCanonicalModel({ claudeRuntimeCacheFile: file, effectiveAlias: "opus" }), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an absent, malformed or unversioned cache resolves to null, never a guess", async () => {
+  assert.equal(await readCachedCanonicalModel({ claudeRuntimeCacheFile: undefined, effectiveAlias: "sonnet" }), null);
+  assert.equal(await readCachedCanonicalModel({ claudeRuntimeCacheFile: "/nonexistent/cache.json", effectiveAlias: "sonnet" }), null);
+
+  const { dir, file } = await withCache({ version: 2, selectedAlias: "sonnet", canonicalModel: "claude-sonnet-5" });
+  try {
+    assert.equal(await readCachedCanonicalModel({ claudeRuntimeCacheFile: file, effectiveAlias: "sonnet" }), null, "unsupported cache version");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveClaudeConfig upgrades BOTH the selected and effective labels to the canonical version when the cache correlates", async () => {
+  // Selected and effective are the SAME alias here (nothing is running yet, so
+  // effective falls back to selected) — both must show the precise "Sonnet 5",
+  // since both genuinely refer to the alias the cache was observed under.
+  const paths = tmpPaths();
+  await writeClaudePreferences(paths, { version: 1, model: "sonnet", effort: "medium" });
+  const { dir, file } = await withCache({ version: 1, selectedAlias: "sonnet", canonicalModel: "claude-sonnet-5", observedAt: "2026-01-01T00:00:00.000Z" });
+  try {
+    const resolved = await resolveClaudeConfig({
+      paths, capabilities: CAPS_FULL, claudeSettingsPath: "/nonexistent",
+      readLiveClaudeBinding: () => null, claudeRuntimeCacheFile: file,
+    });
+    assert.equal(resolved.model.canonicalModel, "claude-sonnet-5");
+    assert.equal(resolved.model.effectiveLabel, "Sonnet 5", "the UI-facing label is upgraded, not merely the raw field");
+    assert.equal(resolved.model.selectedLabel, "Sonnet 5", "the selected alias is also known precisely — it must not stay bare");
+  } finally {
+    rmSync(paths.dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveClaudeConfig upgrades selected and running labels INDEPENDENTLY when they name different aliases", async () => {
+  // The operator just selected opus while sonnet is still the one actually running
+  // (pending restart). The cache has evidence for BOTH aliases, from two different
+  // real turns observed in the past. Each label must be upgraded against its OWN
+  // alias, not against whichever one happens to be "effective".
+  const paths = tmpPaths();
+  await writeClaudePreferences(paths, { version: 1, model: "opus", effort: "high" });
+  const { dir, file } = await withCache({ version: 1, selectedAlias: "opus", canonicalModel: "claude-opus-5", observedAt: "2026-01-01T00:00:00.000Z" });
+  try {
+    const resolved = await resolveClaudeConfig({
+      paths, capabilities: CAPS_FULL, claudeSettingsPath: "/nonexistent",
+      readLiveClaudeBinding: () => ({ bindings: [{ live: true, metadata: { model: "sonnet", effort: "medium" } }] }),
+      claudeRuntimeCacheFile: file,
+    });
+    assert.equal(resolved.model.pendingRestart, true);
+    assert.equal(resolved.model.selectedLabel, "Opus 5", "the new selection's own cached version");
+    // The cache only has evidence for opus, not sonnet — the running alias stays bare.
+    assert.equal(resolved.model.runningLabel, "Sonnet");
+    assert.equal(resolved.model.effectiveLabel, "Sonnet", "effective mirrors what is actually running");
+  } finally {
+    rmSync(paths.dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveClaudeConfig falls back to the bare alias label with no cache evidence yet", async () => {
+  const paths = tmpPaths();
+  await writeClaudePreferences(paths, { version: 1, model: "sonnet", effort: "medium" });
+  try {
+    const resolved = await resolveClaudeConfig({
+      paths, capabilities: CAPS_FULL, claudeSettingsPath: "/nonexistent",
+      readLiveClaudeBinding: () => null, claudeRuntimeCacheFile: undefined,
+    });
+    assert.equal(resolved.model.canonicalModel, null);
+    assert.equal(resolved.model.effectiveLabel, "Sonnet");
+  } finally {
+    rmSync(paths.dir, { recursive: true, force: true });
+  }
+});
+
+test("switching alias away from a cached one falls back to the bare label for the NEW alias", async () => {
+  const paths = tmpPaths();
+  await writeClaudePreferences(paths, { version: 1, model: "opus", effort: "medium" }); // operator just switched to opus
+  const { dir, file } = await withCache({ version: 1, selectedAlias: "sonnet", canonicalModel: "claude-sonnet-5", observedAt: "2026-01-01T00:00:00.000Z" }); // stale: still sonnet's
+  try {
+    const resolved = await resolveClaudeConfig({
+      paths, capabilities: CAPS_FULL, claudeSettingsPath: "/nonexistent",
+      readLiveClaudeBinding: () => null, claudeRuntimeCacheFile: file,
+    });
+    assert.equal(resolved.model.canonicalModel, null, "the cache belongs to the previous alias");
+    assert.equal(resolved.model.effectiveLabel, "Opus", "bare label for opus, never sonnet's stale canonical version");
+  } finally {
+    rmSync(paths.dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
