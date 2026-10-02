@@ -294,6 +294,9 @@ export class CodexAppServerClient {
     sessionPath = null,
     onStarted = null,
     onTurnId = null,
+    // ATTACH to a turn this message already launched (exactly-once): instead of `turn/start`,
+    // `thread/resume` the recorded thread and wait for the recorded turn's terminal result.
+    attach = null,
   } = {}) {
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -302,6 +305,7 @@ export class CodexAppServerClient {
       let startResult = null;
       let finalText = "";
       let startedObserved = false;
+      let logPath = sessionPath;
       // The thread's EFFECTIVE model/effort as the server itself reports it
       // (`thread/settings/updated`, emitted when a turn's overrides are applied).
       let effectiveSettings = null;
@@ -316,8 +320,8 @@ export class CodexAppServerClient {
         finish(new Error(`codex-app-server-turn-completion-timeout:${this.socketPath}:${turnId || "unknown"}`));
       }, completionTimeoutMs);
       const sessionLogTimer = setInterval(() => {
-        if (settled || !sessionPath || !turnId) return;
-        const text = readFinalAnswerFromSessionLog(sessionPath, turnId);
+        if (settled || !logPath || !turnId) return;
+        const text = readFinalAnswerFromSessionLog(logPath, turnId);
         if (!text) return;
         finalText = finalText || text;
         if (!startedObserved) this.observe(null, { method: "turn/started", turnId,
@@ -392,7 +396,8 @@ export class CodexAppServerClient {
           }
           initialized = true;
           sendJson({ method: "initialized" });
-          sendJson({ id: requestId, method: "turn/start", params });
+          if (attach) sendJson({ id: requestId, method: "thread/resume", params: { threadId: attach.threadId, cwd: params?.cwd ?? null } });
+          else sendJson({ id: requestId, method: "turn/start", params });
           return;
         }
 
@@ -404,7 +409,15 @@ export class CodexAppServerClient {
             return;
           }
           startResult = message.result;
-          turnId = message.result?.turn?.id || turnId;
+          if (attach) {
+            // `thread/resume` answered: wait for the RECORDED turn; its rollout (if any) is where a
+            // result that completed before we attached can be read back.
+            turnId = attach.turnId;
+            logPath = message.result?.thread?.path || logPath;
+            startResult = { turn: { id: turnId } };
+          } else {
+            turnId = message.result?.turn?.id || turnId;
+          }
           if (turnId) {
             try {
               onTurnId?.({
@@ -681,6 +694,8 @@ export const createCodexAppServerInjector = ({ Client = CodexAppServerClient, lo
       const seededId = started?.thread?.id;
       if (!seededId) throw new Error(`codex-app-server-thread-start-missing:${payload.from}`);
       threadPath = started?.thread?.path || threadPath;
+      // Record the thread BEFORE any turn: a retry of this message reuses it instead of seeding another.
+      try { processing?.observeSeed?.({ threadId: seededId }); } catch { /* recording only */ }
       if (typeof started?.model === "string") {
         threadStartEffective = { model: started.model, effort: typeof started.reasoningEffort === "string" ? started.reasoningEffort : null };
       }
@@ -688,6 +703,25 @@ export const createCodexAppServerInjector = ({ Client = CodexAppServerClient, lo
       log("info", `Codex app-server wake thread ${reason}`, { msgId: payload.msgId, threadId: seededId, socketPath, threadPath });
       return seededId;
     };
+
+    // EXACTLY-ONCE: this message already launched a turn on a live server -> attach to it. No
+    // thread/start, no thread/resume-for-continuation, no second turn/start.
+    if (peer?.attachTurn?.threadId && peer?.attachTurn?.turnId) {
+      const attached = await client.startTurnAndWaitForFinal(turnParams(peer.attachTurn.threadId), {
+        completionTimeoutMs: Number(peer?.replyTimeoutMs) || DEFAULT_TURN_COMPLETION_TIMEOUT_MS,
+        sessionPath: null,
+        attach: { threadId: peer.attachTurn.threadId, turnId: peer.attachTurn.turnId },
+        ...(typeof processing?.observeTurn === "function"
+          ? { onTurnId: ({ turnId, threadId: acceptedThreadId, abort }) => processing.observeTurn({ sessionId: turnId, threadId: acceptedThreadId ?? peer.attachTurn.threadId, abort }) }
+          : {}),
+      });
+      log("info", "Codex app-server wake attached to the turn this message already launched", {
+        msgId: payload.msgId, threadId: peer.attachTurn.threadId, turnId: attached?.turnId ?? peer.attachTurn.turnId,
+      });
+      processing?.completed({ sessionId: attached?.turnId ?? null });
+      peer.threadId = peer.attachTurn.threadId;
+      return attached;
+    }
 
     let threadId = peer?.threadId;
     let seededHere = false;

@@ -38,10 +38,14 @@ else {
 process.on("SIGTERM", () => process.exit(0));
 `;
 
+// A real WebSocket endpoint on the Unix socket, like the App Server's control socket: readiness is
+// proven by a genuine upgrade, so the fake must complete one.
 const FAKE_APP_SERVER = `
-const net = require("node:net");
+const http = require("node:http");
+const { WebSocketServer } = require(${JSON.stringify(path.resolve("node_modules/ws"))});
 const socketPath = process.argv[2];
-const server = net.createServer(() => {});
+const server = http.createServer();
+new WebSocketServer({ server });
 server.listen(socketPath, () => console.log("listening " + socketPath));
 process.on("SIGTERM", () => { server.close(); try { require("node:fs").unlinkSync(socketPath); } catch {} process.exit(0); });
 `;

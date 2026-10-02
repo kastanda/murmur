@@ -572,6 +572,8 @@ export class NatsBroker {
     maxAckAgeMs?: number;
     maxFutureSkewMs?: number;
     onInvalidAck?: (event: InvalidAckEvent) => void;
+    /** A fully VERIFIED duplicate ACK for a message that is already acknowledged (benign). */
+    onDuplicateAck?: (event: InvalidAckEvent) => void;
   }): Promise<BrokerSubscription> {
     await this.connect();
 
@@ -646,6 +648,7 @@ export class NatsBroker {
       maxAckAgeMs?: number;
       maxFutureSkewMs?: number;
       onInvalidAck?: (event: InvalidAckEvent) => void;
+      onDuplicateAck?: (event: InvalidAckEvent) => void;
     },
   ): Promise<void> {
     try {
@@ -679,7 +682,15 @@ export class NatsBroker {
       }
       // 'pending' is in flight too: the peer can acknowledge between publish() and
       // markSent(). Rejecting that ACK leaves the row to time out into a spurious retry.
-      if (record.status !== "sent" && record.status !== "pending") {
+      // A receiver ACKs EVERY delivery of a msgId — including each re-publish of the same logical
+      // message (`duplicate-ignored`). Once the first ACK terminalized the row, a later ACK from
+      // the same peer for the same message is a legitimate duplicate, not an attack: it goes
+      // through the FULL verification below (digest, conversation, peer, window, signature, nonce)
+      // and is then acknowledged as benign. An unverifiable or replayed one is still rejected, and
+      // so is a NACK for an already-acknowledged message.
+      const inFlight = record.status === "sent" || record.status === "pending";
+      const duplicateOfAcked = record.status === "acked" && decoded.status === "ack";
+      if (!inFlight && !duplicateOfAcked) {
         this.invalidAck(params, "message-not-in-flight", decoded);
         return;
       }
@@ -714,6 +725,11 @@ export class NatsBroker {
       }
       if (!(await this.claimAckNonce(params.ackReceipts, decoded.senderAgentId, decoded.nonce))) {
         this.invalidAck(params, "nonce-replay", decoded);
+        return;
+      }
+
+      if (duplicateOfAcked) {
+        params.onDuplicateAck?.({ reason: "duplicate-ack", msgId: decoded.msgId, senderAgentId: decoded.senderAgentId });
         return;
       }
 

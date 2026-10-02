@@ -369,3 +369,37 @@ test("durable reply RECOVERY after a restart never delivers a stored result of a
   assert.equal(recovered.length, 1);
   assert.equal(sent[0].replyToMessageId, OTHER_ROOT);
 });
+
+// ---------------------------------------------------------------------------
+// Restart reconstruction (regression gate for the existing cancellation implementation)
+// ---------------------------------------------------------------------------
+
+test("RESTART after cancellation: a continuation left open (older build / unavailable db at cancel time) is closed by reconcile and never reloaded as open", async () => {
+  const ctx = harness();
+  const handoff = openHandoff(ctx);
+  // an intent exists but the open continuation was never terminalized (the pre-fix leftover)
+  const raw = new DatabaseSync(ctx.db);
+  raw.exec("CREATE TABLE IF NOT EXISTS workflow_control (root_message_id TEXT PRIMARY KEY, state TEXT NOT NULL, requested_at INTEGER NOT NULL, requested_by TEXT NOT NULL)");
+  raw.prepare("INSERT INTO workflow_control VALUES (?, 'cancel_requested', ?, 'operator')").run(ROOT, 1);
+  raw.close();
+  // "daemon restart": a fresh store instance on the same database
+  const restarted = new AgentHandoffStore(ctx.db);
+  assert.equal(restarted.listOpen().length, 1, "before reconcile the leftover is visible as open");
+  assert.equal(restarted.reconcileCancelledContinuations(5), 1);
+  assert.equal(restarted.listOpen().length, 0);
+  assert.equal(restarted.pendingEnqueue().length, 0, "and it is not re-enqueued either");
+  const kept = restarted.get(handoff.handoffMsgId);
+  assert.deepEqual([kept.state, kept.terminalReason], ["terminal", "workflow-cancelled"]);
+  assert.equal(restarted.reconcileCancelledContinuations(6), 0, "idempotent");
+  restarted.close();
+});
+
+test("a cancelled workflow's handoff that was written but never enqueued is not re-enqueued by recovery after a restart; other workflows are", async () => {
+  const ctx = harness();
+  const cancelled = openHandoff(ctx, { root: ROOT, id: "handoff-cancelled-1" });
+  const live = openHandoff(ctx, { root: OTHER_ROOT, id: "handoff-live-0001" });
+  ctx.cancel(ROOT, [cancelled.handoffMsgId]);
+  const restarted = new AgentHandoffStore(ctx.db);
+  assert.deepEqual(restarted.pendingEnqueue().map((h) => h.handoffMsgId), [live.handoffMsgId]);
+  restarted.close();
+});

@@ -147,6 +147,13 @@ export class WakeMonitor {
     this.queue = [];
     this.queuedKeys = new Set();
     this.processing = false;
+    // A request that arrived while a drain was already running; honoured before the drain ends.
+    this.drainAgain = false;
+    // Daemon mode: the broker's receive handler must only DURABLY ACCEPT a message and return.
+    // Running the runtime turn inside it (minutes for a model turn) blocks the receive loop, so
+    // the ACK is not sent until the turn ends, the sender re-publishes the same msgId every
+    // ack-timeout, and the queued duplicates then draw late duplicate ACKs.
+    this.backgroundDrain = options.backgroundDrain === true;
     this.cursor = Number.isFinite(Number(options.initialCursor)) ? Number(options.initialCursor) : 0;
   }
 
@@ -155,11 +162,20 @@ export class WakeMonitor {
     if (this.dispatchStore) {
       this.dispatchStore.enqueue(payload, this.now());
       this.advanceCursor(payload);
-      await this.drain();
+      if (this.backgroundDrain) this.drainInBackground();
+      else await this.drain();
       return;
     }
     this.enqueue(payload);
-    await this.drain();
+    if (this.backgroundDrain) this.drainInBackground();
+    else await this.drain();
+  }
+
+  /** Start (or nudge) the single drain loop without making the caller wait for it. */
+  drainInBackground() {
+    this.drain().catch((error) => {
+      this.log("error", "WakeMonitor background drain failed", { error: error instanceof Error ? error.message : String(error) });
+    });
   }
 
   enqueue(payload) {
@@ -171,29 +187,36 @@ export class WakeMonitor {
   }
 
   async drain() {
-    if (this.processing) return;
+    if (this.processing) {
+      // Work arrived mid-drain: make the running loop take another pass instead of dropping it.
+      this.drainAgain = true;
+      return;
+    }
     this.processing = true;
     try {
-      if (this.dispatchStore) {
+      do {
+        this.drainAgain = false;
+        if (this.dispatchStore) {
+          while (true) {
+            const dispatch = this.dispatchStore.claimDue(this.now());
+            if (!dispatch) break;
+            await this.processPayload(dispatch.payload, dispatch);
+          }
+          continue;
+        }
         while (true) {
-          const dispatch = this.dispatchStore.claimDue(this.now());
-          if (!dispatch) break;
-          await this.processPayload(dispatch.payload, dispatch);
-        }
-        return;
-      }
-      while (true) {
-        while (this.queue.length > 0) {
-          const payload = this.queue.shift();
-          this.queuedKeys.delete(this.keyFor(payload));
-          await this.processPayload(payload);
-        }
+          while (this.queue.length > 0) {
+            const payload = this.queue.shift();
+            this.queuedKeys.delete(this.keyFor(payload));
+            await this.processPayload(payload);
+          }
 
-        if (!this.loadBacklogAfter) break;
-        const backlog = await this.loadBacklogAfter(this.cursor);
-        if (!Array.isArray(backlog) || backlog.length === 0) break;
-        for (const payload of backlog) this.enqueue(payload);
-      }
+          if (!this.loadBacklogAfter) break;
+          const backlog = await this.loadBacklogAfter(this.cursor);
+          if (!Array.isArray(backlog) || backlog.length === 0) break;
+          for (const payload of backlog) this.enqueue(payload);
+        }
+      } while (this.drainAgain);
     } finally {
       this.processing = false;
     }

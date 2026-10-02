@@ -17,7 +17,7 @@
  */
 import { spawn as nodeSpawn } from "node:child_process";
 import { createWriteStream, lstatSync, realpathSync, renameSync, statSync, unlinkSync } from "node:fs";
-import net from "node:net";
+import WebSocket from "ws";
 import path from "node:path";
 import { ensurePrivateDirectory } from "../secure-state.mjs";
 import { codexAppServerCommand } from "./codex.mjs";
@@ -134,16 +134,44 @@ export const probeUnixSocket = (socketPath, timeoutMs = 2_000) =>
       resolve(describe({ ok: false, reason: endpoint.reason }));
       return;
     }
-    // `net.connect` follows the alias, exactly as a real client does.
-    const socket = net.connect({ path: socketPath });
+    // A REAL WebSocket upgrade, exactly as a Murmur Codex client opens its connection (`ws+unix`
+    // follows the alias like any client). A bare `net.connect` that is dropped straight away is
+    // not a protocol-correct client: the App Server logs "Handshake not finished" for every one
+    // of them (995 such warnings were seen from the 5-second status poll alone). The upgrade is
+    // closed politely once it is accepted, so readiness is proven by the real protocol and the
+    // server has nothing to complain about.
+    let socket;
+    let done = false;
     const finish = (result) => {
-      socket.removeAllListeners();
-      socket.destroy();
+      if (done) return;
+      done = true;
+      try { socket?.removeAllListeners(); } catch { /* already gone */ }
+      try {
+        socket?.on("error", () => {});
+        // A completed upgrade is closed politely; a failed one is torn down (nothing to say goodbye to).
+        if (result.ok) socket?.close(1000); else socket?.terminate();
+      } catch { /* already gone */ }
       resolve(describe(result));
     };
-    socket.setTimeout(timeoutMs, () => finish({ ok: false, reason: "socket-timeout" }));
-    socket.once("connect", () => finish({ ok: true, reason: endpoint.alias ? "connected-via-alias" : "connected" }));
-    socket.once("error", (err) => finish({ ok: false, reason: `socket-error:${err.code || err.message}` }));
+    try {
+      socket = new WebSocket(`ws+unix://${socketPath}:/`, { perMessageDeflate: false, handshakeTimeout: timeoutMs });
+    } catch (err) {
+      finish({ ok: false, reason: `socket-error:${err.code || err.message}` });
+      return;
+    }
+    const timer = setTimeout(() => finish({ ok: false, reason: "socket-timeout" }), timeoutMs + 500);
+    timer.unref?.();
+    socket.once("open", () => {
+      clearTimeout(timer);
+      finish({ ok: true, reason: endpoint.alias ? "connected-via-alias" : "connected" });
+    });
+    socket.once("error", (err) => {
+      clearTimeout(timer);
+      // A listener that accepts the connection but never completes the upgrade is not a ready
+      // App Server, whatever it is.
+      const handshake = /handshake|Unexpected server response|socket hang up/i.test(err.message || "");
+      finish({ ok: false, reason: handshake ? "socket-handshake-failed" : `socket-error:${err.code || err.message}` });
+    });
   });
 
 /** Readiness marker emitted by `murmur-daemon.mjs` structured logging. */

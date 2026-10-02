@@ -85,6 +85,7 @@ import {
 } from "./runstate.mjs";
 import { enqueueRootTask, findRejectedCandidates, rootWorkflowCancelledAt, waitForCorrelatedReply } from "./send.mjs";
 import { lowLimitWarnings } from "./usage.mjs";
+import { classifyRuntimeOutput, OUTPUT_KINDS } from "../runtime-output.mjs";
 import { collectStatus } from "./status.mjs";
 import { CODEX_APP_SERVER_CHILD, cleanupRuntimeArtifacts, reapOrphanedChildren } from "./supervisor.mjs";
 
@@ -1300,10 +1301,22 @@ const commandSend = async ({ args, flags }) => {
     }
     return 3;
   }
+  // A correlated reply is not automatically an ANSWER: an empty text or a bare tool/delegation
+  // intent must never satisfy a caller (and never a required independent review).
+  const verdict = classifyRuntimeOutput({ text: reply.text });
+  if (verdict.kind !== OUTPUT_KINDS.text) {
+    if (flags.json) {
+      sendResult({ ok: false, reason: "non-substantive-reply", kind: verdict.kind, msgId: sent.msgId, conversationId: sent.conversationId, replyMsgId: reply.msgId });
+    } else {
+      err(`murmur: the correlated reply is not substantive (${verdict.kind}); it does not count as a result (msgId ${sent.msgId}).`);
+    }
+    return 3;
+  }
   if (flags.json) {
     sendResult({
       ok: true,
       waited: true,
+      substantive: true,
       msgId: sent.msgId,
       conversationId: sent.conversationId,
       replyMsgId: reply.msgId,

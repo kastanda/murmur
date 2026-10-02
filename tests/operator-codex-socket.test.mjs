@@ -14,7 +14,9 @@ import { spawn } from "node:child_process";
 import {
   existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync,
 } from "node:fs";
+import http from "node:http";
 import net from "node:net";
+import { WebSocketServer } from "ws";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -63,12 +65,21 @@ const setup = async () => {
 
 /** A real listening Unix socket, at `target`. */
 const listenAt = async (target) => {
-  const server = net.createServer(() => {});
+  // A real WebSocket endpoint, like the App Server's control socket; it counts upgrades and
+  // protocol errors so a probe's behaviour is observable.
+  const server = http.createServer();
+  const wss = new WebSocketServer({ server });
+  const stats = { upgrades: 0, clientErrors: 0 };
+  wss.on("connection", () => { stats.upgrades += 1; });
+  server.on("clientError", (_err, socket) => { stats.clientErrors += 1; socket.destroy(); });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(target, resolve);
   });
-  return { server, close: () => new Promise((resolve) => server.close(resolve)) };
+  return {
+    server, stats,
+    close: () => new Promise((resolve) => { wss.close(); server.closeAllConnections?.(); server.close(resolve); }),
+  };
 };
 
 /** Exactly the live shape: `run/codex.sock -> <external>/<hash>`, target a live socket. */
@@ -450,6 +461,62 @@ test("K. `murmur status` on the real alias shape no longer fails with invalid-pr
     assert.match(doctor.stdout, /codex-socket\s+owned by the running supervisor \(socket alias\)/);
   } finally {
     await alias?.listener.close();
+    ctx.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Health polling must be a protocol-correct client (no "Handshake not finished" spam)
+// ---------------------------------------------------------------------------
+
+test("the readiness probe performs a REAL WebSocket upgrade and leaves no incomplete handshake behind", async () => {
+  const ctx = await setup();
+  let listener;
+  try {
+    listener = await listenAt(ctx.paths.codexSocket);
+    for (let i = 0; i < 5; i += 1) {
+      const probe = await probeUnixSocket(ctx.paths.codexSocket);
+      assert.equal(probe.ok, true, probe.reason);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(listener.stats.upgrades, 5, "every probe completed a genuine upgrade");
+    assert.equal(listener.stats.clientErrors, 0, "no probe dropped an incomplete handshake on the server");
+  } finally {
+    await listener?.close();
+    ctx.cleanup();
+  }
+});
+
+test("a listener that accepts connections but never completes the WebSocket upgrade is NOT ready", async () => {
+  const ctx = await setup();
+  let raw;
+  let rawSockets;
+  try {
+    rawSockets = new Set();
+    raw = net.createServer((socket) => { rawSockets.add(socket); socket.on("error", () => {}); });
+    await new Promise((resolve) => raw.listen(ctx.paths.codexSocket, resolve));
+    const probe = await probeUnixSocket(ctx.paths.codexSocket, 300);
+    assert.equal(probe.ok, false);
+    assert.match(probe.reason, /^socket-(handshake-failed|timeout)$/);
+  } finally {
+    for (const socket of rawSockets ?? []) socket.destroy();
+    await new Promise((resolve) => (raw ? raw.close(() => resolve()) : resolve()));
+    ctx.cleanup();
+  }
+});
+
+test("status polling (collectStatus) probes with the real upgrade too", async () => {
+  const ctx = await setup();
+  let listener;
+  try {
+    listener = await listenAt(ctx.paths.codexSocket);
+    const project = await loadProfile(ctx.paths);
+    await collectStatus({ project, paths: ctx.paths, includeNats: false });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(listener.stats.clientErrors, 0);
+    assert.ok(listener.stats.upgrades >= 1);
+  } finally {
+    await listener?.close();
     ctx.cleanup();
   }
 });

@@ -1,4 +1,5 @@
 import { IGNORED_DUE_TO_CANCELLED_WORKFLOW } from "./workflow-control.mjs";
+import { RuntimeTurnStore } from "./runtime-turn-store.mjs";
 import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { HANDOFF_REASONS } from "@murmurv2/core";
@@ -137,10 +138,13 @@ export class CodexAppServerRuntimeAdapter {
     interruptTurn = null,
     // Display-only record of what the App Server reported running; best-effort.
     recordEffective = null,
+    // Durable "which thread/turn runs this message" (exactly-once across retries and restarts).
+    turnStore = null,
     readServerIdentity = unixSocketIdentity, threadStore = new CodexConversationThreadStore() }) {
     if (typeof injector !== "function") throw new Error("codex-app-server-adapter-injector-required");
     Object.assign(this, { bindingStore, dispatchStore, agentId, projectId, peer, injector, sendReply,
       now, heartbeatIntervalMs, retryDelayMs, log, handoff, modelPolicy, interruptTurn, recordEffective, readServerIdentity, threadStore });
+    this.turnStore = turnStore ?? new RuntimeTurnStore(dispatchStore.db);
     this.runtimeKind = CODEX_APP_SERVER_KIND;
     this.memberSlot = CODEX_APP_SERVER_MEMBER_SLOT;
     this.capabilities = RUNTIME_CAPABILITIES[this.runtimeKind];
@@ -267,6 +271,21 @@ export class CodexAppServerRuntimeAdapter {
         // NOT `started`: Codex has no processing-started receipt (see RUNTIME_CAPABILITIES).
         observeTurn: ({ sessionId, threadId, abort = null }) => {
           this.activeTurn = { threadId: threadId ?? null, turnId: sessionId ?? null, abort };
+          if (threadId && sessionId) {
+            try {
+              this.turnStore.recordLaunched(identity, { runtimeKind: this.runtimeKind, threadId, turnId: sessionId, serverIdentity: this.serverIdentity }, this.now());
+            } catch (error) {
+              this.log("warn", "Could not persist the launched Codex turn", { error: error instanceof Error ? error.message : String(error) });
+            }
+          }
+        },
+        observeSeed: ({ threadId }) => {
+          if (!threadId) return;
+          try {
+            this.turnStore.recordSeeded(identity, { runtimeKind: this.runtimeKind, threadId, serverIdentity: this.serverIdentity }, this.now());
+          } catch (error) {
+            this.log("warn", "Could not persist the seeded Codex thread", { error: error instanceof Error ? error.message : String(error) });
+          }
         },
         completed: () => {
           if (!this.bindingStore.validateFence(fence, identity)) return { accepted: false, reason: "stale-runtime-fence" };
@@ -291,6 +310,24 @@ export class CodexAppServerRuntimeAdapter {
         : payload;
       const runtimePeer = { ...this.peer, ...(existingSession ? { threadId: existingSession.threadId } : {}) };
       if (!existingSession) delete runtimePeer.threadId;
+      // EXACTLY-ONCE. If an earlier attempt of THIS message already created a thread / launched a
+      // turn on the SAME App Server, this attempt must not create another: it reuses the thread,
+      // or attaches to the launched turn. Only when that server is gone is the old turn abandoned.
+      const prior = this.turnStore.get(identity);
+      if (prior && prior.state !== "finished" && prior.state !== "abandoned") {
+        if (prior.serverIdentity === this.serverIdentity && prior.threadId) {
+          runtimePeer.threadId = prior.threadId;
+          if (prior.state === "launched" && prior.turnId) runtimePeer.attachTurn = { threadId: prior.threadId, turnId: prior.turnId };
+        } else {
+          this.turnStore.markAbandoned(identity, this.now());
+          this.log("warn", "Previous Codex thread/turn of this message belonged to a server that is gone; starting fresh", {
+            msgId: identity.msgId, previousState: prior.state,
+          });
+        }
+      }
+      // A review/analysis turn legitimately takes minutes; the wait is not the execution, and a
+      // retry attaches rather than re-running, so a generous default is safe.
+      if (!runtimePeer.replyTimeoutMs) runtimePeer.replyTimeoutMs = 900_000;
       runtimePeer.mode = "codex_app_server";
       let policy = { model: null, effort: null };
       if (typeof this.modelPolicy === "function") {
@@ -340,7 +377,7 @@ export class CodexAppServerRuntimeAdapter {
           observedAt: new Date(this.now()).toISOString(),
         })).catch(() => {});
       }
-      return await settleRuntimeTurn({
+      const settled = await settleRuntimeTurn({
         runtimeKind: this.runtimeKind,
         dispatchStore: this.dispatchStore,
         bindingStore: this.bindingStore,
@@ -362,8 +399,16 @@ export class CodexAppServerRuntimeAdapter {
         log: this.log,
         now: this.now,
       });
+      // Only a SETTLED result retires the record. If settlement rejected the output (empty / tool
+      // intent) the record stays `launched`, so a retry ATTACHES to the same turn instead of
+      // starting another one for the same msgId.
+      this.turnStore.markFinished(identity, this.now());
+      return settled;
     } catch (error) {
       const failure = asError(error);
+      // The recorded thread no longer exists on this server: that turn is gone for good, so the
+      // retry may start fresh (otherwise it would attach to nothing forever).
+      if (/thread not found|no rollout found/i.test(failure.message)) this.turnStore.markAbandoned(identity, this.now());
       this.refreshServerGeneration();
       if (this.bindingStore.validateFence(fence, identity)) {
         if (handedOff && !failure.outcomeUnknown) this.dispatchStore.recordProcessingReceipt({ ...attempt, status: "failed", errorMessage: failure.message }, this.now());

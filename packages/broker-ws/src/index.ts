@@ -409,7 +409,14 @@ export class WebSocketBroker {
       reject("unknown-message", ack.senderAgentId, ack.msgId);
       return;
     }
-    if (record.status !== "sent" && record.status !== "pending") {
+    // See broker-nats: a verified duplicate ACK of an already-acknowledged message is benign.
+    // A duplicate additionally REQUIRES the replay protections the in-flight path may skip: a durable
+    // nonce store and an in-window timestamp. Without them it is rejected exactly as before.
+    const atMs = Date.parse(ack.at);
+    const fresh = Number.isFinite(atMs) && atMs >= Date.now() - 5 * 60_000 && atMs <= Date.now() + 30_000;
+    const inFlight = record.status === "sent" || record.status === "pending";
+    const duplicateOfAcked = record.status === "acked" && ack.status === "ack" && fresh && Boolean(sub.ackReceipts);
+    if (!inFlight && !duplicateOfAcked) {
       reject("message-not-in-flight", ack.senderAgentId, ack.msgId);
       return;
     }
@@ -443,6 +450,8 @@ export class WebSocketBroker {
       reject("nonce-replay", ack.senderAgentId, ack.msgId);
       return;
     }
+
+    if (duplicateOfAcked) return;
 
     const result = await sub.outbox.applyAckTransition(
       ack.msgId,

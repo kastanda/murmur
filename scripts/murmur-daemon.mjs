@@ -907,6 +907,8 @@ if (activeRuntimeAdapter && handoffCoordinator) {
 
 const wakeMonitor = new WakeMonitor({
   ...wakeConfig,
+  // The receive handler durably accepts and returns; the turn runs from the dispatch queue.
+  backgroundDrain: true,
   initialCursor: inboundCursor(),
   loadBacklogAfter: loadInboundAfter,
   dispatchStore: wakeDispatchStore,
@@ -1076,6 +1078,8 @@ const flushLoop = async () => {
     try {
       wakeMonitor.reconcileProcessingAttempts();
       runtimeBindingStore?.reconcileStale({ processingStartedTtlMs });
+      // A cancelled workflow's continuations are never open (also after a restart).
+      handoffController?.store.reconcileCancelledContinuations();
       await runtimeRegistry.recoverCompletedReplies();
       if (handoffController) await handoffController.recoverPendingEnqueues();
       await wakeMonitor.drain();
@@ -1171,6 +1175,7 @@ try {
     requireSignedAcks,
     maxAckAgeMs,
     onInvalidAck: (event) => log("warn", "Invalid ACK rejected", event),
+    onDuplicateAck: (event) => log("info", "Duplicate delivery ACK ignored (message already acknowledged)", event),
   });
   log("info", "ACK correlation started", {
     ackSubject: `ack.${agentId}`,

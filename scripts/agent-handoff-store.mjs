@@ -318,6 +318,21 @@ export class AgentHandoffStore {
    * continuation write and the enqueue). Re-enqueue is safe: the outbox is keyed by
    * msgId, and the handoff msgId is stable.
    */
+  /**
+   * Idempotent self-heal: any continuation still `open` whose root workflow has a durable cancel
+   * intent can never be resumed, so it becomes terminal (`workflow-cancelled`) — the row is kept.
+   * Covers a cancel recorded by an older build, a database that was unavailable at cancel time,
+   * and a daemon restart: a cancelled continuation is never reloaded as open.
+   */
+  reconcileCancelledContinuations(now = Date.now()) {
+    return Number(this.db.prepare(`
+      UPDATE agent_handoffs
+         SET state = 'terminal', terminal_reason = ?, closed_at = ?
+       WHERE state = 'open'
+         AND root_message_id IN (SELECT root_message_id FROM workflow_control)
+    `).run(WORKFLOW_CANCELLED_REASON, now).changes);
+  }
+
   pendingEnqueue() {
     return this.db.prepare(`
       SELECT * FROM agent_handoffs WHERE state = 'open' AND enqueued_at IS NULL

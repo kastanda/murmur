@@ -4,6 +4,7 @@ import { HANDOFF_REASONS } from "@murmurv2/core";
 import { settleRuntimeTurn } from "./agent-handoff-runtime.mjs";
 import { extractCanonicalModel } from "./claude-capabilities.mjs";
 import { writePrivateJson } from "./secure-state.mjs";
+import { OUTPUT_KINDS, RuntimeOutputError, classifyRuntimeOutput, safeDiagnostics } from "./runtime-output.mjs";
 import { IGNORED_DUE_TO_CANCELLED_WORKFLOW } from "./workflow-control.mjs";
 
 export const CLAUDE_ONE_SHOT_KIND = "claude_one_shot";
@@ -115,7 +116,18 @@ export function runClaudeOneShot({
         const parsed = JSON.parse(stdout);
         const resultText = typeof parsed.result === "string" ? parsed.result : null;
         const confirmedSessionId = parsed.session_id || parsed.sessionId;
-        if (!resultText || !confirmedSessionId) throw new Error("claude-one-shot-result-invalid");
+        if (!confirmedSessionId) throw new Error("claude-one-shot-result-invalid");
+        // A process that exits 0 has not necessarily answered. Classify BEFORE anything can treat
+        // the text as a result: `is_error` (an API error sentence as "result"), empty output and a
+        // tool-use stop each get an explicit failure with bounded, redacted diagnostics.
+        const verdict = classifyRuntimeOutput({ text: resultText, stopReason: parsed.stop_reason ?? null, isError: parsed.is_error === true });
+        if (verdict.kind !== OUTPUT_KINDS.text && verdict.kind !== OUTPUT_KINDS.handoff) {
+          throw new RuntimeOutputError("claude-one-shot", verdict.kind, verdict.reason, safeDiagnostics({
+            exit: code, subtype: parsed.subtype, stop: parsed.stop_reason, terminal: parsed.terminal_reason,
+            api: parsed.api_error_status, turns: parsed.num_turns, ms: parsed.duration_ms,
+            stderr: stderr.trim().slice(0, 200),
+          }));
+        }
         resolve({ text: resultText, sessionId: confirmedSessionId, raw: parsed });
       } catch (error) {
         reject(asError(error));

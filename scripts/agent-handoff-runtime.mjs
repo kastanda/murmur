@@ -14,6 +14,7 @@
  */
 import { HANDOFF_REASONS } from "@murmurv2/core";
 import { HandoffRejection, composeContinuationPrompt } from "./agent-handoff-controller.mjs";
+import { OUTPUT_KINDS, RuntimeOutputError, classifyRuntimeOutput } from "./runtime-output.mjs";
 import {
   IGNORED_DUE_TO_CANCELLED_WORKFLOW, WORKFLOW_CANCELLED_REASON, isWorkflowCancelRequested,
 } from "./workflow-control.mjs";
@@ -332,6 +333,14 @@ export const settleRuntimeTurn = async ({
     if (!bindingStore.validateFence(fence, identity)) return { status: "late-result-dropped" };
     if (bindingStore.markIdle(fence, now()) !== 1) return { status: "late-result-dropped" };
     return { status: "completed-cancelled-workflow", attemptId: attempt.attemptId, reply: null };
+  }
+
+  // NOTHING non-substantive may become a result. An empty output, or a delegation/tool intent that
+  // is not the exact control frame (e.g. fenced), is a runtime FAILURE: it is never relayed to the
+  // delegator or the root as an answer, and the dispatch retry budget then ends in a clear reason.
+  const verdict = classifyRuntimeOutput({ text: resultText });
+  if (verdict.kind === OUTPUT_KINDS.empty || verdict.kind === OUTPUT_KINDS.toolIntentOnly) {
+    throw new RuntimeOutputError(runtimeKind, verdict.kind, verdict.reason, { msgId: payload?.msgId ? String(payload.msgId).slice(0, 12) : null });
   }
 
   const action = coordinator && turn ? coordinator.classifyTerminal(resultText) : { kind: "none" };
