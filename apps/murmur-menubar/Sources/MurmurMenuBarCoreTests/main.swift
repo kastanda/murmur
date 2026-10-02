@@ -877,6 +877,332 @@ await test("the app never edits a model preference file itself — every write i
     await expect(offenders.isEmpty, offenders.joined(separator: "\n"))
 }
 
+// MARK: - Active work
+
+suite("Active work")
+
+/// A fixed "now" so elapsed/reset rendering is deterministic.
+let workNow = WorkMenu.parseISO("2026-10-03T12:00:00.000Z")!
+
+func decodeTasks(_ json: String) async throws -> WorkSnapshot {
+    try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(json) }).tasks(project: "murmur")
+}
+
+await test("argv for the work commands is direct and has no project-wide stop in it") {
+    let cli = MurmurCLI(executable: "/opt/homebrew/bin/murmur", runner: FakeRunner { _ in ok("") })
+    await expectEqual(cli.tasksInvocation(project: "murmur").arguments, ["tasks", "murmur", "--json"])
+    await expectEqual(cli.taskInvocation(project: "murmur", workflowId: "root-aaaaaaaa-0001").arguments, ["task", "murmur", "root-aaaaaaaa-0001", "--json"])
+    let cancel = cli.cancelInvocation(project: "murmur", workflowId: "root-aaaaaaaa-0001")
+    await expectEqual(cancel.arguments, ["cancel", "murmur", "root-aaaaaaaa-0001", "--json"])
+    await expect(!cancel.arguments.contains("stop") && !cancel.arguments.contains("-c"))
+    await expectEqual(cli.usageInvocation(project: "murmur", refresh: false).arguments, ["usage", "murmur", "--json"])
+    await expectEqual(cli.usageInvocation(project: "murmur", refresh: true).arguments, ["usage", "murmur", "--json", "--refresh"])
+}
+
+await test("zero active tasks: «Активные задачи: нет», no queued line") {
+    let snapshot = try await decodeTasks(tasksEmptyJSON)
+    await expectEqual(WorkMenu.activeSummary(snapshot.summary), "Активные задачи: нет")
+    await expectEqual(WorkMenu.queuedSummary(snapshot.summary), nil)
+    await expect(isRussian(L.noActiveTasks))
+}
+
+await test("two active root tasks and one queued: the counts are of ROOT tasks, queued is separate") {
+    let snapshot = try await decodeTasks(tasksActiveJSON)
+    await expectEqual(WorkMenu.activeSummary(snapshot.summary), "Активные задачи: 2")
+    await expectEqual(WorkMenu.queuedSummary(snapshot.summary), "В очереди: 1")
+    await expectEqual(snapshot.tasks.count, 3)
+    await expectEqual(snapshot.recent.count, 1)
+}
+
+await test("a Claude→Codex→Cursor chain is ONE active task, not three") {
+    let snapshot = try await decodeTasks(tasksWaitingJSON)
+    await expectEqual(WorkMenu.activeSummary(snapshot.summary), "Активные задачи: 1")
+    await expectEqual(snapshot.tasks[0].chain.count, 3)
+    await expectEqual(WorkMenu.chainText(snapshot.tasks[0].chain), "Пользователь → Claude\nClaude → Codex\nCodex → Cursor")
+}
+
+await test("a task row names the agent who is working NOW, the stage and the elapsed time; the chain is separate") {
+    let snapshot = try await decodeTasks(tasksActiveJSON)
+    let row = WorkMenu.row(snapshot.tasks[0], now: workNow)
+    await expectEqual(row.title, "Исправить provisioning")
+    await expectEqual(row.detailLine, "Codex · Review · 2м 14с")
+    await expectEqual(row.chainLine, "Claude → Codex")
+    let single = WorkMenu.row(snapshot.tasks[1], now: workNow)
+    await expectEqual(single.detailLine, "Claude · Обработка запроса · 48с")
+    await expectEqual(single.chainLine, nil, "a one-hop task has no chain line")
+}
+
+await test("a queued task reads «В очереди · 12с»; a task being cancelled reads «Отмена запрошена»") {
+    let snapshot = try await decodeTasks(tasksActiveJSON)
+    await expectEqual(WorkMenu.row(snapshot.tasks[2], now: workNow).detailLine, "В очереди · 12с")
+    let cancelling = try await decodeTasks(tasksCancelRequestedJSON)
+    await expect(WorkMenu.row(cancelling.tasks[0], now: workNow).detailLine.hasPrefix("Отмена запрошена"))
+    await expect(WorkMenu.statusLabel("cancel_requested") != WorkMenu.statusLabel("cancelled"), "requested and done are distinct words")
+    await expectEqual(WorkMenu.statusLabel("cancelled"), "Отменено")
+}
+
+await test("waiting parent/child: the CHILD is the current agent and the state is waiting, not running") {
+    let snapshot = try await decodeTasks(tasksWaitingJSON)
+    let task = snapshot.tasks[0]
+    await expectEqual(task.status, "waiting")
+    await expectEqual(task.currentAgent, "codex")
+    await expectEqual(WorkMenu.row(task, now: workNow).detailLine, "Codex · Ожидание ответа codex · 2м 00с")
+    await expectEqual(WorkMenu.statusLabel("waiting", stalled: true), "Ожидание (исполнитель не отвечает)")
+}
+
+await test("elapsed time formats as 42с / 2м 14с / 1ч 07м and is computed from the timestamp at render time") {
+    await expectEqual(WorkMenu.elapsed(42_000), "42с")
+    await expectEqual(WorkMenu.elapsed(134_000), "2м 14с")
+    await expectEqual(WorkMenu.elapsed(3_620_000), "1ч 00м")
+    await expectEqual(WorkMenu.elapsed(4_020_000), "1ч 07м")
+    await expectEqual(WorkMenu.elapsed(nil), "—")
+    let task = WorkTask(workflowId: "root-xxxxxxxx-0001", status: "running", submittedAt: "2026-10-03T11:59:00.000Z", elapsedMs: 1, requestSummary: "t")
+    await expectEqual(WorkMenu.elapsed(for: task, now: workNow), "1м 00с", "ticks on the local clock between polls")
+    let later = WorkMenu.parseISO("2026-10-03T12:00:30.000Z")!
+    await expectEqual(WorkMenu.elapsed(for: task, now: later), "1м 30с")
+    let done = WorkTask(workflowId: "root-xxxxxxxx-0002", status: "completed", submittedAt: "2026-10-03T11:00:00.000Z", elapsedMs: 9_000, requestSummary: "t")
+    await expectEqual(WorkMenu.elapsed(for: done, now: later), "9с", "a finished task stops counting")
+}
+
+await test("the request text shown is exactly what the CLI already redacted — the app never un-redacts or re-reads it") {
+    let json = """
+    {"project":"murmur","observedAt":"2026-10-03T12:00:00.000Z","summary":{"active":1,"queued":0},
+     "tasks":[{"workflowId":"root-ffffffff-0006","status":"running","stalled":false,"submittedAt":"2026-10-03T11:59:00.000Z",
+       "elapsedMs":1000,"requestSummary":"Deploy with api_key=<redacted> and <key-redacted>","currentAgent":"claude",
+       "currentStage":"Обработка запроса","chain":[{"from":"root","to":"claude"}],"cancellable":true}],"recent":[]}
+    """
+    let snapshot = try await decodeTasks(json)
+    await expect(WorkMenu.row(snapshot.tasks[0], now: workNow).title.contains("<redacted>"))
+}
+
+await test("refresh polls tasks with the status poll and shows them; switching project clears them at once") {
+    let runner = healthyRunner()
+    let controller = await makeController(runner: runner)
+    await controller.refresh()
+    await expectEqual(await controller.workSnapshot?.summary.active, 2)
+    await expect(runner.invocations.contains { $0.arguments == ["tasks", "/Users/x/Projects/murmur", "--json"] })
+    await controller.selectProject("other-aaaaaaaaaaaa")
+    await expectNil(await controller.workSnapshot, "the old project's tasks must not show for the new selection")
+    await expectNil(await controller.usageReport)
+}
+
+await test("task selection loads the detail: bounded request and the correlated final result") {
+    let controller = await makeController(runner: healthyRunner())
+    await controller.refresh()
+    let detail = await controller.taskDetail("root-aaaaaaaa-0001")
+    await expectEqual(detail?.request, "Ответь точно: OK")
+    await expectEqual(detail?.result, "OK")
+    await expectEqual(detail?.task.status, "completed")
+}
+
+// MARK: cancellation
+
+suite("Per-task cancellation")
+
+func cancelRunner(_ cancelOutcome: CommandOutcome) -> FakeRunner {
+    FakeRunner { invocation in
+        switch invocation.arguments.first {
+        case "projects": return ok(projectsJSON)
+        case "status": return ok(healthyStatusJSON)
+        case "notify": return ok(notifyJSON)
+        case "tasks": return ok(tasksActiveJSON)
+        case "cancel": return cancelOutcome
+        default: return ok("")
+        }
+    }
+}
+
+await test("cancelling sends exactly that workflow's cancel argv — no stop, no other task") {
+    let runner = cancelRunner(ok(cancelOkJSON))
+    let controller = await makeController(runner: runner)
+    await controller.refresh()
+    let outcome = await controller.cancelTask("root-aaaaaaaa-0001")
+    await expectEqual(outcome, .accepted(status: "cancel_requested"))
+    let cancels = runner.invocations.filter { $0.arguments.first == "cancel" }
+    await expectEqual(cancels.map(\.arguments), [["cancel", "/Users/x/Projects/murmur", "root-aaaaaaaa-0001", "--json"]])
+    await expect(!runner.invocations.contains { $0.arguments.first == "stop" }, "cancelling never stops the project")
+}
+
+await test("a queued task cancels straight to «cancelled»; the outcome carries the real status") {
+    let controller = await makeController(runner: cancelRunner(ok(cancelDoneJSON)))
+    await controller.refresh()
+    await expectEqual(await controller.cancelTask("root-cccccccc-0003"), .accepted(status: "cancelled"))
+}
+
+await test("cancelling a finished task is reported as already finished, an unknown one as unknown") {
+    let terminal = await makeController(runner: cancelRunner(CommandOutcome(exitCode: 4, stdout: cancelTerminalJSON, stderr: "")))
+    await terminal.refresh()
+    await expectEqual(await terminal.cancelTask("root-dddddddd-0004"), .alreadyFinished)
+    let unknown = await makeController(runner: cancelRunner(CommandOutcome(exitCode: 2, stdout: cancelUnknownJSON, stderr: "")))
+    await unknown.refresh()
+    await expectEqual(await unknown.cancelTask("root-zzzzzzzz-0009"), .unknown)
+}
+
+await test("a failed cancel command surfaces as a Russian failure, not a silent success") {
+    let controller = await makeController(runner: cancelRunner(CommandOutcome(exitCode: 1, stdout: "", stderr: "murmur: cancel-not-recorded")))
+    await controller.refresh()
+    if case let .failed(message) = await controller.cancelTask("root-aaaaaaaa-0001") {
+        await expect(message.range(of: "[А-Яа-я]", options: .regularExpression) != nil, message)
+    } else {
+        await expect(false, "expected a failure")
+    }
+}
+
+await test("while the cancel command runs the task is «отмена…», not cancelled; a second cancel of the same task is refused") {
+    let runner = cancelRunner(ok(cancelOkJSON))
+    runner.gate = { @Sendable in try? await Task.sleep(nanoseconds: 150_000_000) }
+    let controller = await makeController(runner: runner)
+    await controller.refresh()
+    let first = Task { await controller.cancelTask("root-aaaaaaaa-0001") }
+    try? await Task.sleep(nanoseconds: 30_000_000)
+    await expect(await controller.cancellingTasks.contains("root-aaaaaaaa-0001"))
+    let second = await controller.cancelTask("root-aaaaaaaa-0001")
+    await expectEqual(second, .failed(L.taskCancelling))
+    _ = await first.value
+    await expect(await !controller.cancellingTasks.contains("root-aaaaaaaa-0001"))
+    await expect(isRussian(L.taskCancelling))
+}
+
+await test("cancel works while a submitted task is still waiting for its reply, but not during start/stop or a config change") {
+    let runner = healthyRunner()
+    runner.gate = { @Sendable in try? await Task.sleep(nanoseconds: 120_000_000) }
+    let controller = await makeController(runner: runner)
+    await controller.refresh()
+    await controller.start()
+    try? await Task.sleep(nanoseconds: 20_000_000)
+    await expect(await controller.isBusy)
+    await expectEqual(await controller.cancelTask("root-aaaaaaaa-0001"), .failed(L.busy), "a lifecycle command in flight blocks the cancel")
+    try? await Task.sleep(nanoseconds: 400_000_000)
+}
+
+await test("the confirmation wording says it stops ONLY that task, and avoids «Остановить»") {
+    await expectEqual(L.cancelConfirmTitle, "Отменить эту задачу?")
+    await expect(L.cancelConfirmMessage.contains("только выбранную задачу"))
+    await expect(L.cancelConfirmMessage.contains("Остальные задачи и Murmur продолжат работу"))
+    await expectEqual(L.taskCancel, "Отменить задачу")
+    await expect(!L.taskCancel.contains("Остановить") && !L.cancelConfirmMessage.contains("Остановить"))
+    for text in [L.cancelConfirmTitle, L.cancelConfirmMessage, L.taskCancel, L.cancelConfirmKeep, L.cancelledBySystem, L.cancelAlreadyFinished] {
+        await expect(isRussian(text), text)
+    }
+}
+
+await test("a cancelled `send` is shown as a SYSTEM result, not as an answer from an agent") {
+    let result = SendResult(ok: false, reason: "cancelled", detail: nil, msgId: "root-aaaaaaaa-0001", replyMsgId: nil, text: nil, timeoutSeconds: nil)
+    await expectEqual(describeSendFailure(result), "Задача отменена пользователем.")
+}
+
+// MARK: - Provider limits
+
+suite("Provider limits")
+
+func decodeUsage(_ json: String) async throws -> UsageReport {
+    try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(json) }).usage(project: "murmur")
+}
+
+await test("a provider with a percentage and a reset shows both, with a dot and always the text") {
+    let report = try await decodeUsage(usageJSON)
+    let claude = report.providers["claude"]!
+    let moscow = TimeZone(identifier: "Europe/Moscow")!
+    let lines = WorkMenu.usageLines(name: "claude", usage: claude, now: workNow, timeZone: moscow)
+    await expectEqual(lines, [
+        "Claude",
+        "5 часов: 🟢 64% осталось", "  Сброс через 2ч 18м",
+        "Неделя: 🟢 38% осталось", "  Сброс 6 октября, 03:00",
+    ])
+}
+
+await test("multiple windows are shown separately — never collapsed into one percentage") {
+    let report = try await decodeUsage(usageJSON)
+    let lines = WorkMenu.usageLines(name: "claude", usage: report.providers["claude"]!, now: workNow)
+    await expectEqual(lines.filter { $0.contains("осталось") }.count, 2)
+    await expect(lines.contains { $0.hasPrefix("5 часов") } && lines.contains { $0.hasPrefix("Неделя") })
+}
+
+await test("a missing reset time is simply omitted — nothing is invented") {
+    let report = try await decodeUsage(usageJSON)
+    let lines = WorkMenu.usageLines(name: "codex", usage: report.providers["codex"]!, now: workNow)
+    await expectEqual(lines, ["Codex", "Неделя: 🟡 18% осталось"])
+    await expect(!lines.joined().contains("Сброс"))
+}
+
+await test("thresholds: >25 green, 10–25 yellow, <10 red") {
+    await expectEqual(WorkMenu.level(remaining: 64), .green)
+    await expectEqual(WorkMenu.level(remaining: 26), .green)
+    await expectEqual(WorkMenu.level(remaining: 25), .yellow)
+    await expectEqual(WorkMenu.level(remaining: 10), .yellow)
+    await expectEqual(WorkMenu.level(remaining: 9.9), .red)
+    await expectEqual(WorkMenu.level(remaining: 0), .red)
+}
+
+await test("an unavailable provider says so — Cursor shows «Данные недоступны», never a number") {
+    let report = try await decodeUsage(usageJSON)
+    await expectEqual(WorkMenu.usageLines(name: "cursor", usage: report.providers["cursor"]!, now: workNow), ["Cursor", "Данные недоступны"])
+    await expect(isRussian(L.usageUnavailable))
+}
+
+await test("stale data says «Данные устарели» and is NOT coloured green") {
+    let report = try await decodeUsage(usageStaleJSON)
+    let lines = WorkMenu.usageLines(name: "claude", usage: report.providers["claude"]!, now: workNow)
+    await expect(lines.contains("Данные устарели"))
+    await expect(!lines.joined().contains("🟢") && !lines.joined().contains("🟡") && !lines.joined().contains("🔴"), "no colour for stale numbers")
+}
+
+await test("an API rate limit is labelled as such and never presented as the account limit or coloured as quota") {
+    let report = try await decodeUsage(usageLowJSON)
+    let lines = WorkMenu.usageLines(name: "codex", usage: report.providers["codex"]!, now: workNow)
+    await expect(lines.contains("Лимиты API (не лимит аккаунта)"))
+    await expect(!lines.joined().contains("🔴"))
+    await expect(WorkMenu.lowLimitWarnings(report).allSatisfy { !$0.contains("Codex") }, "an API rate limit never triggers the account low-limit warning")
+}
+
+await test("low-limit warning: only a fresh subscription window under 10%, passive wording, never for stale data") {
+    let low = try await decodeUsage(usageLowJSON)
+    await expectEqual(WorkMenu.lowLimitWarnings(low), ["Claude: осталось 7% текущего лимита. Задача может не завершиться до сброса."])
+    await expectEqual(WorkMenu.lowLimitWarnings(try await decodeUsage(usageJSON)), [])
+    await expectEqual(WorkMenu.lowLimitWarnings(try await decodeUsage(usageStaleJSON)), [], "a stale 5% figure raises no alarm")
+    await expectEqual(WorkMenu.lowLimitWarnings(nil), [])
+    for text in [L.sendAnyway, L.lowLimitTitle, L.refreshLimits, L.limits] { await expect(isRussian(text), text) }
+}
+
+await test("limits are read on a SLOW cadence: a second poll inside the interval does not call `usage` again") {
+    let runner = healthyRunner()
+    let controller = await makeController(runner: runner)
+    await controller.refresh()
+    await controller.refresh()
+    await controller.refresh()
+    let usageCalls = runner.invocations.filter { $0.arguments.first == "usage" }
+    await expectEqual(usageCalls.count, 1, "provider usage must not ride the 5-second status poll")
+    await expectEqual(usageCalls.first?.arguments, ["usage", "/Users/x/Projects/murmur", "--json"])
+    await expectEqual(MurmurController.usageInterval, 120)
+}
+
+await test("«Обновить лимиты» forces a provider re-read") {
+    let runner = healthyRunner()
+    let controller = await makeController(runner: runner)
+    await controller.refresh()
+    await controller.refreshUsage(force: true)
+    await expect(runner.invocations.contains { $0.arguments == ["usage", "/Users/x/Projects/murmur", "--json", "--refresh"] })
+}
+
+await test("percentages come only from provider windows: a provider with no windows renders no number at all") {
+    let json = """
+    {"project":"murmur","providers":{"claude":{"available":true,"kind":"subscription_usage","windows":[]}}}
+    """
+    let report = try await decodeUsage(json)
+    let lines = WorkMenu.usageLines(name: "claude", usage: report.providers["claude"]!, now: workNow)
+    await expectEqual(lines, ["Claude", "Данные недоступны"])
+}
+
+await test("no secret field is ever decoded or rendered from usage: names, kinds, percentages and times only") {
+    let hostile = """
+    {"project":"murmur","providers":{"claude":{"available":true,"kind":"subscription_usage","email":"someone@example.invalid",
+      "accountId":"acct-secret","token":"sk-secret","windows":[{"id":"s","label":"5 часов","usedPercent":10,"remainingPercent":90,"apiKey":"sk-secret"}]}}}
+    """
+    let report = try await decodeUsage(hostile)
+    let rendered = WorkMenu.usageLines(name: "claude", usage: report.providers["claude"]!, now: workNow).joined(separator: "\n")
+    await expect(!rendered.contains("example.invalid") && !rendered.contains("acct-secret") && !rendered.contains("sk-secret"))
+}
+
 // MARK: - Cursor model (read-only, non-controllable)
 
 await test("argv for reading the Cursor policy is read-only") {

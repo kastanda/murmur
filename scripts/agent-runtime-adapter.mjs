@@ -1,3 +1,4 @@
+import { IGNORED_DUE_TO_CANCELLED_WORKFLOW } from "./workflow-control.mjs";
 import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { HANDOFF_REASONS } from "@murmurv2/core";
@@ -46,6 +47,10 @@ class DelegatingRuntimeAdapter {
   start(options) { return this.runtime.start(options); }
   executeTurn(payload, dispatch) { return this.runtime.executeTurn(payload, dispatch); }
   cancel(options) { return this.capabilities.cancel ? this.runtime.cancel(options) : false; }
+  /** The root workflow of the turn executing right now (null when idle). */
+  get activeRootMessageId() { return this.runtime.activeRootMessageId ?? null; }
+  /** Interrupt only the current turn; see each runtime's `interruptActiveTurn`. */
+  interruptActiveTurn(options) { return this.runtime.interruptActiveTurn?.(options) ?? false; }
   health() { return { runtimeKind: this.runtimeKind, memberSlot: this.memberSlot,
     capabilities: this.capabilities, ...this.runtime.health() }; }
   recoverCompletedReplies() { return this.runtime.recoverCompletedReplies?.() ?? []; }
@@ -127,17 +132,36 @@ export class CodexAppServerRuntimeAdapter {
     // (null = no override). Sender identity and message text never reach this — Claude,
     // Cursor and root all get the same Codex policy because it belongs to this project.
     modelPolicy = null,
+    // `async ({ threadId, turnId }) => void` — the App Server `turn/interrupt` for exactly one
+    // turn. Injected so the adapter never opens its own connection and tests need no server.
+    interruptTurn = null,
     // Display-only record of what the App Server reported running; best-effort.
     recordEffective = null,
     readServerIdentity = unixSocketIdentity, threadStore = new CodexConversationThreadStore() }) {
     if (typeof injector !== "function") throw new Error("codex-app-server-adapter-injector-required");
     Object.assign(this, { bindingStore, dispatchStore, agentId, projectId, peer, injector, sendReply,
-      now, heartbeatIntervalMs, retryDelayMs, log, handoff, modelPolicy, recordEffective, readServerIdentity, threadStore });
+      now, heartbeatIntervalMs, retryDelayMs, log, handoff, modelPolicy, interruptTurn, recordEffective, readServerIdentity, threadStore });
     this.runtimeKind = CODEX_APP_SERVER_KIND;
     this.memberSlot = CODEX_APP_SERVER_MEMBER_SLOT;
     this.capabilities = RUNTIME_CAPABILITIES[this.runtimeKind];
     this.serverGeneration = 0;
     this.serverIdentity = null;
+    this.activeRootMessageId = null;
+    this.activeTurn = null;
+  }
+  /**
+   * Per-task interrupt of the ACTIVE turn: `turn/interrupt` for that exact thread + turn id.
+   * The App Server, its other threads and every other workflow are untouched. Returns false
+   * when no turn id is known yet (the turn has not started) — the cancel intent still stops
+   * everything that would follow.
+   */
+  async interruptActiveTurn() {
+    const active = this.activeTurn;
+    if (!active?.threadId || !active?.turnId || typeof this.interruptTurn !== "function") return false;
+    await this.interruptTurn({ threadId: active.threadId, turnId: active.turnId });
+    // The server accepted the interrupt for this exact turn: stop waiting for it locally.
+    try { active.abort?.("operator-cancel"); } catch { /* the wait already ended */ }
+    return true;
   }
   refreshServerGeneration() {
     const socketPath = this.peer?.socketPath || this.peer?.target;
@@ -229,6 +253,8 @@ export class CodexAppServerRuntimeAdapter {
     const attempt = { attemptId: randomUUID(), inboundMessageId: identity.msgId,
       recipientId: identity.recipientId, memberSlot: identity.memberSlot,
       runtime: this.runtimeKind, capability: "completed" };
+    this.activeRootMessageId = turn?.rootMessageId ?? payload.msgId;
+    this.activeTurn = null;
     let handedOff = false;
     try {
       if (this.dispatchStore.beginHandoff(identity, this.now(), attempt) !== 1) throw new Error("codex-app-server-handoff-claim-lost");
@@ -237,6 +263,11 @@ export class CodexAppServerRuntimeAdapter {
       let terminalObserved = false;
       const processing = {
         attemptId: attempt.attemptId,
+        // The App Server's own ids for THIS turn, for a scoped `turn/interrupt`. Deliberately
+        // NOT `started`: Codex has no processing-started receipt (see RUNTIME_CAPABILITIES).
+        observeTurn: ({ sessionId, threadId, abort = null }) => {
+          this.activeTurn = { threadId: threadId ?? null, turnId: sessionId ?? null, abort };
+        },
         completed: () => {
           if (!this.bindingStore.validateFence(fence, identity)) return { accepted: false, reason: "stale-runtime-fence" };
           terminalObserved = true;
@@ -337,10 +368,16 @@ export class CodexAppServerRuntimeAdapter {
       if (this.bindingStore.validateFence(fence, identity)) {
         if (handedOff && !failure.outcomeUnknown) this.dispatchStore.recordProcessingReceipt({ ...attempt, status: "failed", errorMessage: failure.message }, this.now());
         const row = this.dispatchStore.get(identity);
-        this.bindingStore.releaseAssignment(fence, identity, { state: row?.attempts >= row?.maxAttempts ? "terminal" : "failed",
-          reason: failure.message, nextAttemptAt: this.now() + this.retryDelayMs }, this.now());
+        const cancelled = Boolean(this.handoff?.isWorkflowCancelled(turn?.rootMessageId ?? payload.msgId));
+        this.bindingStore.releaseAssignment(fence, identity, {
+          state: cancelled || row?.attempts >= row?.maxAttempts ? "terminal" : "failed",
+          reason: cancelled ? IGNORED_DUE_TO_CANCELLED_WORKFLOW : failure.message,
+          nextAttemptAt: this.now() + this.retryDelayMs }, this.now());
       }
       return { status: failure.outcomeUnknown ? "unknown" : "failed", error: failure };
+    } finally {
+      this.activeRootMessageId = null;
+      this.activeTurn = null;
     }
   }
   async recoverCompletedReplies() {
@@ -349,6 +386,8 @@ export class CodexAppServerRuntimeAdapter {
     for (const row of rows) {
       const metadata = row.metadata_json ? JSON.parse(row.metadata_json) : null;
       if (!metadata?.recipient || !metadata?.conversationId || !metadata?.replyToMessageId) continue;
+      // A stored result of a CANCELLED workflow is never delivered, however it got stuck.
+      if (this.handoff?.isInboundMessageWorkflowCancelled(row.inbound_message_id)) continue;
       const reply = await this.sendReply({ msgId: row.attempt_id, to: metadata.recipient,
         conversationId: metadata.conversationId, replyToMessageId: metadata.replyToMessageId, text: metadata.resultText || "" });
       this.dispatchStore.recordProcessingReceipt({ attemptId: row.attempt_id,

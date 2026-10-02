@@ -4,6 +4,7 @@ import { HANDOFF_REASONS } from "@murmurv2/core";
 import { settleRuntimeTurn } from "./agent-handoff-runtime.mjs";
 import { extractCanonicalModel } from "./claude-capabilities.mjs";
 import { writePrivateJson } from "./secure-state.mjs";
+import { IGNORED_DUE_TO_CANCELLED_WORKFLOW } from "./workflow-control.mjs";
 
 export const CLAUDE_ONE_SHOT_KIND = "claude_one_shot";
 export const CLAUDE_AUTO_MEMBER_SLOT = "claude:auto";
@@ -293,6 +294,9 @@ export class ClaudeOneShotRuntime {
         turn, dispatch, dispatchStore: this.dispatchStore, bindingStore: this.bindingStore, fence, identity,
       });
     }
+    // The root workflow this turn serves: the daemon's cancellation watcher uses it to
+    // interrupt ONLY this turn's child process when the operator cancels that workflow.
+    this.activeRootMessageId = turn?.rootMessageId ?? payload.msgId;
     // A continuation resumes the EXACT originating Claude session; an ordinary turn keeps
     // the binding's session (or seeds a new one).
     const requestedSessionId = turn?.resumeSessionId || binding.runtimeSessionId || randomUUID();
@@ -372,18 +376,29 @@ export class ClaudeOneShotRuntime {
           this.dispatchStore.recordProcessingReceipt({ ...attempt, status: "failed", errorMessage: failure.message }, this.now());
         }
         const row = this.dispatchStore.get(identity);
-        const terminal = row && row.attempts >= row.maxAttempts;
+        // A turn interrupted because its workflow was cancelled is retired, never retried.
+        const cancelled = Boolean(this.handoff?.isWorkflowCancelled(turn?.rootMessageId ?? payload.msgId));
+        const terminal = cancelled || (row && row.attempts >= row.maxAttempts);
         this.bindingStore.releaseAssignment(fence, identity, {
           state: terminal ? "terminal" : "failed",
-          reason: failure.outcomeUnknown ? "claude-one-shot-outcome-unknown" : failure.message,
+          reason: cancelled ? IGNORED_DUE_TO_CANCELLED_WORKFLOW
+            : failure.outcomeUnknown ? "claude-one-shot-outcome-unknown" : failure.message,
           nextAttemptAt: this.now() + this.retryDelayMs,
         }, this.now());
       }
       return { status: failure.outcomeUnknown ? "unknown" : "failed", error: failure };
     } finally {
       this.currentChild = null;
+      this.activeRootMessageId = null;
     }
   }
+
+  /**
+   * Interrupt the CURRENT turn only: SIGTERM (then SIGKILL after the grace) to the one
+   * `claude -p` child that is executing it. The daemon, the other agents and every other
+   * workflow are untouched.
+   */
+  interruptActiveTurn(options) { return this.cancel(options); }
 
   async recoverCompletedReplies() {
     const rows = this.dispatchStore.db.prepare(`
@@ -395,6 +410,8 @@ export class ClaudeOneShotRuntime {
     for (const row of rows) {
       const metadata = row.metadata_json ? JSON.parse(row.metadata_json) : null;
       if (!metadata?.resultText || !metadata?.recipient || !metadata?.conversationId || !metadata?.replyToMessageId) continue;
+      // A stored result of a CANCELLED workflow is never delivered, however it got stuck.
+      if (this.handoff?.isInboundMessageWorkflowCancelled(row.inbound_message_id)) continue;
       const reply = await this.sendReply({
         msgId: row.attempt_id,
         to: metadata.recipient,

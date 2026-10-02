@@ -31,6 +31,7 @@ import {
 } from "./notify-activity.mjs";
 import { createClaudeSummarizer } from "./notify-summarizer.mjs";
 import {
+  CodexAppServerClient,
   createChannelThreadStartBindingResolver,
   createCodexAppServerDaemonInjector,
   createCodexAppServerInjector,
@@ -842,6 +843,10 @@ const codexModelPolicy = codexProjectPaths ? async () => {
 } : null;
 const codexAppServerRuntime = codexAppServerRuntimeEnabled ? new CodexAppServerRuntimeAdapter({
   modelPolicy: codexModelPolicy,
+  // Per-task cancel: `turn/interrupt` for one exact thread + turn on the project's App Server.
+  interruptTurn: ({ threadId, turnId }) => new CodexAppServerClient({
+    socketPath: codexAppServerRuntimeConfig.socketPath || codexAppServerRuntimeConfig.target, timeoutMs: 10_000,
+  }).request("turn/interrupt", { threadId, turnId }),
   recordEffective: codexProjectPaths ? (record) => writeCodexRuntimeCache(codexProjectPaths, record) : null,
   bindingStore: runtimeBindingStore,
   dispatchStore: wakeDispatchStore,
@@ -871,6 +876,33 @@ if (activeRuntimeAdapter) {
   await activeRuntimeAdapter.recoverCompletedReplies();
   log("info", "Autonomous runtime adapter enabled", { runtimeKind: activeRuntimeAdapter.runtimeKind,
     memberSlot: activeRuntimeAdapter.memberSlot, capabilities: activeRuntimeAdapter.capabilities });
+}
+
+/**
+ * Operator per-task cancellation, runtime side. `murmur cancel` only writes a durable
+ * intent (see workflow-control.mjs); the gates that refuse new work read it directly. This
+ * watcher additionally interrupts the turn that is executing RIGHT NOW when — and only
+ * when — it belongs to a cancelled root workflow, using the runtime's own scoped mechanism
+ * (one `claude -p` child / one Codex `turn/interrupt` / one ACP `session/cancel`). It never
+ * stops the daemon, another agent, or a turn of any other workflow.
+ */
+if (activeRuntimeAdapter && handoffCoordinator) {
+  const interruptedRoots = new Set();
+  const watcher = setInterval(async () => {
+    try {
+      const root = activeRuntimeAdapter.activeRootMessageId;
+      if (!root || interruptedRoots.has(root) || !handoffCoordinator.isWorkflowCancelled(root)) return;
+      if (await activeRuntimeAdapter.interruptActiveTurn()) {
+        interruptedRoots.add(root);
+        log("warn", "Active turn interrupted: its workflow was cancelled by the operator", { rootMessageId: root });
+      }
+    } catch (error) {
+      log("warn", "Could not interrupt the active turn of a cancelled workflow", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }, 1_000);
+  watcher.unref?.();
 }
 
 const wakeMonitor = new WakeMonitor({

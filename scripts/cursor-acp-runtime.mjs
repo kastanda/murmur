@@ -1,3 +1,4 @@
+import { IGNORED_DUE_TO_CANCELLED_WORKFLOW } from "./workflow-control.mjs";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
@@ -210,6 +211,23 @@ export class CursorAcpClient {
     }
   }
 
+  /**
+   * Scoped cancel of the active prompt: `session/cancel` for exactly that session and a
+   * bounded wait. Unlike `cancel`, it NEVER escalates to shutting the agent process down —
+   * one cancelled task must not take Cursor away from the others.
+   */
+  async interruptActive({ graceMs = this.terminateGraceMs } = {}) {
+    const active = this.activePrompt;
+    if (!active) return false;
+    this.notify("session/cancel", { sessionId: active.sessionId });
+    try {
+      await this.withTimeout(active.promise.catch(() => {}), graceMs, "cursor-acp-cancel-timeout");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async cancel({ graceMs = this.terminateGraceMs } = {}) {
     const active = this.activePrompt;
     if (!active) return false;
@@ -354,6 +372,7 @@ export class CursorAcpRuntime {
       });
     }
     const promptText = turn?.promptText ?? payload.text;
+    this.activeRootMessageId = turn?.rootMessageId ?? payload.msgId;
     const attempt = { attemptId: randomUUID(), inboundMessageId: identity.msgId,
       recipientId: identity.recipientId, memberSlot: identity.memberSlot,
       runtime: CURSOR_ACP_KIND, capability: "completed" };
@@ -405,13 +424,17 @@ export class CursorAcpRuntime {
         if (submitted && !failure.outcomeUnknown) this.dispatchStore.recordProcessingReceipt({ ...attempt,
           status: "failed", errorMessage: failure.message }, this.now());
         const row = this.dispatchStore.get(identity);
-        const terminal = row && row.attempts >= row.maxAttempts;
+        const cancelled = Boolean(this.handoff?.isWorkflowCancelled(turn?.rootMessageId ?? payload.msgId));
+        const terminal = cancelled || (row && row.attempts >= row.maxAttempts);
         this.bindingStore.releaseAssignment(fence, identity, { state: terminal ? "terminal" : "failed",
-          reason: failure.outcomeUnknown ? "cursor-acp-outcome-unknown" : failure.message,
+          reason: cancelled ? IGNORED_DUE_TO_CANCELLED_WORKFLOW
+            : failure.outcomeUnknown ? "cursor-acp-outcome-unknown" : failure.message,
           nextAttemptAt: this.now() + this.retryDelayMs }, this.now());
         if (!this.client.health().healthy) this.bindingStore.markOffline(fence, this.now());
       }
       return { status: failure.outcomeUnknown ? "unknown" : "failed", error: failure };
+    } finally {
+      this.activeRootMessageId = null;
     }
   }
 
@@ -423,6 +446,8 @@ export class CursorAcpRuntime {
     for (const row of rows) {
       const metadata = row.metadata_json ? JSON.parse(row.metadata_json) : null;
       if (!metadata?.resultText || !metadata?.recipient || !metadata?.conversationId || !metadata?.replyToMessageId) continue;
+      // A stored result of a CANCELLED workflow is never delivered, however it got stuck.
+      if (this.handoff?.isInboundMessageWorkflowCancelled(row.inbound_message_id)) continue;
       const reply = await this.sendReply({ msgId: row.attempt_id, to: metadata.recipient,
         conversationId: metadata.conversationId, replyToMessageId: metadata.replyToMessageId, text: metadata.resultText });
       this.dispatchStore.recordProcessingReceipt({ attemptId: row.attempt_id,
@@ -435,6 +460,9 @@ export class CursorAcpRuntime {
   }
 
   async cancel() { return this.client?.cancel({ graceMs: this.terminateGraceMs }) || false; }
+
+  /** Per-task interrupt: ACP `session/cancel` for the ACTIVE session only; never kills the agent process. */
+  async interruptActiveTurn() { return this.client?.interruptActive({ graceMs: this.terminateGraceMs }) || false; }
 
   async shutdown() {
     this.stopHeartbeat();

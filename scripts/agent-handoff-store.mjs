@@ -23,6 +23,9 @@
  * leaving behind no continuation row and no outbound handoff outbox row.
  */
 import { DatabaseSync } from "node:sqlite";
+import {
+  WORKFLOW_CANCELLED_REASON, WORKFLOW_CONTROL_DDL, isWorkflowCancelRequested,
+} from "./workflow-control.mjs";
 
 export const HANDOFF_STATES = Object.freeze({
   open: "open",
@@ -106,6 +109,7 @@ export class AgentHandoffStore {
     // this database file, so this connection needs the same busy timeout they use.
     this.db.exec("PRAGMA busy_timeout=10000;");
     this.db.exec(DDL);
+    this.db.exec(WORKFLOW_CONTROL_DDL);
     this.ensureColumns();
   }
 
@@ -265,6 +269,12 @@ export class AgentHandoffStore {
     return this.transact(() => {
       if (!this.fenceIsCurrent(fence, identity)) {
         return { ok: false, reason: "handoff-continuation-stale-binding", handoff: null, created: false };
+      }
+      // Operator cancellation is checked INSIDE the same transaction that would create the
+      // continuation and the outbound handoff, so no child can begin after the intent
+      // committed — and none that committed before it survives unobserved.
+      if (isWorkflowCancelRequested(this.db, record.rootMessageId)) {
+        return { ok: false, reason: WORKFLOW_CANCELLED_REASON, handoff: null, created: false };
       }
       const { handoff, created } = this.applyCreate(record, now);
       if (outbox) this.applyOutboxEnqueue(outbox, now);

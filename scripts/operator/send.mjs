@@ -104,11 +104,40 @@ export const findRejectedCandidates = (dbPath, { msgId, expectedSender, conversa
   }
 };
 
-export const waitForCorrelatedReply = async (dbPath, correlation, { timeoutMs = 600_000, pollMs = 500, sleep = delay } = {}) => {
+/**
+ * When did the operator cancel this root workflow (ms), or `null`? Read from the root identity's
+ * own database (where `murmur cancel` records the durable intent). A waiting `murmur send`
+ * observes it so it can stop waiting and report a SYSTEM result instead of timing out on a task
+ * nobody will answer.
+ */
+export const rootWorkflowCancelledAt = (dbPath, msgId) => {
+  if (!existsSync(dbPath)) return null;
+  let db;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    db.exec("PRAGMA busy_timeout=2000;");
+    const row = db.prepare("SELECT requested_at AS at FROM workflow_control WHERE root_message_id = ?").get(msgId);
+    return row ? Number(row.at) : null;
+  } catch {
+    return null;
+  } finally {
+    try { db?.close(); } catch { /* already closed */ }
+  }
+};
+
+export const waitForCorrelatedReply = async (dbPath, correlation, { timeoutMs = 600_000, pollMs = 500, sleep = delay, cancelCheck = null } = {}) => {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const row = findCorrelatedReply(dbPath, correlation);
-    if (row) return row;
+    const cancelledAt = cancelCheck?.();
+    const cancelled = cancelledAt !== null && cancelledAt !== undefined && cancelledAt !== false;
+    if (row) {
+      // A reply that arrived AFTER the cancel is a late delivery: it stays in history but the
+      // task stays cancelled. One that arrived before it is a genuine completion.
+      if (cancelled && Date.parse(row.createdAt) > Number(cancelledAt)) return { cancelled: true };
+      return row;
+    }
+    if (cancelled) return { cancelled: true };
     await sleep(pollMs);
   }
   return null;

@@ -49,6 +49,11 @@ public final class MurmurController: ObservableObject {
     @Published public private(set) var claudeConfig: ClaudeConfigReport?
     @Published public private(set) var codexConfig: CodexConfigReport?
     @Published public private(set) var cursorConfig: CursorConfigReport?
+    @Published public private(set) var workSnapshot: WorkSnapshot?
+    @Published public private(set) var usageReport: UsageReport?
+    @Published public private(set) var usageRefreshing = false
+    /// Workflow ids whose cancellation command is in flight (shown as «отмена…», not as cancelled).
+    @Published public private(set) var cancellingTasks: Set<String> = []
     @Published public private(set) var operation: LifecycleOperation?
     @Published public private(set) var lastError: String?
     @Published public private(set) var cliLocation: CLILocation = .missing
@@ -57,6 +62,11 @@ public final class MurmurController: ObservableObject {
     private let preferences: PreferenceStore
     private let makeCLI: (String) -> MurmurCLI
     private var pollTask: Task<Void, Never>?
+    private var lastUsageFetch: Date?
+
+    /// Provider usage is read on a SLOW cadence — never with the 5-second status poll. The CLI also
+    /// caches provider reads, so this interval is the upper bound on provider calls.
+    public static let usageInterval: TimeInterval = 120
 
     /// How often status is refreshed. Five seconds is responsive enough for a start to
     /// feel immediate, and light enough that an idle menu bar app is not a background
@@ -183,6 +193,9 @@ public final class MurmurController: ObservableObject {
         claudeConfig = nil
         codexConfig = nil
         cursorConfig = nil
+        workSnapshot = nil
+        usageReport = nil
+        lastUsageFetch = nil
         Task { await refresh() }
     }
 
@@ -221,6 +234,8 @@ public final class MurmurController: ObservableObject {
             status = nil
             codexConfig = nil
             cursorConfig = nil
+            workSnapshot = nil
+            usageReport = nil
             return
         }
         do {
@@ -231,6 +246,12 @@ public final class MurmurController: ObservableObject {
         } catch {
             lastError = describeFailure(error)
         }
+        // Active work is local durable state: cheap, so it rides the normal poll.
+        workSnapshot = try? await cli.tasks(project: project)
+        // Provider usage may reach a provider: slow cadence only (manual refresh bypasses it).
+        if lastUsageFetch == nil || Date().timeIntervalSince(lastUsageFetch ?? .distantPast) >= Self.usageInterval {
+            await refreshUsage(force: false)
+        }
         claudeConfig = try? await cli.claudeConfig(project: project)
         // `nil` for a project with no Codex identity (exit 3, no JSON) — the Codex rows are simply omitted.
         codexConfig = try? await cli.codexConfig(project: project)
@@ -238,6 +259,60 @@ public final class MurmurController: ObservableObject {
         // simply omits the Cursor section in that case, same pattern as `claudeConfig`.
         cursorConfig = try? await cli.cursorConfig(project: project)
     }
+
+    // MARK: active work + usage
+
+    public enum CancelOutcome: Equatable, Sendable {
+        case accepted(status: String)
+        case alreadyFinished
+        case unknown
+        case failed(String)
+    }
+
+    /// Cancel ONE workflow. Allowed while a task submission is still waiting for its reply
+    /// (`.sending` — that wait is exactly what the operator is cancelling) but never alongside a
+    /// lifecycle or configuration command. It never stops the project or any agent.
+    public func cancelTask(_ workflowId: String) async -> CancelOutcome {
+        guard let cli = currentCLI(), let project = selectedProject?.cliArgument else { return .failed(L.cliMissingTitle) }
+        guard operation == nil || operation == .sending else { return .failed(L.busy) }
+        guard !cancellingTasks.contains(workflowId) else { return .failed(L.taskCancelling) }
+        cancellingTasks.insert(workflowId)
+        defer { cancellingTasks.remove(workflowId) }
+        do {
+            let result = try await cli.cancel(project: project, workflowId: workflowId)
+            await refresh()
+            if result.ok { return .accepted(status: result.status ?? "cancel_requested") }
+            switch result.reason {
+            case "already-terminal": return .alreadyFinished
+            case "unknown-workflow": return .unknown
+            default: return .failed(L.cancelFailed)
+            }
+        } catch {
+            return .failed(describeFailure(error))
+        }
+    }
+
+    public func taskDetail(_ workflowId: String) async -> WorkTaskDetail? {
+        guard let cli = currentCLI(), let project = selectedProject?.cliArgument else { return nil }
+        return try? await cli.taskDetail(project: project, workflowId: workflowId)
+    }
+
+    /// `force` re-reads the providers now («Обновить лимиты»); otherwise the CLI answers from its
+    /// own short cache. A failure keeps the previous report (it will show as stale by itself).
+    public func refreshUsage(force: Bool) async {
+        guard let cli = currentCLI(), let project = selectedProject?.cliArgument else { return }
+        usageRefreshing = true
+        defer { usageRefreshing = false }
+        if let report = try? await cli.usage(project: project, refresh: force) {
+            usageReport = report
+        }
+        lastUsageFetch = Date()
+    }
+
+    public func refreshLimits() { Task { await refreshUsage(force: true) } }
+
+    /// Passive low-limit lines from the last usage report (empty when none is low or the data is stale).
+    public var lowLimitWarnings: [String] { WorkMenu.lowLimitWarnings(usageReport) }
 
     // MARK: internals
 

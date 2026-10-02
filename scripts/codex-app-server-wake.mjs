@@ -293,6 +293,7 @@ export class CodexAppServerClient {
     completionTimeoutMs = DEFAULT_TURN_COMPLETION_TIMEOUT_MS,
     sessionPath = null,
     onStarted = null,
+    onTurnId = null,
   } = {}) {
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -404,6 +405,18 @@ export class CodexAppServerClient {
           }
           startResult = message.result;
           turnId = message.result?.turn?.id || turnId;
+          if (turnId) {
+            try {
+              onTurnId?.({
+                turnId,
+                threadId: params?.threadId ?? null,
+                // Ends THIS wait now. Used after the server accepted a scoped `turn/interrupt`:
+                // the interrupted turn's `turn/completed` is not reliably delivered on this
+                // connection, and waiting out the completion timeout would hold the runtime.
+                abort: (reason = "operator-cancel") => finish(new Error(`codex-app-server-turn-interrupted:${reason}`)),
+              });
+            } catch { /* recording only */ }
+          }
           return;
         }
 
@@ -617,6 +630,12 @@ export const createCodexAppServerInjector = ({ Client = CodexAppServerClient, lo
         sessionPath: threadPath,
         ...(typeof processing?.started === "function"
           ? { onStarted: ({ turnId }) => processing.started({ sessionId: turnId }) }
+          : {}),
+        // The turn id comes from the `turn/start` RESPONSE (the `turn/started` notification is not
+        // reliably observed on this connection). It only RECORDS the exact ids for a scoped
+        // `turn/interrupt`; it is not a processing-started receipt.
+        ...(typeof processing?.observeTurn === "function"
+          ? { onTurnId: ({ turnId, threadId: acceptedThreadId, abort }) => processing.observeTurn({ sessionId: turnId, threadId: acceptedThreadId ?? threadId, abort }) }
           : {}),
       });
       diagnosticObserver?.({ method: "turn/completion-source", threadId, turnId: result?.turnId ?? null,

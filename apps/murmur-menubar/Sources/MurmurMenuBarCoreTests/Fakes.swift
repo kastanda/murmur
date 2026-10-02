@@ -274,6 +274,116 @@ let cursorConfigAutoJSON = """
    "source":"cursor-global","supportedModels":[],"requiresRestart":false,"requiresNewSession":false}}
 """
 
+// MARK: active work + usage fixtures (synthetic ids and figures)
+
+let tasksEmptyJSON = """
+{"project":"murmur","observedAt":"2026-10-03T12:00:00.000Z",
+ "summary":{"active":0,"queued":0,"running":0,"waiting":0,"cancelRequested":0},"tasks":[],"recent":[]}
+"""
+
+/// Two active ROOT tasks (one running at Codex under Claude, one running at Claude), one queued,
+/// and a finished one in `recent`. Six internal hops would still be two tasks here.
+let tasksActiveJSON = """
+{"project":"murmur","observedAt":"2026-10-03T12:00:00.000Z",
+ "summary":{"active":2,"queued":1,"running":2,"waiting":0,"cancelRequested":0},
+ "tasks":[
+  {"workflowId":"root-aaaaaaaa-0001","status":"running","stalled":false,
+   "submittedAt":"2026-10-03T11:57:46.000Z","startedAt":"2026-10-03T11:57:47.000Z","elapsedMs":134000,
+   "requestSummary":"Исправить provisioning","currentAgent":"codex","currentStage":"Review",
+   "chain":[{"from":"root","to":"claude"},{"from":"claude","to":"codex","state":"open"}],
+   "lastActivityAt":"2026-10-03T11:58:00.000Z","lastActivity":"claude → codex","cancellable":true},
+  {"workflowId":"root-bbbbbbbb-0002","status":"running","stalled":false,
+   "submittedAt":"2026-10-03T11:59:12.000Z","startedAt":"2026-10-03T11:59:12.000Z","elapsedMs":48000,
+   "requestSummary":"Проверить API интеграцию","currentAgent":"claude","currentStage":"Обработка запроса",
+   "chain":[{"from":"root","to":"claude"}],
+   "lastActivityAt":"2026-10-03T11:59:30.000Z","lastActivity":"Выполняется","cancellable":true},
+  {"workflowId":"root-cccccccc-0003","status":"queued","stalled":false,
+   "submittedAt":"2026-10-03T11:59:48.000Z","startedAt":null,"elapsedMs":12000,
+   "requestSummary":"Обновить documentation","currentAgent":"claude","currentStage":"В очереди",
+   "chain":[{"from":"root","to":"claude"}],
+   "lastActivityAt":"2026-10-03T11:59:48.000Z","lastActivity":"Принята, ожидает исполнителя","cancellable":true}],
+ "recent":[
+  {"workflowId":"root-dddddddd-0004","status":"completed","stalled":false,
+   "submittedAt":"2026-10-03T11:50:00.000Z","startedAt":null,"elapsedMs":9000,
+   "requestSummary":"Ответь точно: OK","currentAgent":null,"currentStage":null,
+   "chain":[{"from":"root","to":"claude"}],
+   "lastActivityAt":"2026-10-03T11:50:09.000Z","lastActivity":"Получен итоговый ответ","cancellable":false}]}
+"""
+
+/// A parent (Claude) waiting for its child (Codex) that has not started: waiting, current agent = the child.
+let tasksWaitingJSON = """
+{"project":"murmur","observedAt":"2026-10-03T12:00:00.000Z",
+ "summary":{"active":1,"queued":0,"running":0,"waiting":1,"cancelRequested":0},
+ "tasks":[{"workflowId":"root-eeeeeeee-0005","status":"waiting","stalled":false,
+   "submittedAt":"2026-10-03T11:58:00.000Z","startedAt":null,"elapsedMs":120000,
+   "requestSummary":"Длинная цепочка","currentAgent":"codex","currentStage":"Ожидание ответа codex",
+   "chain":[{"from":"root","to":"claude"},{"from":"claude","to":"codex","state":"open"},{"from":"codex","to":"cursor","state":"open"}],
+   "lastActivityAt":"2026-10-03T11:59:00.000Z","lastActivity":"codex → cursor","cancellable":true}],
+ "recent":[]}
+"""
+
+let tasksCancelRequestedJSON = """
+{"project":"murmur","observedAt":"2026-10-03T12:00:00.000Z",
+ "summary":{"active":1,"queued":0,"running":0,"waiting":0,"cancelRequested":1},
+ "tasks":[{"workflowId":"root-aaaaaaaa-0001","status":"cancel_requested","stalled":false,
+   "submittedAt":"2026-10-03T11:57:46.000Z","startedAt":null,"elapsedMs":134000,
+   "requestSummary":"Исправить provisioning","currentAgent":"codex","currentStage":"Отмена запрошена",
+   "chain":[{"from":"root","to":"claude"}],"lastActivityAt":"2026-10-03T11:58:00.000Z",
+   "lastActivity":"Запрошена отмена, текущий шаг завершается","cancellable":false}],"recent":[]}
+"""
+
+let taskDetailJSON = """
+{"project":"murmur","task":{"workflowId":"root-aaaaaaaa-0001","status":"completed","stalled":false,
+ "submittedAt":"2026-10-03T11:50:00.000Z","startedAt":null,"elapsedMs":9000,
+ "requestSummary":"Ответь точно: OK","currentAgent":null,"currentStage":null,
+ "chain":[{"from":"root","to":"claude"}],"lastActivityAt":"2026-10-03T11:50:09.000Z",
+ "lastActivity":"Получен итоговый ответ","cancellable":false,
+ "request":"Ответь точно: OK","result":"OK"}}
+"""
+
+let cancelOkJSON = """
+{"ok":true,"workflowId":"root-aaaaaaaa-0001","status":"cancel_requested","alreadyRequested":false,
+ "retiredQueuedDispatches":0,"systemResult":"Задача отменена пользователем."}
+"""
+let cancelDoneJSON = """
+{"ok":true,"workflowId":"root-cccccccc-0003","status":"cancelled","alreadyRequested":false,
+ "retiredQueuedDispatches":1,"systemResult":"Задача отменена пользователем."}
+"""
+let cancelTerminalJSON = """
+{"ok":false,"reason":"already-terminal","workflowId":"root-dddddddd-0004","status":"completed"}
+"""
+let cancelUnknownJSON = """
+{"ok":false,"reason":"unknown-workflow","workflowId":"root-zzzzzzzz-0009"}
+"""
+
+/// Claude: two windows; Codex: one weekly window; Cursor: nothing exposed. Figures are synthetic.
+let usageJSON = """
+{"project":"murmur","observedAt":"2026-10-03T12:00:00.000Z","providers":{
+ "claude":{"available":true,"source":"claude-cli-get-usage","kind":"subscription_usage","plan":"pro",
+   "observedAt":"2026-10-03T11:59:00.000Z","stale":false,
+   "windows":[
+    {"id":"session","label":"5 часов","usedPercent":36,"remainingPercent":64,"resetsAt":"2026-10-03T14:18:00.000Z","resetsInMs":8280000,"expired":false,"windowMinutes":300},
+    {"id":"weekly","label":"Неделя","usedPercent":62,"remainingPercent":38,"resetsAt":"2026-10-06T00:00:00.000Z","resetsInMs":216000000,"expired":false,"windowMinutes":10080}]},
+ "codex":{"available":true,"source":"codex-app-server-rate-limits","kind":"subscription_usage","plan":"pro",
+   "observedAt":"2026-10-03T11:59:30.000Z","stale":false,
+   "windows":[{"id":"codex:primary","label":"Неделя","usedPercent":82,"remainingPercent":18,"resetsAt":null,"resetsInMs":null,"expired":false,"windowMinutes":10080}]},
+ "cursor":{"available":false,"reason":"not-exposed-by-runtime"}}}
+"""
+
+let usageLowJSON = """
+{"project":"murmur","observedAt":"2026-10-03T12:00:00.000Z","providers":{
+ "claude":{"available":true,"kind":"subscription_usage","observedAt":"2026-10-03T11:59:00.000Z","stale":false,
+   "windows":[{"id":"session","label":"5 часов","usedPercent":93,"remainingPercent":7,"resetsAt":"2026-10-03T12:40:00.000Z","resetsInMs":2400000,"expired":false}]},
+ "codex":{"available":true,"kind":"api_rate_limit","observedAt":"2026-10-03T11:59:00.000Z","stale":false,
+   "windows":[{"id":"codex:primary","label":"1 мин","usedPercent":99,"remainingPercent":1,"expired":false}]}}}
+"""
+
+let usageStaleJSON = """
+{"project":"murmur","observedAt":"2026-10-03T12:00:00.000Z","providers":{
+ "claude":{"available":true,"kind":"subscription_usage","observedAt":"2026-10-03T10:00:00.000Z","stale":true,
+   "windows":[{"id":"session","label":"5 часов","usedPercent":95,"remainingPercent":5,"resetsAt":"2026-10-03T12:30:00.000Z","expired":false}]}}}
+"""
+
 /// The default fake: a healthy project, two projects, Telegram configured.
 func healthyRunner() -> FakeRunner {
     FakeRunner { invocation in
@@ -285,6 +395,10 @@ func healthyRunner() -> FakeRunner {
         case "claude": return ok(claudeConfigJSON)
         case "codex": return ok(codexConfigJSON)
         case "cursor": return ok(cursorConfigJSON)
+        case "tasks": return ok(tasksActiveJSON)
+        case "task": return ok(taskDetailJSON)
+        case "cancel": return ok(cancelOkJSON)
+        case "usage": return ok(usageJSON)
         default: return ok("")
         }
     }

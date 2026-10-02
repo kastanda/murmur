@@ -378,6 +378,35 @@ test("Codex protocol fixture exposes observed turn/started and terminal completi
   assert.equal(result.source, "app-server-events");
 });
 
+test("Codex protocol reports the turn id from the turn/start RESPONSE even when turn/started is never observed", async () => {
+  const accepted = [];
+  const client = new CodexAppServerClient({ socketPath: "/fake/codex.sock", WebSocketImpl: protocolWebSocket("completed", { emitStarted: false }) });
+  await client.startTurnAndWaitForFinal({ threadId: "thread-1", input: [] }, {
+    onTurnId: (ids) => accepted.push(ids),
+  });
+  assert.deepEqual(accepted.map(({ abort, ...ids }) => ids), [{ turnId: "turn-protocol", threadId: "thread-1" }], "the exact ids a scoped turn/interrupt needs");
+  assert.equal(typeof accepted[0].abort, "function");
+});
+
+test("Codex protocol: abort() ends the wait for an interrupted turn immediately instead of waiting out the completion timeout", async () => {
+  class HangingSocket extends EventEmitter {
+    constructor() { super(); queueMicrotask(() => this.emit("open")); }
+    send(raw) {
+      const request = JSON.parse(raw);
+      const emit = (message) => this.emit("message", Buffer.from(JSON.stringify(message)));
+      if (request.method === "initialize") queueMicrotask(() => emit({ id: request.id, result: {} }));
+      else if (request.method === "turn/start") queueMicrotask(() => emit({ id: request.id, result: { turn: { id: "turn-hang" } } }));
+    }
+    close() {}
+  }
+  const client = new CodexAppServerClient({ socketPath: "/fake/codex.sock", WebSocketImpl: HangingSocket });
+  const waiting = client.startTurnAndWaitForFinal({ threadId: "thread-1", input: [] }, {
+    completionTimeoutMs: 60_000,
+    onTurnId: ({ abort }) => setImmediate(() => abort("operator-cancel")),
+  });
+  await assert.rejects(waiting, /codex-app-server-turn-interrupted:operator-cancel/);
+});
+
 test("Codex protocol reports missing start without synthesizing it", async () => {
   const diagnostics = [];
   const client = new CodexAppServerClient({ socketPath: "/fake/codex.sock",

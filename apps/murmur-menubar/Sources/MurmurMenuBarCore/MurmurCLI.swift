@@ -244,6 +244,24 @@ public struct MurmurCLI: Sendable {
         CommandInvocation(executable: executable, arguments: ["codex", project, "effort", value])
     }
 
+    public func tasksInvocation(project: String) -> CommandInvocation {
+        CommandInvocation(executable: executable, arguments: ["tasks", project, "--json"])
+    }
+
+    public func taskInvocation(project: String, workflowId: String) -> CommandInvocation {
+        CommandInvocation(executable: executable, arguments: ["task", project, workflowId, "--json"])
+    }
+
+    /// Cancels ONE workflow. The id is passed as a single argv entry (the CLI validates it again);
+    /// there is no project-wide stop here.
+    public func cancelInvocation(project: String, workflowId: String) -> CommandInvocation {
+        CommandInvocation(executable: executable, arguments: ["cancel", project, workflowId, "--json"])
+    }
+
+    public func usageInvocation(project: String, refresh: Bool) -> CommandInvocation {
+        CommandInvocation(executable: executable, arguments: ["usage", project, "--json"] + (refresh ? ["--refresh"] : []))
+    }
+
     /// Read-only — there is deliberately no `setCursorModelInvocation`. See
     /// `cursor-config.mjs`'s header: Cursor's own model selection is real but ACCOUNT-
     /// GLOBAL, not project-scoped, so this app only ever displays it.
@@ -274,6 +292,26 @@ public struct MurmurCLI: Sendable {
 
     public func claudeConfig(project: String) async throws -> ClaudeConfigReport {
         try await decode(ClaudeConfigReport.self, from: claudeConfigInvocation(project: project), timeout: 30, allowNonZeroExit: true)
+    }
+
+    public func tasks(project: String) async throws -> WorkSnapshot {
+        try await decode(WorkSnapshot.self, from: tasksInvocation(project: project), timeout: 20, allowNonZeroExit: true)
+    }
+
+    public func taskDetail(project: String, workflowId: String) async throws -> WorkTaskDetail {
+        try await decode(TaskDetailReport.self, from: taskInvocation(project: project, workflowId: workflowId), timeout: 20, allowNonZeroExit: false).task
+    }
+
+    /// `cancel` exits 2 (unknown) / 4 (already finished) / 1 (invalid) WITH a JSON body — each is an
+    /// answer to render, so the JSON is decoded whatever the exit code.
+    public func cancel(project: String, workflowId: String) async throws -> CancelResult {
+        try await decode(CancelResult.self, from: cancelInvocation(project: project, workflowId: workflowId), timeout: 30, allowNonZeroExit: true)
+    }
+
+    /// May contact a provider (through its own CLI/App Server) when its cache is stale or
+    /// `refresh` is set — hence the longer timeout and the slow cadence the controller uses.
+    public func usage(project: String, refresh: Bool = false) async throws -> UsageReport {
+        try await decode(UsageReport.self, from: usageInvocation(project: project, refresh: refresh), timeout: 60, allowNonZeroExit: true)
     }
 
     /// A project with no Codex identity exits 3 with no JSON on stdout — callers treat a

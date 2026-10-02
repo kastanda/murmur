@@ -31,6 +31,11 @@ struct MurmurMenuBarApp: App {
             .defaultSize(width: 640, height: 440)
         Window(L.sendTask, id: WindowID.send) { SendTaskWindow(controller: controller) }
             .defaultSize(width: 540, height: 440)
+        // One window per task, keyed by its workflow id (the root message id).
+        WindowGroup(L.taskDetail, id: WindowID.task, for: String.self) { $workflowId in
+            TaskDetailWindow(controller: controller, workflowId: workflowId ?? "")
+        }
+        .defaultSize(width: 520, height: 520)
     }
 
     private func symbolName(_ state: HealthState) -> String {

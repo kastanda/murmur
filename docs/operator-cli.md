@@ -633,6 +633,19 @@ choice when Murmur restarts; Codex applies an explicit choice from the next turn
 [cursor-model-discovery.md](cursor-model-discovery.md)). None of these commands writes any global
 agent configuration. The recipient's project policy picks its model: a sender cannot.
 
+## Active work, cancellation and usage
+
+```bash
+murmur tasks  <project> [--json]               # active + queued root tasks (+ a few recent)
+murmur task   <project> <workflow-id> [--json] # one task: request, chain, stage, result
+murmur cancel <project> <workflow-id> [--json] # cancel ONE workflow (never the project)
+murmur usage  <project> [--json] [--refresh]   # provider subscription usage windows
+```
+
+See [active-work.md](active-work.md) (what a task is, states, exactly what cancellation stops) and
+[usage-observability.md](usage-observability.md) (provider sources, quota vs rate limit vs context,
+freshness and cadence).
+
 ## Logs
 
 ```bash

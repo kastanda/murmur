@@ -34,6 +34,12 @@ struct MenuContent: View {
         } else {
             Text("\(L.project): \(controller.selectedProject?.name ?? L.noProjectSelected)")
             Text("\(L.status): \(statusLine)")
+            // Active work, compact: the count of ROOT tasks (a Claude→Codex→Cursor chain is one),
+            // and queued work only when there is some. The list itself lives in the submenu.
+            if let work = controller.workSnapshot {
+                Text(WorkMenu.activeSummary(work.summary))
+                if let queued = WorkMenu.queuedSummary(work.summary) { Text(queued) }
+            }
             if let error = controller.lastError {
                 Text(error)
             }
@@ -76,6 +82,52 @@ struct MenuContent: View {
         codexSection
         cursorSection
         Text("\(L.telegram): \(controller.telegramLabel)")
+        limitsMenu
+        activeTasksMenu
+    }
+
+    // MARK: active tasks (compact submenu; clicking a task opens its detail window)
+
+    @ViewBuilder private var activeTasksMenu: some View {
+        if let work = controller.workSnapshot {
+            Menu(L.activeTasks) {
+                if work.tasks.isEmpty { Text(L.noActiveTasks) }
+                ForEach(work.tasks) { task in
+                    let row = WorkMenu.row(task)
+                    Button(row.title) { openWindow(id: WindowID.task, value: task.workflowId) }
+                    Text("   \(row.detailLine)")
+                    if let chain = row.chainLine { Text("   \(chain)") }
+                    Divider()
+                }
+                if !work.recent.isEmpty {
+                    Text(L.recentTasks)
+                    ForEach(work.recent) { task in
+                        Button("\(WorkMenu.statusLabel(task.status, stalled: task.stalled)) · \(task.requestSummary)") {
+                            openWindow(id: WindowID.task, value: task.workflowId)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: provider limits (subscription usage only; slow cadence, manual refresh)
+
+    @ViewBuilder private var limitsMenu: some View {
+        Menu(L.limits) {
+            if let report = controller.usageReport {
+                ForEach(report.orderedProviders, id: \.name) { entry in
+                    ForEach(Array(WorkMenu.usageLines(name: entry.name, usage: entry.usage).enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                    }
+                    Divider()
+                }
+            } else {
+                Text(L.usageUnavailable)
+            }
+            Button(L.refreshLimits) { controller.refreshLimits() }
+                .disabled(controller.usageRefreshing)
+        }
     }
 
     // MARK: Claude model/effort
@@ -210,6 +262,7 @@ struct MenuContent: View {
 }
 
 enum WindowID {
+    static let task = "murmur-task"
     static let status = "murmur-status"
     static let send = "murmur-send"
     static let doctor = "murmur-doctor"

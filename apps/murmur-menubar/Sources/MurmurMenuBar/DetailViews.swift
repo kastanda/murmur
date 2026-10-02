@@ -137,6 +137,7 @@ struct SendTaskWindow: View {
     @State private var result: String?
     @State private var failure: String?
     @State private var sending = false
+    @State private var lowLimitConfirm = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -183,9 +184,20 @@ struct SendTaskWindow: View {
         }
         .padding(20)
         .frame(minWidth: 520, minHeight: 420)
+        .confirmationDialog(L.lowLimitTitle, isPresented: $lowLimitConfirm, titleVisibility: .visible) {
+            Button(L.sendAnyway) { performSend() }
+            Button(L.cancel, role: .cancel) {}
+        } message: {
+            Text(controller.lowLimitWarnings.joined(separator: "\n"))
+        }
     }
 
+    /// A low provider limit is a PASSIVE warning: sending is never blocked, only confirmed.
     private func submit() {
+        if !controller.lowLimitWarnings.isEmpty { lowLimitConfirm = true } else { performSend() }
+    }
+
+    private func performSend() {
         let text = task
         sending = true
         result = nil
@@ -196,6 +208,107 @@ struct SendTaskWindow: View {
             case let .failed(message): failure = message
             }
             sending = false
+        }
+    }
+}
+
+
+/// One task, in words. No protocol metadata by default: status, who is working, the stage, the
+/// bounded request, the chain, the last activity, and — when finished — the correlated result.
+struct TaskDetailWindow: View {
+    @ObservedObject var controller: MurmurController
+    let workflowId: String
+    @State private var detail: WorkTaskDetail?
+    @State private var confirmCancel = false
+    @State private var notice: String?
+
+    private static let logAgents: Set<String> = ["claude", "codex", "cursor", "root"]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if let task = detail?.task {
+                Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
+                    row(L.taskStatus, controller.cancellingTasks.contains(workflowId)
+                        ? L.taskCancelling : WorkMenu.statusLabel(task.status, stalled: task.stalled))
+                    row(L.project, controller.selectedProject?.name ?? L.unknown)
+                    row(L.taskSubmitted, WorkMenu.parseISO(task.submittedAt)
+                        .map { $0.formatted(date: .abbreviated, time: .standard) } ?? L.unknown)
+                    row(L.taskElapsed, WorkMenu.elapsed(for: task))
+                    if let agent = task.currentAgent { row(L.taskCurrentAgent, WorkMenu.agent(agent)) }
+                    if let stage = task.currentStage { row(L.taskCurrentStage, stage) }
+                }
+                Divider()
+                Text(L.taskRequest).font(.headline)
+                Text(detail?.request ?? "").textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if !task.chain.isEmpty {
+                    Text(L.taskChain).font(.headline)
+                    Text(WorkMenu.chainText(task.chain)).textSelection(.enabled)
+                }
+                if let last = task.lastActivity {
+                    Text(L.taskLastActivity).font(.headline)
+                    Text(last)
+                }
+                if let result = detail?.result {
+                    Divider()
+                    Text(L.taskResult).font(.headline)
+                    ScrollView { Text(result).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+                        .frame(maxHeight: 160)
+                }
+                if let notice { Text(notice).foregroundStyle(.orange) }
+                HStack {
+                    Button(L.taskOpenLogs) { openLogs(agent: task.currentAgent) }
+                    Spacer()
+                    Button(L.taskCancel, role: .destructive) { confirmCancel = true }
+                        .disabled(!task.cancellable || controller.cancellingTasks.contains(workflowId))
+                }
+            } else {
+                ProgressView()
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(20)
+        .frame(minWidth: 480, minHeight: 360)
+        // Cancelling stops ONLY this task — the dialog says so, and the button is not "Остановить".
+        .confirmationDialog(L.cancelConfirmTitle, isPresented: $confirmCancel, titleVisibility: .visible) {
+            Button(L.taskCancel, role: .destructive) { cancel() }
+            Button(L.cancelConfirmKeep, role: .cancel) {}
+        } message: {
+            Text(L.cancelConfirmMessage)
+        }
+        .task(id: workflowId) {
+            while !Task.isCancelled {
+                detail = await controller.taskDetail(workflowId) ?? detail
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+            }
+        }
+    }
+
+    private func cancel() {
+        Task {
+            switch await controller.cancelTask(workflowId) {
+            case let .accepted(status): notice = status == "cancelled" ? L.cancelledBySystem : L.taskCancelRequested
+            case .alreadyFinished: notice = L.cancelAlreadyFinished
+            case .unknown: notice = L.cancelUnknown
+            case let .failed(message): notice = message
+            }
+            detail = await controller.taskDetail(workflowId) ?? detail
+        }
+    }
+
+    private func openLogs(agent: String?) {
+        guard let logsDir = controller.selectedProject?.logsDir else { return }
+        if let agent, Self.logAgents.contains(agent) {
+            NSWorkspace.shared.open(URL(fileURLWithPath: "\(logsDir)/\(agent).log"))
+        } else {
+            NSWorkspace.shared.open(URL(fileURLWithPath: logsDir))
+        }
+    }
+
+    @ViewBuilder private func row(_ label: String, _ value: String) -> some View {
+        GridRow {
+            Text(label).foregroundStyle(.secondary)
+            Text(value)
         }
     }
 }

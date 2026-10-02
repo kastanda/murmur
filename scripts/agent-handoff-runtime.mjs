@@ -14,6 +14,9 @@
  */
 import { HANDOFF_REASONS } from "@murmurv2/core";
 import { HandoffRejection, composeContinuationPrompt } from "./agent-handoff-controller.mjs";
+import {
+  IGNORED_DUE_TO_CANCELLED_WORKFLOW, WORKFLOW_CANCELLED_REASON, isWorkflowCancelRequested,
+} from "./workflow-control.mjs";
 
 export { HandoffRejection };
 
@@ -47,6 +50,38 @@ export class HandoffTurnCoordinator {
   delegate(options) { return this.controller.delegate(options); }
 
   /**
+   * Has the operator cancelled the root workflow this message belongs to? Reads the durable
+   * intent from the SAME database the handoff store and dispatch queue live in.
+   */
+  isWorkflowCancelled(rootMessageId) {
+    return isWorkflowCancelRequested(this.controller.store.db, rootMessageId);
+  }
+
+  /**
+   * Is the workflow of an ALREADY-RECORDED inbound message cancelled? Used by durable reply
+   * recovery (after a restart) so a stored result can never resurrect a cancelled workflow.
+   * The root is derived exactly as `prepareTurn` does: the dispatch's own lineage, else the
+   * continuation its `replyToMessageId` closes, else the message itself.
+   */
+  isInboundMessageWorkflowCancelled(inboundMessageId) {
+    const db = this.controller.store.db;
+    let payload = null;
+    try {
+      const row = db.prepare("SELECT payload_json AS json FROM wake_dispatch WHERE msg_id = ? LIMIT 1").get(inboundMessageId);
+      payload = row?.json ? JSON.parse(row.json) : null;
+    } catch {
+      payload = null;
+    }
+    const candidate = payload?.replyToMessageId ? this.controller.store.get(payload.replyToMessageId) : null;
+    return this.isWorkflowCancelled(this.rootOf(payload ?? { msgId: inboundMessageId }, candidate));
+  }
+
+  /** The root workflow a payload belongs to: continuation's root, inbound handoff's root, else itself. */
+  rootOf(payload, candidate = null) {
+    return candidate?.rootMessageId ?? payload?.handoff?.rootMessageId ?? payload?.msgId ?? null;
+  }
+
+  /**
    * Build the turn context for one claimed dispatch.
    *
    * A dispatch whose `replyToMessageId` is the exact msgId of one of OUR open handoffs
@@ -67,6 +102,34 @@ export class HandoffTurnCoordinator {
     };
 
     const candidate = this.controller.matchChildReply(payload);
+
+    // CANCELLATION GATE. Before any prompt is built or model started: a message of a
+    // cancelled workflow — a queued root task, an inbound child task, or a late child
+    // reply — is refused with a stable audit disposition. It stays in message history;
+    // it never wakes, resumes or continues the workflow.
+    const rootForGate = this.rootOf(payload, candidate);
+    if (this.isWorkflowCancelled(rootForGate)) {
+      if (candidate && candidate.state === "open") {
+        this.controller.markContinuationTerminal({
+          fence, identity, handoffMsgId: candidate.handoffMsgId, reason: WORKFLOW_CANCELLED_REASON,
+        });
+      }
+      return {
+        kind: candidate ? "continuation" : "ordinary",
+        cancelledWorkflow: true,
+        rejection: { reason: IGNORED_DUE_TO_CANCELLED_WORKFLOW, detail: rootForGate },
+        continuation: candidate,
+        binding: bindingContext,
+        isHandoffInbound: false,
+        resumeSessionId: null,
+        parentActivePath: [],
+        rootMessageId: rootForGate,
+        rootConversationId: payload?.handoff?.rootConversationId ?? payload?.conversationId ?? null,
+        causedByMessageId: payload.msgId,
+        reply: { to: payload.from, conversationId: payload.conversationId, replyToMessageId: payload.msgId },
+        promptText: null,
+      };
+    }
     if (candidate) {
       return this.prepareContinuation({ payload, candidate, bindingContext, runtimeKind, memberSlot,
         serverGeneration, serverIdentity, resumeGuard, fence, identity });
@@ -227,7 +290,8 @@ export class HandoffTurnCoordinator {
       reason,
       nextAttemptAt: this.now(),
     }, this.now());
-    this.log("error", "Handoff turn rejected before model execution", {
+    this.log(turn.cancelledWorkflow ? "warn" : "error", turn.cancelledWorkflow
+      ? "Message of a cancelled workflow ignored" : "Handoff turn rejected before model execution", {
       msgId: dispatch?.msgId ?? identity.msgId,
       memberSlot: identity.memberSlot,
       reason,
@@ -254,6 +318,22 @@ export const settleRuntimeTurn = async ({
     replyToMessageId: payload.msgId,
   };
 
+  // A workflow cancelled while this turn ran: the result is kept in the receipt for audit
+  // but is neither delivered nor allowed to delegate (no resurrection, no fake reply).
+  if (coordinator && turn && coordinator.isWorkflowCancelled(turn.rootMessageId)) {
+    dispatchStore.recordProcessingReceipt({
+      ...attempt,
+      status: "completed",
+      sessionId,
+      metadata: { ...extraMetadata, disposition: IGNORED_DUE_TO_CANCELLED_WORKFLOW, resultText },
+    }, now());
+    dispatchStore.markHandedOffIfLatestAttemptCompleted(identity, attempt.attemptId, now());
+    log("warn", "Turn result suppressed: workflow cancelled by the operator", { msgId: payload.msgId });
+    if (!bindingStore.validateFence(fence, identity)) return { status: "late-result-dropped" };
+    if (bindingStore.markIdle(fence, now()) !== 1) return { status: "late-result-dropped" };
+    return { status: "completed-cancelled-workflow", attemptId: attempt.attemptId, reply: null };
+  }
+
   const action = coordinator && turn ? coordinator.classifyTerminal(resultText) : { kind: "none" };
   if (action.kind === "invalid") {
     // A frame that clearly claims `murmur.action` is NEVER downgraded into an ordinary reply.
@@ -278,6 +358,18 @@ export const settleRuntimeTurn = async ({
     } catch (error) {
       // Losing the fence inside the transaction is not a model failure: nothing was
       // created and a live generation owns the work now.
+      if (error instanceof HandoffRejection && error.reason === WORKFLOW_CANCELLED_REASON) {
+        // The intent landed between the check above and the fenced create: nothing was created.
+        log("warn", "Handoff creation refused: workflow cancelled by the operator", { msgId: payload.msgId });
+        dispatchStore.recordProcessingReceipt({
+          ...attempt, status: "completed", sessionId,
+          metadata: { ...extraMetadata, disposition: IGNORED_DUE_TO_CANCELLED_WORKFLOW, resultText },
+        }, now());
+        dispatchStore.markHandedOffIfLatestAttemptCompleted(identity, attempt.attemptId, now());
+        if (!bindingStore.validateFence(fence, identity)) return { status: "late-result-dropped" };
+        if (bindingStore.markIdle(fence, now()) !== 1) return { status: "late-result-dropped" };
+        return { status: "completed-cancelled-workflow", attemptId: attempt.attemptId, reply: null };
+      }
       if (error instanceof HandoffRejection && error.reason === HANDOFF_REASONS.continuationStaleBinding) {
         log("warn", "Handoff creation refused: runtime generation is stale", {
           msgId: payload.msgId, detail: error.detail ?? null,
@@ -335,7 +427,11 @@ export const settleRuntimeTurn = async ({
   if (!receipt.accepted) throw new Error(`${runtimeKind}-completion-rejected:${receipt.reason}`);
   dispatchStore.markHandedOffIfLatestAttemptCompleted(identity, attempt.attemptId, now());
   let reply = null;
-  if (bindingStore.validateFence(fence, identity)) {
+  // Re-check immediately before the reply is enqueued: a cancel that committed after the check
+  // at the top of this function (but before this point) still wins and the reply is withheld.
+  const cancelledBeforeSend = Boolean(coordinator && turn && coordinator.isWorkflowCancelled(turn.rootMessageId));
+  if (cancelledBeforeSend) log("warn", "Reply withheld: workflow cancelled by the operator", { msgId: payload.msgId });
+  if (!cancelledBeforeSend && bindingStore.validateFence(fence, identity)) {
     try {
       reply = await sendReply({
         msgId: attempt.attemptId,
@@ -355,5 +451,6 @@ export const settleRuntimeTurn = async ({
   }
   if (!bindingStore.validateFence(fence, identity)) return { status: "late-result-dropped" };
   if (bindingStore.markIdle(fence, now()) !== 1) return { status: "late-result-dropped" };
+  if (cancelledBeforeSend) return { status: "completed-cancelled-workflow", attemptId: attempt.attemptId, reply: null };
   return { status: reply ? "completed" : "completed-reply-pending", attemptId: attempt.attemptId, reply };
 };

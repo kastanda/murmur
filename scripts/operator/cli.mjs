@@ -36,6 +36,8 @@ import {
   publicProfileSummary,
 } from "./profile.mjs";
 import { commandClaude } from "./claude.mjs";
+import { commandWork } from "./work.mjs";
+import { commandUsage } from "./usage.mjs";
 import { commandCodex } from "./codex-model.mjs";
 import { commandCursor } from "./cursor.mjs";
 import { commandNotify } from "./notify.mjs";
@@ -81,7 +83,8 @@ import {
   unsettledOwnedChildren,
   writeRunState,
 } from "./runstate.mjs";
-import { enqueueRootTask, findRejectedCandidates, waitForCorrelatedReply } from "./send.mjs";
+import { enqueueRootTask, findRejectedCandidates, rootWorkflowCancelledAt, waitForCorrelatedReply } from "./send.mjs";
+import { lowLimitWarnings } from "./usage.mjs";
 import { collectStatus } from "./status.mjs";
 import { CODEX_APP_SERVER_CHILD, cleanupRuntimeArtifacts, reapOrphanedChildren } from "./supervisor.mjs";
 
@@ -106,6 +109,10 @@ Usage:
   murmur projects [--json]
   murmur claude   <project> config [--json] [--refresh] | model <id|inherit> | effort <level>
   murmur codex    <project> config [--json] [--refresh] | model <id|inherit> | effort <level>
+  murmur tasks    <project> [--json]
+  murmur task     <project> <workflow-id> [--json]
+  murmur cancel   <project> <workflow-id> [--json]
+  murmur usage    <project> [--json] [--refresh]
   murmur cursor   <project> config [--json]
   murmur notify  status | mode <activity|errors|default> | migrate [--from <dir>] | test
 
@@ -1234,6 +1241,10 @@ const commandSend = async ({ args, flags }) => {
     return 3;
   }
 
+  // Passive, NON-BLOCKING warning from the last cached usage snapshot (never a fresh provider
+  // call, never an interactive prompt): the task is sent regardless.
+  for (const line of await lowLimitWarnings()) err(`murmur: ${line}`);
+
   const sent = await enqueueRootTask({
     murmurRoot: MURMUR_ROOT,
     rootDataDir: paths.agentDir(root.name),
@@ -1256,7 +1267,20 @@ const commandSend = async ({ args, flags }) => {
     conversationId: sent.conversationId,
   };
   const timeoutMs = (flags.timeoutSeconds ?? 600) * 1000;
-  const reply = await waitForCorrelatedReply(paths.agentDbFile(root.name), correlation, { timeoutMs });
+  const reply = await waitForCorrelatedReply(paths.agentDbFile(root.name), correlation, {
+    timeoutMs,
+    cancelCheck: () => rootWorkflowCancelledAt(paths.agentDbFile(root.name), sent.msgId),
+  });
+  if (reply?.cancelled) {
+    // An operator/runtime status — deliberately NOT attributed to any agent.
+    if (flags.json) {
+      sendResult({ ok: false, reason: "cancelled", msgId: sent.msgId, conversationId: sent.conversationId, systemResult: "Задача отменена пользователем." });
+    } else {
+      out("");
+      out("Задача отменена пользователем.");
+    }
+    return 5;
+  }
   if (!reply) {
     const rejected = findRejectedCandidates(paths.agentDbFile(root.name), correlation);
     if (flags.json) {
@@ -1305,6 +1329,10 @@ const COMMANDS = {
   notify: (parsed) => commandNotify({ ...parsed, out, err }),
   claude: (parsed) => commandClaude({ ...parsed, out, err }),
   codex: (parsed) => commandCodex({ ...parsed, out, err }),
+  usage: (parsed) => commandUsage({ ...parsed, out, err }),
+  tasks: (parsed) => commandWork({ ...parsed, command: "tasks", out, err }),
+  task: (parsed) => commandWork({ ...parsed, command: "task", out, err }),
+  cancel: (parsed) => commandWork({ ...parsed, command: "cancel", out, err }),
   cursor: (parsed) => commandCursor({ ...parsed, out, err }),
 };
 
