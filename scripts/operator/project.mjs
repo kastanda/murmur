@@ -103,6 +103,13 @@ export const projectPathsFor = (projectId, { home = murmurHome() } = {}) => {
     home,
     root,
     projectFile: path.join(root, "project.json"),
+    // Per-project RUNTIME POLICY — which Claude model/effort this project's Claude
+    // identity should use. Deliberately its OWN file, separate from every
+    // `agent-config.json` (which holds private signing/encryption keys) and from
+    // `project.json` (which can hold a NATS token): this file holds no credential of any
+    // kind, ever, so it can be read/written freely by the operator CLI and the menu bar
+    // app without going anywhere near key material.
+    claudePreferencesFile: path.join(root, "claude-preferences.json"),
     agentsDir,
     agentDir: (agentName) => path.join(agentsDir, agentName),
     agentConfigFile: (agentName) => path.join(agentsDir, agentName, "agent-config.json"),

@@ -214,6 +214,22 @@ public struct MurmurCLI: Sendable {
         )
     }
 
+    public func claudeConfigInvocation(project: String) -> CommandInvocation {
+        CommandInvocation(executable: executable, arguments: ["claude", project, "config", "--json"])
+    }
+
+    /// `value` is whatever `claudeConfig(project:)` already reported as a supported
+    /// option (see `ClaudeCapabilities.modelMenuOptions`/`effortMenuOptions`) — the CLI
+    /// re-validates it independently regardless, so a stale or hand-typed value is still
+    /// refused rather than ever reaching Claude's own argv unchecked.
+    public func setClaudeModelInvocation(project: String, value: String) -> CommandInvocation {
+        CommandInvocation(executable: executable, arguments: ["claude", project, "model", value])
+    }
+
+    public func setClaudeEffortInvocation(project: String, value: String) -> CommandInvocation {
+        CommandInvocation(executable: executable, arguments: ["claude", project, "effort", value])
+    }
+
     // MARK: execution
 
     public func status(project: String) async throws -> ProjectStatus {
@@ -233,6 +249,22 @@ public struct MurmurCLI: Sendable {
     public func notifyStatus() async throws -> NotifyStatus {
         // Exit 3 means "not configured", which this decodes rather than throws on.
         try await decode(NotifyStatus.self, from: notifyStatusInvocation(), timeout: 20, allowNonZeroExit: true)
+    }
+
+    public func claudeConfig(project: String) async throws -> ClaudeConfigReport {
+        try await decode(ClaudeConfigReport.self, from: claudeConfigInvocation(project: project), timeout: 20, allowNonZeroExit: true)
+    }
+
+    /// Writes THROUGH the CLI, exactly like every other preference change in this app;
+    /// never edits `claude-preferences.json` directly. A rejected value (unsupported by
+    /// the installed CLI) surfaces as `MurmurCLIError.commandFailed` with the CLI's own
+    /// one-line reason — see `commandClaude`'s `err(...)` calls on the JS side.
+    public func setClaudeModel(project: String, value: String) async throws {
+        try await runLifecycle(setClaudeModelInvocation(project: project, value: value), timeout: 20)
+    }
+
+    public func setClaudeEffort(project: String, value: String) async throws {
+        try await runLifecycle(setClaudeEffortInvocation(project: project, value: value), timeout: 20)
     }
 
     public func send(project: String, task: String, timeoutSeconds: Int) async throws -> SendResult {

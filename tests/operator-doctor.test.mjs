@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -320,3 +320,162 @@ test("the rendered report never contains key material", async () => {
     ctx.cleanup();
   }
 });
+
+// ---------------------------------------------------------------------------
+// claude-model-config — Part of the Claude model control slice
+// ---------------------------------------------------------------------------
+
+{
+  const { checkClaudeModelConfig } = await import("../scripts/operator/doctor.mjs");
+  const { writeClaudePreferences } = await import("../scripts/operator/claude-config.mjs");
+
+  const CAPS_FULL = async () => ({
+    modelFlagSupported: true, effortFlagSupported: true,
+    supportedModels: ["sonnet", "opus"], supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+  });
+
+  const tmpPaths = () => {
+    const dir = mkdtempSync(path.join(shortTmp(), "mur-doctor-claude-"));
+    return { dir, claudePreferencesFile: path.join(dir, "claude-preferences.json") };
+  };
+
+  test("doctor passes an absent preference — inherit is never a fault", async () => {
+    const paths = tmpPaths();
+    try {
+      const results = await checkClaudeModelConfig({ paths, discoverCapabilities: CAPS_FULL });
+      assert.deepEqual(results.map((r) => r.status), [PASS]);
+    } finally {
+      rmSync(paths.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("doctor passes an explicit, currently-supported selection", async () => {
+    const paths = tmpPaths();
+    try {
+      await writeClaudePreferences(paths, { version: 1, model: "sonnet", effort: "medium" });
+      const results = await checkClaudeModelConfig({ paths, discoverCapabilities: CAPS_FULL });
+      assert.deepEqual(results.map((r) => r.status), [PASS, PASS]);
+      assert.ok(results.every((r) => !r.fatal), "an unsupported model/effort never blocks `murmur start`");
+    } finally {
+      rmSync(paths.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("doctor FAILS when the configured model is no longer supported by the installed CLI", async () => {
+    const paths = tmpPaths();
+    try {
+      await writeClaudePreferences(paths, { version: 1, model: "opus", effort: "medium" });
+      const noOpus = async () => ({
+        modelFlagSupported: true, effortFlagSupported: true,
+        supportedModels: ["sonnet"], supportedEfforts: ["low", "medium", "high"],
+      });
+      const results = await checkClaudeModelConfig({ paths, discoverCapabilities: noOpus });
+      const modelCheck = results.find((r) => r.name === "claude-model-config");
+      assert.equal(modelCheck.status, FAIL);
+      assert.match(modelCheck.detail, /opus.*no longer supported/);
+      assert.match(modelCheck.fix, /murmur claude/);
+    } finally {
+      rmSync(paths.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("doctor FAILS when the configured effort is no longer supported", async () => {
+    const paths = tmpPaths();
+    try {
+      await writeClaudePreferences(paths, { version: 1, model: "sonnet", effort: "xhigh" });
+      const noXhigh = async () => ({
+        modelFlagSupported: true, effortFlagSupported: true,
+        supportedModels: ["sonnet", "opus"], supportedEfforts: ["low", "medium", "high"],
+      });
+      const results = await checkClaudeModelConfig({ paths, discoverCapabilities: noXhigh });
+      const effortCheck = results.find((r) => r.name === "claude-effort-config");
+      assert.equal(effortCheck.status, FAIL);
+      assert.match(effortCheck.detail, /xhigh.*no longer supported/);
+    } finally {
+      rmSync(paths.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("doctor passes inherit even when the installed CLI supports neither option", async () => {
+    const paths = tmpPaths();
+    try {
+      await writeClaudePreferences(paths, { version: 1, model: "inherit", effort: "inherit" });
+      const noSupport = async () => ({
+        modelFlagSupported: false, effortFlagSupported: false, supportedModels: [], supportedEfforts: [],
+      });
+      const results = await checkClaudeModelConfig({ paths, discoverCapabilities: noSupport });
+      assert.deepEqual(results.map((r) => r.status), [PASS, PASS]);
+    } finally {
+      rmSync(paths.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("doctor surfaces an invalid preferences file without crashing the whole run", async () => {
+    const paths = tmpPaths();
+    try {
+      writeFileSync(paths.claudePreferencesFile, "{not json");
+      const results = await checkClaudeModelConfig({ paths, discoverCapabilities: CAPS_FULL });
+      assert.deepEqual(results.map((r) => r.status), [FAIL]);
+      assert.match(results[0].detail, /invalid/);
+    } finally {
+      rmSync(paths.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a brand-new project profile gets sonnet/medium defaults, discovered via the injected capabilities", async () => {
+    const { bootstrapProfile: bootstrap } = await import("../scripts/operator/profile.mjs");
+    const { projectIdFor: pidFor, projectPathsFor: pathsFor } = await import("../scripts/operator/project.mjs");
+    const { loadClaudePreferences } = await import("../scripts/operator/claude-config.mjs");
+    const dir = mkdtempSync(path.join(shortTmp(), "mur-doctor-newproj-"));
+    try {
+      const projectPath = path.join(dir, "project");
+      mkdirSync(projectPath, { recursive: true });
+      const projectId = pidFor(projectPath);
+      const paths = pathsFor(projectId, { home: path.join(dir, ".murmur") });
+      await bootstrap({ projectId, projectPath, paths, discoverCapabilities: CAPS_FULL });
+      const loaded = await loadClaudePreferences(paths);
+      assert.deepEqual(loaded, { state: "configured", preferences: { version: 1, model: "sonnet", effort: "medium" } });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("reconciling an EXISTING profile never writes or changes claude-preferences.json", async () => {
+    const { bootstrapProfile: bootstrap } = await import("../scripts/operator/profile.mjs");
+    const { projectIdFor: pidFor, projectPathsFor: pathsFor } = await import("../scripts/operator/project.mjs");
+    const dir = mkdtempSync(path.join(shortTmp(), "mur-doctor-existing-"));
+    try {
+      const projectPath = path.join(dir, "project");
+      mkdirSync(projectPath, { recursive: true });
+      const projectId = pidFor(projectPath);
+      const paths = pathsFor(projectId, { home: path.join(dir, ".murmur") });
+      await bootstrap({ projectId, projectPath, paths, discoverCapabilities: CAPS_FULL });
+      await writeClaudePreferences(paths, { version: 1, model: "opus", effort: "high" });
+
+      // Simulate a project that was bootstrapped before this feature existed and has no
+      // preference file, to prove reconciliation does not retroactively create one either.
+      const legacyDir = mkdtempSync(path.join(shortTmp(), "mur-doctor-legacy-"));
+      const legacyProjectPath = path.join(legacyDir, "project");
+      mkdirSync(legacyProjectPath, { recursive: true });
+      const legacyProjectId = pidFor(legacyProjectPath);
+      const legacyPaths = pathsFor(legacyProjectId, { home: path.join(legacyDir, ".murmur") });
+      // Bootstrap WITHOUT the claude step ever running, by writing project.json directly
+      // the way bootstrapProfile would have before this feature existed is impractical
+      // here; instead, bootstrap normally then delete the preferences file to simulate it.
+      await bootstrap({ projectId: legacyProjectId, projectPath: legacyProjectPath, paths: legacyPaths, discoverCapabilities: CAPS_FULL });
+      rmSync(legacyPaths.claudePreferencesFile);
+
+      // Re-run reconciliation on BOTH: the explicit one must keep its explicit choice,
+      // and the one with no file must NOT have one invented for it.
+      await bootstrap({ projectId, projectPath, paths, discoverCapabilities: CAPS_FULL });
+      await bootstrap({ projectId: legacyProjectId, projectPath: legacyProjectPath, paths: legacyPaths, discoverCapabilities: CAPS_FULL });
+
+      const kept = JSON.parse(readFileSync(paths.claudePreferencesFile, "utf8"));
+      assert.deepEqual(kept, { version: 1, model: "opus", effort: "high" });
+      assert.equal(existsSync(legacyPaths.claudePreferencesFile), false,
+        "reconciliation of an existing profile must never retroactively create a preferences file");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}

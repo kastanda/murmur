@@ -25,9 +25,20 @@ export const claudeHandoffResumeGuard = ({ continuation, binding }) => {
   return { ok: true };
 };
 
-export function buildClaudeOneShotArgs({ prompt, sessionId, resume = false, permissionMode = "dontAsk", model }) {
+/**
+ * `model`/`effort` are passed through UNVALIDATED here on purpose: validation against the
+ * installed CLI's actual discovered capabilities happens once, at the policy boundary
+ * (`operator/claude-config.mjs`), before a value is ever written to the project's
+ * preferences file. By the time a value reaches this function it is already a value an
+ * operator explicitly chose and Murmur already confirmed the CLI accepts — this function
+ * only builds argv from it. Passing `undefined`/omitting a flag entirely is how "inherit"
+ * is expressed: Murmur adds no override and the installed CLI's own configuration decides,
+ * exactly as it did before either option existed.
+ */
+export function buildClaudeOneShotArgs({ prompt, sessionId, resume = false, permissionMode = "dontAsk", model, effort }) {
   const args = ["-p", "--safe-mode", "--output-format", "json", "--permission-mode", permissionMode, "--tools", ""];
   if (model) args.push("--model", model);
+  if (effort) args.push("--effort", effort);
   if (resume) args.push("--resume", sessionId);
   else args.push("--session-id", sessionId);
   args.push(prompt);
@@ -41,6 +52,7 @@ export function runClaudeOneShot({
   cwd,
   permissionMode = "dontAsk",
   model,
+  effort,
   timeoutMs = 300_000,
   terminateGraceMs = 5_000,
   command = "claude",
@@ -48,7 +60,7 @@ export function runClaudeOneShot({
   onSpawn = () => {},
 }) {
   return new Promise((resolve, reject) => {
-    const args = buildClaudeOneShotArgs({ prompt, sessionId, resume, permissionMode, model });
+    const args = buildClaudeOneShotArgs({ prompt, sessionId, resume, permissionMode, model, effort });
     const child = spawn(command, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
@@ -125,13 +137,14 @@ export class ClaudeOneShotRuntime {
     retryDelayMs = 1_000,
     permissionMode = "dontAsk",
     model,
+    effort,
     handoff = null,
     log = () => {},
   }) {
     Object.assign(this, {
       bindingStore, dispatchStore, agentId, projectId, cwd, sendReply, runner, now,
       heartbeatIntervalMs, turnTimeoutMs, terminateGraceMs, retryDelayMs,
-      permissionMode, model, handoff, log,
+      permissionMode, model, effort, handoff, log,
     });
   }
 
@@ -156,7 +169,18 @@ export class ClaudeOneShotRuntime {
       memberSlot: CLAUDE_AUTO_MEMBER_SLOT,
       leaseTtlMs,
       state: "STARTING",
-      metadata: { permissionMode: this.permissionMode },
+      // Recorded once, at daemon boot, because `this.model`/`this.effort` are fixed for
+      // the life of this process (see the module header on why a config-file change needs
+      // a restart to take effect). `status`/`doctor` read this back as the TRUTH of what
+      // is actually executing right now, as opposed to the project's current preference
+      // file — which a running daemon may have already fallen behind. "inherit" is
+      // recorded explicitly (never omitted) so a later comparison never has to guess
+      // whether an absent field meant "no override" or "not recorded yet".
+      metadata: {
+        permissionMode: this.permissionMode,
+        model: this.model || "inherit",
+        effort: this.effort || "inherit",
+      },
     }, this.now());
     const fence = {
       bindingId,
@@ -257,7 +281,15 @@ export class ClaudeOneShotRuntime {
         resume: resumeSession,
         cwd: this.cwd,
         permissionMode: this.permissionMode,
+        // Fixed per daemon process and applied to EVERY turn this runtime instance ever
+        // executes — a new session, a resumed session, and a turn caused by Codex, Cursor
+        // or the root operator all go through this same instance, so none of them can
+        // choose Claude's model/effort merely by being the sender. See
+        // `claude-one-shot-runtime.test.mjs` for the sender-independence proof, and
+        // `claude-capabilities.mjs` for empirical confirmation that `--model` on a
+        // `--resume`d session changes the effective model with no loss of context.
         model: this.model,
+        effort: this.effort,
         timeoutMs: this.turnTimeoutMs,
         terminateGraceMs: this.terminateGraceMs,
         onSpawn: ({ pid, processStartIdentity, child }) => {

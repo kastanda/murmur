@@ -14,6 +14,8 @@ import { createKeyPair, createSigningKeyPair, getCryptoProvider } from "@murmurv
 import { localHandoffCapabilities, peerCapabilityFields } from "../agent-handoff-controller.mjs";
 import { ensurePrivateDirectory, readPrivateJson, writePrivateJson } from "../secure-state.mjs";
 import { defaultScopeForRole, isNotifyScope } from "../notify-config.mjs";
+import { discoverClaudeCapabilities } from "../claude-capabilities.mjs";
+import { defaultClaudePreferencesFor, writeClaudePreferences } from "./claude-config.mjs";
 import { CLAUDE_AUTO_MEMBER_SLOT } from "../claude-one-shot-runtime.mjs";
 import { CURSOR_ACP_MEMBER_SLOT } from "../cursor-acp-runtime.mjs";
 import { CODEX_APP_SERVER_MEMBER_SLOT } from "../agent-runtime-adapter.mjs";
@@ -293,6 +295,9 @@ export const bootstrapProfile = async ({
   agents = DEFAULT_AGENTS,
   edges = DEFAULT_TRUST_EDGES,
   now = () => new Date().toISOString(),
+  // Injectable so tests get a fast, deterministic answer instead of spawning the real
+  // `claude` binary on every brand-new-profile test; production always uses the real one.
+  discoverCapabilities = discoverClaudeCapabilities,
 }) => {
   const alreadyBootstrapped = await exists(paths.projectFile);
 
@@ -399,6 +404,17 @@ export const bootstrapProfile = async ({
     if (alreadyBootstrapped && JSON.stringify(existingProject) !== JSON.stringify(project)) {
       repairs.push("project-metadata");
     }
+  }
+
+  // Claude model/effort defaults are written ONLY for a genuinely NEW profile, and only
+  // once: an EXISTING profile's absence of `claude-preferences.json` means "this project
+  // has never set one, and inherits Claude Code's own configuration" — changing that
+  // retroactively would be exactly the silent behaviour change section 5 forbids. The
+  // discovered capabilities decide which defaults are actually safe to write; a CLI that
+  // does not support an option gets "inherit" for it rather than a value nobody validated.
+  if (!alreadyBootstrapped && agents.some((agent) => agent.name === "claude")) {
+    const capabilities = await discoverCapabilities();
+    await writeClaudePreferences(paths, defaultClaudePreferencesFor(capabilities));
   }
 
   return {

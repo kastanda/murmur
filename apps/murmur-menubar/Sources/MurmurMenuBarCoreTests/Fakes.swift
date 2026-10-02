@@ -80,6 +80,62 @@ let doctorJSON = """
                            {"name":"telegram-notify","status":"PASS","detail":"configured (global: telegram:telegram)"}]}
 """
 
+/// Sonnet/Medium, explicitly selected and already matching what is running — the default
+/// shape most tests want, matching this project's OWN actual configured policy.
+let claudeConfigJSON = """
+{"project":"murmur",
+ "capabilities":{"available":true,"modelSupported":true,"effortSupported":true,
+   "supportedModels":["sonnet","opus"],"supportedEfforts":["low","medium","high","xhigh","max"],
+   "modelLabels":{"sonnet":"Sonnet","opus":"Opus","inherit":"По настройкам Claude Code"},
+   "effortLabels":{"low":"Низкое","medium":"Среднее","high":"Высокое","xhigh":"Повышенное","max":"Максимальное","inherit":"По настройкам Claude Code"}},
+ "claude":{"model":"sonnet","modelLabel":"Sonnet","effort":"medium","effortLabel":"Среднее",
+   "runningModel":"sonnet","runningEffort":"medium",
+   "effectiveModel":"sonnet","effectiveModelLabel":"Sonnet",
+   "effectiveEffort":"medium","effectiveEffortLabel":"Среднее",
+   "source":"murmur-project","effortSource":"murmur-project","pendingRestart":false,"configState":"configured"}}
+"""
+
+/// The operator just picked Opus/High while a Sonnet/Medium daemon is still running.
+let claudeConfigPendingRestartJSON = """
+{"project":"murmur",
+ "capabilities":{"available":true,"modelSupported":true,"effortSupported":true,
+   "supportedModels":["sonnet","opus"],"supportedEfforts":["low","medium","high","xhigh","max"],
+   "modelLabels":{"sonnet":"Sonnet","opus":"Opus","inherit":"По настройкам Claude Code"},
+   "effortLabels":{"low":"Низкое","medium":"Среднее","high":"Высокое","xhigh":"Повышенное","max":"Максимальное","inherit":"По настройкам Claude Code"}},
+ "claude":{"model":"opus","modelLabel":"Opus","effort":"high","effortLabel":"Высокое",
+   "runningModel":"sonnet","runningEffort":"medium",
+   "effectiveModel":"sonnet","effectiveModelLabel":"Sonnet",
+   "effectiveEffort":"medium","effectiveEffortLabel":"Среднее",
+   "source":"murmur-project","effortSource":"murmur-project","pendingRestart":true,"configState":"configured"}}
+"""
+
+/// Nothing ever configured for this project: pure inherit, Claude Code's own default shown.
+let claudeConfigInheritJSON = """
+{"project":"murmur",
+ "capabilities":{"available":true,"modelSupported":true,"effortSupported":true,
+   "supportedModels":["sonnet","opus"],"supportedEfforts":["low","medium","high","xhigh","max"],
+   "modelLabels":{"sonnet":"Sonnet","opus":"Opus","inherit":"По настройкам Claude Code"},
+   "effortLabels":{"low":"Низкое","medium":"Среднее","high":"Высокое","xhigh":"Повышенное","max":"Максимальное","inherit":"По настройкам Claude Code"}},
+ "claude":{"model":"inherit","modelLabel":"По настройкам Claude Code","effort":"inherit","effortLabel":"По настройкам Claude Code",
+   "runningModel":null,"runningEffort":null,
+   "effectiveModel":"sonnet","effectiveModelLabel":"Sonnet",
+   "effectiveEffort":null,"effectiveEffortLabel":null,
+   "source":"claude-code","effortSource":"claude-code","pendingRestart":false,"configState":"absent"}}
+"""
+
+/// The installed CLI supports neither flag at all.
+let claudeConfigUnsupportedJSON = """
+{"project":"murmur",
+ "capabilities":{"available":true,"modelSupported":false,"effortSupported":false,
+   "supportedModels":[],"supportedEfforts":[],
+   "modelLabels":{"inherit":"По настройкам Claude Code"},"effortLabels":{"inherit":"По настройкам Claude Code"}},
+ "claude":{"model":"inherit","modelLabel":"По настройкам Claude Code","effort":"inherit","effortLabel":"По настройкам Claude Code",
+   "runningModel":null,"runningEffort":null,
+   "effectiveModel":null,"effectiveModelLabel":null,
+   "effectiveEffort":null,"effectiveEffortLabel":null,
+   "source":"claude-code","effortSource":"claude-code","pendingRestart":false,"configState":"absent"}}
+"""
+
 /// The default fake: a healthy project, two projects, Telegram configured.
 func healthyRunner() -> FakeRunner {
     FakeRunner { invocation in
@@ -88,6 +144,7 @@ func healthyRunner() -> FakeRunner {
         case "status": return ok(healthyStatusJSON)
         case "notify": return ok(notifyJSON)
         case "doctor": return ok(doctorJSON)
+        case "claude": return ok(claudeConfigJSON)
         default: return ok("")
         }
     }

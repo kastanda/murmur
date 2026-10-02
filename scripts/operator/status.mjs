@@ -38,17 +38,21 @@ export const readAgentRuntimeState = (dbPath, agentId, { now = Date.now() } = {}
     const bindingRows = queryAll(
       db,
       `SELECT binding_id AS bindingId, runtime_kind AS runtimeKind, member_slot AS memberSlot,
-              state, last_heartbeat AS lastHeartbeat, lease_ttl_ms AS leaseTtlMs, pid, task_id AS taskId
+              state, last_heartbeat AS lastHeartbeat, lease_ttl_ms AS leaseTtlMs, pid, task_id AS taskId,
+              metadata_json AS metadataJson
          FROM runtime_bindings WHERE agent_id = ? ORDER BY updated_at DESC LIMIT 8`,
       [agentId],
     ) || [];
-    const bindings = bindingRows.map((row) => ({
+    const bindings = bindingRows.map(({ metadataJson, ...row }) => ({
       ...row,
       live: LIVE_BINDING_STATES.has(row.state),
       heartbeatAgeMs: Number.isFinite(Number(row.lastHeartbeat)) ? now - Number(row.lastHeartbeat) : null,
       heartbeatFresh: Number.isFinite(Number(row.lastHeartbeat))
         ? now - Number(row.lastHeartbeat) <= Number(row.leaseTtlMs || 30_000)
         : false,
+      // Set once at `ClaudeOneShotRuntime.start()` / recorded the same way by every other
+      // runtime kind's own `metadata`; never a secret (permission mode, model, effort).
+      metadata: metadataJson ? JSON.parse(metadataJson) : null,
     }));
 
     const dispatchRows = queryAll(db, "SELECT state, COUNT(*) AS n FROM wake_dispatch GROUP BY state") || [];

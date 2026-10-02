@@ -14,6 +14,8 @@ import { peerSupportsHandoffV1 } from "@murmurv2/core";
 import { readPrivateJson } from "../secure-state.mjs";
 import { SCOPE_OFF, describeNotifyConfig, isNotifyScope, loadNotifyConfig, notifyConfigPath } from "../notify-config.mjs";
 import { CODEX_SOURCES, discoverCodexExecutable } from "./codex.mjs";
+import { discoverClaudeCapabilities } from "../claude-capabilities.mjs";
+import { isSupportedEffort, isSupportedModel, loadClaudePreferences } from "./claude-config.mjs";
 import { DEFAULT_AGENTS, DEFAULT_NATS_URL, agentIdFor, enabledAgents, loadProfile, peersForAgent } from "./profile.mjs";
 import { socketPathFits, UNIX_SOCKET_PATH_MAX } from "./project.mjs";
 import { OWNED, UNKNOWN, ownedProcessState, provenGone } from "./proc.mjs";
@@ -262,6 +264,41 @@ const checkPairing = async ({ project, paths }) => {
         : repairable(`handoff-v1:${agent.name}->${peerName}`, "peer does not advertise protocol 1.1 + handoff-v1"));
     }
   }
+  return results;
+};
+
+/**
+ * The project's Claude model/effort PREFERENCE, validated against what the installed CLI
+ * can actually do right now.
+ *
+ * Never fails merely because the project uses "inherit" (that is the untouched, always-
+ * valid default — see `claude-config.mjs`), and never fails because the preferences file
+ * is simply absent (an ordinary state for a project that has never set one). It FAILS when
+ * an EXPLICIT selection is no longer something the installed CLI supports — exactly the
+ * situation that would otherwise silently fall back to no override with only a log line
+ * to notice it by.
+ */
+export const checkClaudeModelConfig = async ({ paths, discoverCapabilities = discoverClaudeCapabilities }) => {
+  const loaded = await loadClaudePreferences(paths);
+  if (loaded.state === "invalid") {
+    return [check("claude-model-config", FAIL, `claude-preferences.json is invalid: ${loaded.reason}`, { fatal: false })];
+  }
+  if (loaded.state === "absent") {
+    return [check("claude-model-config", PASS, "no project preference (inherits Claude Code's own configuration)")];
+  }
+  const capabilities = await discoverCapabilities();
+  const { model, effort } = loaded.preferences;
+  const results = [];
+  results.push(isSupportedModel(model, capabilities)
+    ? check("claude-model-config", PASS, model === "inherit" ? "inherit" : `${model} (supported by installed CLI)`)
+    : check("claude-model-config", FAIL, `configured model '${model}' is no longer supported by the installed Claude CLI`, {
+      fix: `murmur claude <project> model <${[...capabilities.supportedModels, "inherit"].join("|")}>`,
+    }));
+  results.push(isSupportedEffort(effort, capabilities)
+    ? check("claude-effort-config", PASS, effort === "inherit" ? "inherit" : `${effort} (supported by installed CLI)`)
+    : check("claude-effort-config", FAIL, `configured effort '${effort}' is no longer supported by the installed Claude CLI`, {
+      fix: `murmur claude <project> effort <${[...capabilities.supportedEfforts, "inherit"].join("|")}>`,
+    }));
   return results;
 };
 
@@ -594,6 +631,7 @@ export const runDiagnostics = async ({
   results.push(...await checkIdentities({ project, paths }));
   results.push(...await checkPairing({ project, paths }));
   results.push(...await checkRuntimeConfig({ project, paths }));
+  results.push(...await checkClaudeModelConfig({ paths }));
   results.push(...await checkCodexSocket({ project, paths, socketProbe }));
   results.push(...await checkSupervisor({ paths }));
   if (includeNotifications) results.push(...await checkNotifications({ project, paths, env, home: notifyHome }));

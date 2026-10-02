@@ -75,7 +75,10 @@ func expectThrows<T>(
 
 /// Proper nouns that stay in Latin script inside a Russian sentence: the product itself,
 /// the agents, and the technologies they are named after.
-let properNouns = ["Murmur", "Menu Bar", "Claude", "Codex", "Cursor", "Telegram", "NATS"]
+// Longer phrases are listed BEFORE their component words ("Claude Code" before "Claude"):
+// `isRussian` strips them in order, and removing "Claude" first would leave a stray
+// " Code" behind.
+let properNouns = ["Claude Code", "Murmur", "Menu Bar", "Claude", "Codex", "Cursor", "Telegram", "NATS", "Sonnet", "Opus"]
 
 /// Is this string Russian once the proper nouns are removed?
 ///

@@ -185,6 +185,104 @@ public struct SendResult: Codable, Equatable, Sendable {
     }
 }
 
+// MARK: - claude model/effort
+
+/// What the INSTALLED Claude CLI actually supports, discovered locally (no network —
+/// see the JS-side `claude-capabilities.mjs`). `modelLabels`/`effortLabels` is a
+/// value -> Russian-label map for EVERY selectable option (including `"inherit"`), so
+/// this app never maintains its own copy of a label and can never drift from the one
+/// place those labels are decided.
+public struct ClaudeCapabilities: Codable, Equatable, Sendable {
+    public let available: Bool
+    public let modelSupported: Bool
+    public let effortSupported: Bool
+    public let supportedModels: [String]
+    public let supportedEfforts: [String]
+    public let modelLabels: [String: String]
+    public let effortLabels: [String: String]
+
+    public init(
+        available: Bool, modelSupported: Bool, effortSupported: Bool,
+        supportedModels: [String], supportedEfforts: [String],
+        modelLabels: [String: String], effortLabels: [String: String]
+    ) {
+        self.available = available
+        self.modelSupported = modelSupported
+        self.effortSupported = effortSupported
+        self.supportedModels = supportedModels
+        self.supportedEfforts = supportedEfforts
+        self.modelLabels = modelLabels
+        self.effortLabels = effortLabels
+    }
+
+    /// The menu offers only a FIXED, simple subset (section 12: "keep the menu simple"),
+    /// intersected with what the installed CLI actually supports, so an option is never
+    /// shown that would just be rejected. `"inherit"` is appended last and unconditionally.
+    public var modelMenuOptions: [String] { supportedModels + ["inherit"] }
+    public var effortMenuOptions: [String] {
+        ["low", "medium", "high"].filter(supportedEfforts.contains) + ["inherit"]
+    }
+}
+
+/// The project's Claude model/effort preference: what was SELECTED, what is actually
+/// RUNNING right now (nil when nothing is), and the resulting EFFECTIVE value — see
+/// `operator/claude-config.mjs`'s `resolveClaudeConfig` for why these three can differ
+/// and which one is truth at any moment.
+public struct ClaudePreference: Codable, Equatable, Sendable {
+    public let model: String
+    public let modelLabel: String
+    public let effort: String
+    public let effortLabel: String
+    public let runningModel: String?
+    public let runningEffort: String?
+    public let effectiveModel: String?
+    public let effectiveModelLabel: String?
+    public let effectiveEffort: String?
+    public let effectiveEffortLabel: String?
+    public let source: String
+    public let effortSource: String
+    public let pendingRestart: Bool
+    public let configState: String
+    public let configReason: String?
+
+    public init(
+        model: String, modelLabel: String, effort: String, effortLabel: String,
+        runningModel: String?, runningEffort: String?,
+        effectiveModel: String?, effectiveModelLabel: String?,
+        effectiveEffort: String?, effectiveEffortLabel: String?,
+        source: String, effortSource: String, pendingRestart: Bool,
+        configState: String, configReason: String? = nil
+    ) {
+        self.model = model
+        self.modelLabel = modelLabel
+        self.effort = effort
+        self.effortLabel = effortLabel
+        self.runningModel = runningModel
+        self.runningEffort = runningEffort
+        self.effectiveModel = effectiveModel
+        self.effectiveModelLabel = effectiveModelLabel
+        self.effectiveEffort = effectiveEffort
+        self.effectiveEffortLabel = effectiveEffortLabel
+        self.source = source
+        self.effortSource = effortSource
+        self.pendingRestart = pendingRestart
+        self.configState = configState
+        self.configReason = configReason
+    }
+}
+
+public struct ClaudeConfigReport: Codable, Equatable, Sendable {
+    public let project: String
+    public let capabilities: ClaudeCapabilities
+    public let claude: ClaudePreference
+
+    public init(project: String, capabilities: ClaudeCapabilities, claude: ClaudePreference) {
+        self.project = project
+        self.capabilities = capabilities
+        self.claude = claude
+    }
+}
+
 // MARK: - health
 
 /// What the menu bar icon says at a glance.

@@ -64,6 +64,9 @@ import { AgentHandoffController, admitInboundHandoff, buildHandoffFailureText } 
 import { HandoffTurnCoordinator } from "./agent-handoff-runtime.mjs";
 import { SessionLeaseStore, createNativeLeaseGate } from "./lease.mjs";
 import { ensurePrivateDirectory, readPrivateJson, setPrivateUmask } from "./secure-state.mjs";
+import { murmurHome, projectPathsFor } from "./operator/project.mjs";
+import { discoverClaudeCapabilities } from "./claude-capabilities.mjs";
+import { isSupportedEffort, isSupportedModel, loadClaudePreferences } from "./operator/claude-config.mjs";
 // vault-guard: optional content policy hook (not included in OSS release)
 
 setPrivateUmask();
@@ -294,6 +297,58 @@ const wakeConfig = normalizeWakeConfig(config);
 const claudeOneShotConfig = config.runtime?.claudeOneShot || {};
 const claudeOneShotEnabled = claudeOneShotConfig.enabled === true;
 const claudeProjectId = claudeOneShotConfig.projectId || path.resolve(claudeOneShotConfig.cwd || process.cwd());
+
+/**
+ * The project's Claude model/effort PREFERENCE, resolved ONCE at daemon startup, exactly
+ * like every other `runtime.claudeOneShot` setting — and, like them, fixed for the life
+ * of this process (see `ClaudeOneShotRuntime`'s constructor doc). A later edit to
+ * `claude-preferences.json` is picked up the NEXT time this daemon starts, never by this
+ * running one; `murmur claude <project> config` reports that truthfully by comparing the
+ * file against this daemon's own recorded binding metadata, not by asking this process.
+ *
+ * Only a MODERN operator profile has `MURMUR_PROJECT_ID` (set by the supervisor) and a
+ * `claude-preferences.json` to read at all; a legacy `.data-claude` identity has neither,
+ * so it is completely unaffected by this feature and keeps its exact prior behaviour —
+ * no `--model`/`--effort` ever added, same as before this slice existed.
+ *
+ * Values are validated against the INSTALLED CLI's own discovered capabilities right
+ * here, not merely against the preferences file's shape: a model that was supported when
+ * selected but is no longer supported by whatever `claude` binary this daemon now finds
+ * on PATH must never be silently forwarded to argv (that already-covered failure mode is
+ * `is_error: true` buried inside a successful-looking JSON result — see
+ * `claude-capabilities.mjs`). An unsupported selection falls back to no override, exactly
+ * like `"inherit"`, and is logged so `murmur doctor` has something to point the operator
+ * at.
+ */
+let resolvedClaudeModel;
+let resolvedClaudeEffort;
+if (claudeOneShotEnabled) {
+  const murmurProjectId = typeof process.env.MURMUR_PROJECT_ID === "string" ? process.env.MURMUR_PROJECT_ID : null;
+  if (murmurProjectId) {
+    const projectPaths = projectPathsFor(murmurProjectId, { home: murmurHome() });
+    const loadedClaudePrefs = await loadClaudePreferences(projectPaths);
+    if (loadedClaudePrefs.state === "configured") {
+      const capabilities = await discoverClaudeCapabilities();
+      const { model: selectedModel, effort: selectedEffort } = loadedClaudePrefs.preferences;
+      if (isSupportedModel(selectedModel, capabilities)) {
+        if (selectedModel !== "inherit") resolvedClaudeModel = selectedModel;
+      } else {
+        log("warn", "Configured Claude model no longer supported by installed CLI; running without an override", {
+          configuredModel: selectedModel,
+        });
+      }
+      if (isSupportedEffort(selectedEffort, capabilities)) {
+        if (selectedEffort !== "inherit") resolvedClaudeEffort = selectedEffort;
+      } else {
+        log("warn", "Configured Claude effort no longer supported by installed CLI; running without an override", {
+          configuredEffort: selectedEffort,
+        });
+      }
+    } else if (loadedClaudePrefs.state === "invalid") {
+      log("warn", "Project Claude preferences are invalid; running without an override", { reason: loadedClaudePrefs.reason });
+    }
+  }
+}
 const cursorAcpConfig = normalizeCursorAcpRuntimeConfig(config.runtime?.cursorAcp);
 const cursorAcpEnabled = cursorAcpConfig.enabled === true;
 const codexAppServerRuntimeConfig = config.runtime?.codexAppServer || {};
@@ -699,7 +754,12 @@ const claudeOneShotRuntime = claudeOneShotEnabled ? new ClaudeOneShotRuntime({
   turnTimeoutMs: Number(claudeOneShotConfig.turnTimeoutMs) || 300_000,
   terminateGraceMs: Number(claudeOneShotConfig.terminateGraceMs) || 5_000,
   permissionMode: claudeOneShotConfig.permissionMode || "dontAsk",
-  model: claudeOneShotConfig.model,
+  // `resolvedClaudeModel`/`resolvedClaudeEffort` (the project's preference, validated
+  // against this installed CLI) take precedence; `claudeOneShotConfig.model` remains as a
+  // fallback for the rare case of a hand-edited `agent-config.json`, so nothing that
+  // already worked stops working.
+  model: resolvedClaudeModel ?? claudeOneShotConfig.model,
+  effort: resolvedClaudeEffort,
   handoff: handoffCoordinator,
   log,
 }) : null;

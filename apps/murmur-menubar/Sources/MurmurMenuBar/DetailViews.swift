@@ -29,6 +29,13 @@ struct StatusWindow: View {
                     row(L.openContinuations, "\(controller.status?.totals?.openContinuations ?? 0)")
                     row(L.dispatches, "активных \(controller.status?.totals?.activeDispatch ?? 0), в очереди \(controller.status?.totals?.pendingDispatch ?? 0)")
                     row(L.telegram, controller.telegramLabel)
+                    if let claude = controller.claudeConfig?.claude {
+                        row(L.claudeSelected, "\(claude.modelLabel) · \(claude.effortLabel)")
+                        row(L.claudeEffective, "\(claude.effectiveModelLabel ?? L.unknown) · \(claude.effectiveEffortLabel ?? L.unknown)")
+                    }
+                }
+                if controller.claudeConfig?.claude.pendingRestart == true {
+                    Text(L.claudePendingRestart).font(.callout).foregroundStyle(.orange)
                 }
                 if let problems = controller.status?.problems, !problems.isEmpty {
                     Divider()

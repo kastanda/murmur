@@ -49,6 +49,8 @@ struct MenuContent: View {
         case .stopping: return L.stopping
         case .checking: return L.checking
         case .sending: return L.sending
+        case .settingClaudeModel: return L.settingClaudeModel
+        case .settingClaudeEffort: return L.settingClaudeEffort
         case nil: return L.healthLabel(controller.health)
         }
     }
@@ -68,7 +70,55 @@ struct MenuContent: View {
         }
         .disabled(controller.isBusy || controller.selectedProject == nil)
         logsMenu
+        claudeSection
         Text("\(L.telegram): \(controller.telegramLabel)")
+    }
+
+    // MARK: Claude model/effort
+
+    /// A compact summary line plus two submenus — never taller than the rest of the menu.
+    /// Each submenu offers only what `ClaudeCapabilities` says the installed CLI actually
+    /// supports (see `modelMenuOptions`/`effortMenuOptions`); an option this build cannot
+    /// honour is never shown rather than being shown and then rejected.
+    @ViewBuilder private var claudeSection: some View {
+        if let config = controller.claudeConfig {
+            Text("\(L.claude): \(config.claude.modelLabel) · \(config.claude.effortLabel)")
+            if config.claude.pendingRestart {
+                Text("\(L.claudeCurrently): \(config.claude.effectiveModelLabel ?? L.unknown)")
+                Text(L.claudePendingRestart)
+            }
+            if config.capabilities.modelSupported {
+                Menu(L.claudeModelMenu) {
+                    ForEach(config.capabilities.modelMenuOptions, id: \.self) { value in
+                        Button(menuLabel(value, in: config.capabilities.modelLabels, selected: value == config.claude.model)) {
+                            controller.setClaudeModel(value)
+                        }
+                    }
+                }
+                .disabled(controller.isBusy)
+            } else {
+                Text(L.claudeModelUnsupported)
+            }
+            if config.capabilities.effortSupported {
+                Menu(L.claudeEffortMenu) {
+                    ForEach(config.capabilities.effortMenuOptions, id: \.self) { value in
+                        Button(menuLabel(value, in: config.capabilities.effortLabels, selected: value == config.claude.effort)) {
+                            controller.setClaudeEffort(value)
+                        }
+                    }
+                }
+                .disabled(controller.isBusy)
+            } else {
+                Text(L.claudeEffortUnsupported)
+            }
+        }
+    }
+
+    /// `✓ Sonnet` for the selected option, `  Sonnet` otherwise — the task's own example
+    /// glyph, consistent with how the project picker marks its current selection.
+    private func menuLabel(_ value: String, in labels: [String: String], selected: Bool) -> String {
+        let label = labels[value] ?? value
+        return selected ? "✓ \(label)" : "  \(label)"
     }
 
     /// Finder for the directory, plus a per-agent shortcut. Opening a log in the system's

@@ -32,6 +32,8 @@ public enum LifecycleOperation: String, Equatable, Sendable {
     case stopping
     case checking
     case sending
+    case settingClaudeModel
+    case settingClaudeEffort
 }
 
 /// Everything the views render.
@@ -42,6 +44,7 @@ public final class MurmurController: ObservableObject {
     @Published public private(set) var status: ProjectStatus?
     @Published public private(set) var notify: NotifyStatus?
     @Published public private(set) var doctor: DoctorReport?
+    @Published public private(set) var claudeConfig: ClaudeConfigReport?
     @Published public private(set) var operation: LifecycleOperation?
     @Published public private(set) var lastError: String?
     @Published public private(set) var cliLocation: CLILocation = .missing
@@ -121,6 +124,19 @@ public final class MurmurController: ObservableObject {
         }
     }
 
+    /// Writes through the CLI (never a direct file edit — see `MurmurCLI.setClaudeModel`),
+    /// then refreshes so `claudeConfig` reflects exactly what the CLI just validated and
+    /// persisted. Uses the SAME single-flight guard as start/stop/send: a model change
+    /// racing a lifecycle command is just as undesirable as two lifecycle commands racing
+    /// each other.
+    public func setClaudeModel(_ value: String) {
+        perform(.settingClaudeModel) { cli, project in try await cli.setClaudeModel(project: project, value: value) }
+    }
+
+    public func setClaudeEffort(_ value: String) {
+        perform(.settingClaudeEffort) { cli, project in try await cli.setClaudeEffort(project: project, value: value) }
+    }
+
     /// Submit one root task and wait for the CLI's correlated reply.
     ///
     /// Correlation is NOT reimplemented here: the CLI enqueues the task, waits for the
@@ -150,6 +166,7 @@ public final class MurmurController: ObservableObject {
         // The previous project's status says nothing about this one.
         status = nil
         doctor = nil
+        claudeConfig = nil
         Task { await refresh() }
     }
 
@@ -196,6 +213,7 @@ public final class MurmurController: ObservableObject {
         } catch {
             lastError = describeFailure(error)
         }
+        claudeConfig = try? await cli.claudeConfig(project: project)
     }
 
     // MARK: internals
@@ -217,13 +235,22 @@ public final class MurmurController: ObservableObject {
         operation = kind
         lastError = nil
         Task { [weak self] in
+            var failure: String?
             do {
                 try await body(cli, project)
             } catch {
-                await MainActor.run { self?.lastError = describeFailure(error) }
+                failure = describeFailure(error)
             }
             await MainActor.run { self?.operation = nil }
+            // `refresh()` clears `lastError` on its OWN successful status fetch — correct
+            // for a poll that recovers on its own, but it runs AFTER `operation` is reset,
+            // so it would otherwise erase the very failure this call just produced. Apply
+            // the outcome of THIS command last, so it is never the one thing a refresh
+            // silently wipes before the operator ever sees it.
             await self?.refresh()
+            if let failure {
+                await MainActor.run { self?.lastError = failure }
+            }
         }
     }
 }

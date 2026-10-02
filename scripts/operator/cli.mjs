@@ -35,6 +35,7 @@ import {
   profileExists,
   publicProfileSummary,
 } from "./profile.mjs";
+import { commandClaude } from "./claude.mjs";
 import { commandNotify } from "./notify.mjs";
 import { locateProject, murmurHome, projectPathsFor } from "./project.mjs";
 import {
@@ -101,6 +102,7 @@ Usage:
   murmur logs    <project> [supervisor|root|claude|codex|cursor|codex-app-server] [-n <lines>] [--follow]
   murmur send    <project> "<task>" [--timeout <seconds>] [--no-wait]
   murmur projects [--json]
+  murmur claude   <project> config [--json] | model <sonnet|opus|inherit> | effort <level>
   murmur notify  status | mode <activity|errors|default> | migrate [--from <dir>] | test
 
 <project> is an absolute path, or a name resolved under ~/Projects/<name>.
@@ -1296,6 +1298,7 @@ const COMMANDS = {
   logs: commandLogs,
   send: commandSend,
   notify: (parsed) => commandNotify({ ...parsed, out, err }),
+  claude: (parsed) => commandClaude({ ...parsed, out, err }),
 };
 
 /**

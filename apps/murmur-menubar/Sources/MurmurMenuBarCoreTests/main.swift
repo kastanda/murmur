@@ -436,6 +436,216 @@ await test("the doctor report is decoded for rendering") {
     await expectEqual(await controller.doctor?.checks.first?.name, "nats")
 }
 
+// MARK: - Claude model/effort control
+
+suite("Claude model/effort")
+
+await test("argv for reading and setting the Claude policy") {
+    let cli = MurmurCLI(executable: "/opt/homebrew/bin/murmur", runner: FakeRunner { _ in ok("") })
+    await expectEqual(cli.claudeConfigInvocation(project: "murmur").arguments, ["claude", "murmur", "config", "--json"])
+    await expectEqual(cli.setClaudeModelInvocation(project: "murmur", value: "sonnet").arguments, ["claude", "murmur", "model", "sonnet"])
+    await expectEqual(cli.setClaudeEffortInvocation(project: "murmur", value: "medium").arguments, ["claude", "murmur", "effort", "medium"])
+    // No shell here either.
+    for invocation in [cli.setClaudeModelInvocation(project: "murmur", value: "opus")] {
+        await expect(!invocation.arguments.contains("-c"))
+    }
+}
+
+await test("claudeConfig decodes selected, running and effective exactly as the CLI reports them") {
+    let cli = MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(claudeConfigJSON) })
+    let report = try await cli.claudeConfig(project: "murmur")
+    await expectEqual(report.claude.model, "sonnet")
+    await expectEqual(report.claude.modelLabel, "Sonnet")
+    await expectEqual(report.claude.effort, "medium")
+    await expectEqual(report.claude.pendingRestart, false)
+    await expectEqual(report.capabilities.modelMenuOptions, ["sonnet", "opus", "inherit"])
+    await expectEqual(report.capabilities.effortMenuOptions, ["low", "medium", "high", "inherit"])
+}
+
+await test("refresh loads the Claude config alongside status") {
+    let controller = await makeController(runner: healthyRunner())
+    await controller.refresh()
+    await expectEqual(await controller.claudeConfig?.claude.model, "sonnet")
+    await expectEqual(await controller.claudeConfig?.claude.modelLabel, "Sonnet")
+}
+
+await test("switching project clears the previous project's Claude config immediately") {
+    let controller = await makeController(runner: healthyRunner())
+    await controller.refresh()
+    await expect(await controller.claudeConfig != nil)
+    await controller.selectProject("other-aaaaaaaaaaaa")
+    await expectNil(await controller.claudeConfig, "the old project's Claude policy must not be shown for the new selection even briefly")
+}
+
+await test("selecting Sonnet invokes exactly the Sonnet argv and refreshes") {
+    let runner = healthyRunner()
+    let controller = await makeController(runner: runner)
+    await controller.refresh()
+    let before = runner.invocations.count
+    await controller.setClaudeModel("sonnet")
+    try? await Task.sleep(nanoseconds: 200_000_000)
+    let calls = runner.invocations.dropFirst(before)
+    await expect(calls.contains { $0.arguments == ["claude", "/Users/x/Projects/murmur", "model", "sonnet"] })
+}
+
+await test("selecting Opus invokes exactly the Opus argv") {
+    let runner = healthyRunner()
+    let controller = await makeController(runner: runner)
+    await controller.refresh()
+    let before = runner.invocations.count
+    await controller.setClaudeModel("opus")
+    try? await Task.sleep(nanoseconds: 200_000_000)
+    let calls = runner.invocations.dropFirst(before)
+    await expect(calls.contains { $0.arguments == ["claude", "/Users/x/Projects/murmur", "model", "opus"] })
+}
+
+await test("selecting 'По настройкам Claude Code' sends the inherit sentinel") {
+    let runner = healthyRunner()
+    let controller = await makeController(runner: runner)
+    await controller.refresh()
+    let before = runner.invocations.count
+    await controller.setClaudeModel("inherit")
+    try? await Task.sleep(nanoseconds: 200_000_000)
+    let calls = runner.invocations.dropFirst(before)
+    await expect(calls.contains { $0.arguments == ["claude", "/Users/x/Projects/murmur", "model", "inherit"] })
+}
+
+await test("selecting an effort level invokes exactly that argv") {
+    let runner = healthyRunner()
+    let controller = await makeController(runner: runner)
+    await controller.refresh()
+    let before = runner.invocations.count
+    await controller.setClaudeEffort("high")
+    try? await Task.sleep(nanoseconds: 200_000_000)
+    let calls = runner.invocations.dropFirst(before)
+    await expect(calls.contains { $0.arguments == ["claude", "/Users/x/Projects/murmur", "effort", "high"] })
+}
+
+await test("a model the installed CLI does not support is never offered in the menu options") {
+    let report = try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(claudeConfigUnsupportedJSON) })
+        .claudeConfig(project: "murmur")
+    await expectEqual(report.capabilities.modelMenuOptions, ["inherit"])
+    await expectEqual(report.capabilities.effortMenuOptions, ["inherit"])
+}
+
+await test("a rejected model value surfaces as a Russian error, not a silent no-op") {
+    let runner = FakeRunner { invocation in
+        switch invocation.arguments.first {
+        case "projects": return ok(projectsJSON)
+        case "status": return ok(healthyStatusJSON)
+        case "notify": return ok(notifyJSON)
+        case "claude":
+            if invocation.arguments.dropFirst(2).first == "model" {
+                return CommandOutcome(exitCode: 1, stdout: "",
+                    stderr: "murmur: 'haiku' is not supported by the installed Claude CLI.")
+            }
+            return ok(claudeConfigJSON)
+        default: return ok("")
+        }
+    }
+    let controller = await makeController(runner: runner)
+    await controller.refresh()
+    await controller.setClaudeModel("haiku")
+    try? await Task.sleep(nanoseconds: 200_000_000)
+    let message = await controller.lastError
+    await expect(message != nil)
+    await expect(message?.range(of: "[А-Яа-я]", options: .regularExpression) != nil, message ?? "nil")
+}
+
+await test("pending-restart wording is shown only when the CLI reports one, and is truthful") {
+    let runner = FakeRunner { invocation in
+        switch invocation.arguments.first {
+        case "projects": return ok(projectsJSON)
+        case "status": return ok(healthyStatusJSON)
+        case "notify": return ok(notifyJSON)
+        case "claude": return ok(claudeConfigPendingRestartJSON)
+        default: return ok("")
+        }
+    }
+    let controller = await makeController(runner: runner)
+    await controller.refresh()
+    let config = await controller.claudeConfig
+    await expectEqual(config?.claude.pendingRestart, true)
+    // Opus is SELECTED but Sonnet is what is actually running — the UI must be able to
+    // tell those apart, never claim Opus is already active.
+    await expectEqual(config?.claude.model, "opus")
+    await expectEqual(config?.claude.effectiveModel, "sonnet")
+}
+
+await test("no pending-restart banner when selected already matches what is running") {
+    let controller = await makeController(runner: healthyRunner())
+    await controller.refresh()
+    await expectEqual(await controller.claudeConfig?.claude.pendingRestart, false)
+}
+
+await test("setting a Claude model is refused while another lifecycle command is in flight") {
+    let runner = healthyRunner()
+    runner.gate = { @Sendable in try? await Task.sleep(nanoseconds: 150_000_000) }
+    let controller = await makeController(runner: runner)
+    await controller.refresh()
+    let before = runner.invocations.count
+
+    await controller.start()
+    // Give the spawned `start` task a chance to actually reach the runner (and its gate)
+    // before asserting on invocation counts — see the companion test below for why.
+    try? await Task.sleep(nanoseconds: 20_000_000)
+    await expect(await controller.isBusy)
+    await controller.setClaudeModel("opus")
+    await controller.setClaudeEffort("high")
+
+    let lifecycle = runner.invocations.dropFirst(before)
+        .filter { ["start", "claude"].contains($0.arguments.first ?? "") }
+    await expectEqual(lifecycle.count, 1, "the model/effort writes must not reach the CLI while start is in flight")
+    await expectEqual(lifecycle.first?.arguments.first, "start")
+    try? await Task.sleep(nanoseconds: 400_000_000)
+}
+
+await test("starting Murmur is refused while a Claude model change is in flight") {
+    let runner = healthyRunner()
+    runner.gate = { @Sendable in try? await Task.sleep(nanoseconds: 150_000_000) }
+    let controller = await makeController(runner: runner)
+    await controller.refresh()
+    let before = runner.invocations.count
+
+    await controller.setClaudeModel("opus")
+    // Give the spawned command task a chance to actually reach the runner (and its gate)
+    // before asserting on invocation counts — `isBusy` flips synchronously inside
+    // `perform()`, but the runner call itself happens inside the task it spawns.
+    try? await Task.sleep(nanoseconds: 20_000_000)
+    await expect(await controller.isBusy)
+    await controller.start()
+
+    let lifecycle = runner.invocations.dropFirst(before)
+        .filter { ["start", "claude"].contains($0.arguments.first ?? "") }
+    await expectEqual(lifecycle.count, 1, "start must not reach the CLI while a model change is in flight")
+    try? await Task.sleep(nanoseconds: 400_000_000)
+}
+
+await test("the Claude section of the menu is entirely Russian, including every option label") {
+    let report = try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(claudeConfigJSON) })
+        .claudeConfig(project: "murmur")
+    await expect(isRussian(report.claude.modelLabel))
+    await expect(isRussian(report.claude.effortLabel))
+    for value in report.capabilities.modelMenuOptions {
+        let label = report.capabilities.modelLabels[value] ?? value
+        await expect(isRussian(label), "«\(label)» must be Russian (Sonnet/Opus are proper nouns)")
+    }
+    for (_, label) in report.capabilities.effortLabels {
+        await expect(isRussian(label), "«\(label)» must be Russian")
+    }
+    await expect(isRussian(L.claudeModelMenu))
+    await expect(isRussian(L.claudeEffortMenu))
+    await expect(isRussian(L.claudePendingRestart))
+}
+
+await test("no fabricated minor version ever appears in a Claude label") {
+    let report = try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(claudeConfigJSON) })
+        .claudeConfig(project: "murmur")
+    for (_, label) in report.capabilities.modelLabels {
+        await expect(label.range(of: "5\\.5|[0-9]", options: .regularExpression) == nil, "«\(label)» must not invent a version number")
+    }
+}
+
 // MARK: - error rendering and secret hygiene
 
 suite("rendering and secrets")
