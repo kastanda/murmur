@@ -51,6 +51,8 @@ struct MenuContent: View {
         case .sending: return L.sending
         case .settingClaudeModel: return L.settingClaudeModel
         case .settingClaudeEffort: return L.settingClaudeEffort
+        case .settingCodexModel: return L.settingCodexModel
+        case .settingCodexEffort: return L.settingCodexEffort
         case nil: return L.healthLabel(controller.health)
         }
     }
@@ -71,46 +73,84 @@ struct MenuContent: View {
         .disabled(controller.isBusy || controller.selectedProject == nil)
         logsMenu
         claudeSection
+        codexSection
         cursorSection
         Text("\(L.telegram): \(controller.telegramLabel)")
     }
 
     // MARK: Claude model/effort
 
-    /// A compact summary line plus two submenus — never taller than the rest of the menu.
-    /// Each submenu offers only what `ClaudeCapabilities` says the installed CLI actually
-    /// supports (see `modelMenuOptions`/`effortMenuOptions`); an option this build cannot
-    /// honour is never shown rather than being shown and then rejected.
+    /// A summary line (the EFFECTIVE concrete model) plus two submenus. Every title, section
+    /// and checkmark comes from `ModelMenu`, built from the CLI's JSON — this view parses no
+    /// model id. The checkmark follows the SELECTED option; the summary follows the running one.
     @ViewBuilder private var claudeSection: some View {
         if let config = controller.claudeConfig {
-            Text("\(L.claude): \(config.claude.modelLabel) · \(config.claude.effortLabel)")
-            if config.claude.pendingRestart {
-                Text("\(L.claudeCurrently): \(config.claude.effectiveModelLabel ?? L.unknown)")
-                Text(L.claudePendingRestart)
-            }
-            if config.capabilities.modelSupported {
+            Text(ModelMenu.claudeSummary(config.claude))
+            ForEach(ModelMenu.claudePendingLines(config.claude), id: \.self) { Text($0) }
+            if config.capabilities.modelSupported && !config.claude.models.isEmpty {
                 Menu(L.claudeModelMenu) {
-                    ForEach(config.capabilities.modelMenuOptions, id: \.self) { value in
-                        Button(menuLabel(value, in: config.capabilities.modelLabels, selected: value == config.claude.model)) {
-                            controller.setClaudeModel(value)
-                        }
+                    modelRows(ModelMenu.claudeRows(options: config.claude.models, selectedId: config.claude.model)) {
+                        controller.setClaudeModel($0)
                     }
                 }
                 .disabled(controller.isBusy)
             } else {
                 Text(L.claudeModelUnsupported)
             }
-            if config.capabilities.effortSupported {
+            if config.capabilities.effortSupported && !config.claude.effortOptions.isEmpty {
                 Menu(L.claudeEffortMenu) {
-                    ForEach(config.capabilities.effortMenuOptions, id: \.self) { value in
-                        Button(menuLabel(value, in: config.capabilities.effortLabels, selected: value == config.claude.effort)) {
-                            controller.setClaudeEffort(value)
-                        }
+                    modelRows(ModelMenu.effortRows(options: config.claude.effortOptions, selectedId: config.claude.effort)) {
+                        controller.setClaudeEffort($0)
                     }
                 }
                 .disabled(controller.isBusy)
             } else {
                 Text(L.claudeEffortUnsupported)
+            }
+        }
+    }
+
+    // MARK: Codex model/reasoning (project-scoped — see `operator/codex-config.mjs`)
+
+    /// Selectors appear ONLY when the Murmur CLI reports Codex as controllable (the App Server's
+    /// own catalog was read). Otherwise just the effective model and one explanatory line — no
+    /// disabled fake controls.
+    @ViewBuilder private var codexSection: some View {
+        if let config = controller.codexConfig {
+            Text(ModelMenu.codexSummary(config.codex))
+            ForEach(ModelMenu.codexPendingLines(config.codex), id: \.self) { Text($0) }
+            if config.codex.controllable {
+                Menu(L.codexModelMenu) {
+                    modelRows(ModelMenu.codexRows(options: config.codex.availableModels, selectedId: config.codex.selectedModel)) {
+                        controller.setCodexModel($0)
+                    }
+                }
+                .disabled(controller.isBusy)
+                if !config.codex.effortOptions.isEmpty {
+                    Menu(L.codexEffortMenu) {
+                        modelRows(ModelMenu.effortRows(options: config.codex.effortOptions, selectedId: config.codex.reasoningEffort)) {
+                            controller.setCodexEffort($0)
+                        }
+                    }
+                    .disabled(controller.isBusy)
+                }
+            } else {
+                Text(L.codexModelUnavailable)
+            }
+        }
+    }
+
+    /// Render `ModelMenuRow`s: headings are disabled items, options are buttons.
+    @ViewBuilder private func modelRows(_ rows: [ModelMenuRow], onSelect: @escaping (String) -> Void) -> some View {
+        ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+            switch row {
+            case let .heading(title):
+                Text(title)
+            case .divider:
+                Divider()
+            case let .option(id, title, checked, enabled):
+                Button(ModelMenu.rowText(title: title, checked: checked)) { onSelect(id) }
+                    .disabled(!enabled)
             }
         }
     }
@@ -127,13 +167,6 @@ struct MenuContent: View {
             Text("\(L.cursor): \(config.cursor.effectiveModelLabel ?? L.cursorByCursorSettings)")
             Text(L.cursorNotControlledByMurmur)
         }
-    }
-
-    /// `✓ Sonnet` for the selected option, `  Sonnet` otherwise — the task's own example
-    /// glyph, consistent with how the project picker marks its current selection.
-    private func menuLabel(_ value: String, in labels: [String: String], selected: Bool) -> String {
-        let label = labels[value] ?? value
-        return selected ? "✓ \(label)" : "  \(label)"
     }
 
     /// Finder for the directory, plus a per-agent shortcut. Opening a log in the system's

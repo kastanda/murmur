@@ -137,7 +137,9 @@ export const readFinalAnswerFromSessionLog = (sessionPath, turnId) => {
 };
 
 export const buildThreadStartParams = (binding = null, peer = null) => ({
-  model: binding?.model ?? peer?.model ?? null,
+  // An explicit PROJECT model policy (set by the runtime adapter) outranks a channel
+  // persona's model; the recipient project, not the roster or a sender, chooses.
+  model: peer?.projectModelPolicy === true ? (peer.model ?? null) : (binding?.model ?? peer?.model ?? null),
   modelProvider: null,
   // A seeded thread must inherit the peer's working directory, otherwise Codex starts
   // in `/` with no project instructions, wrong workspace roots and wrong permissions.
@@ -147,7 +149,9 @@ export const buildThreadStartParams = (binding = null, peer = null) => ({
   approvalsReviewer: null,
   sandbox: null,
   permissions: null,
-  config: null,
+  // Per-thread reasoning effort. `config` overrides apply to THIS thread only and never
+  // write ~/.codex/config.toml (verified against the installed App Server).
+  config: peer?.effort ? { model_reasoning_effort: peer.effort } : null,
   serviceName: null,
   baseInstructions: binding?.baseInstructions ?? null,
   developerInstructions: null,
@@ -297,6 +301,9 @@ export class CodexAppServerClient {
       let startResult = null;
       let finalText = "";
       let startedObserved = false;
+      // The thread's EFFECTIVE model/effort as the server itself reports it
+      // (`thread/settings/updated`, emitted when a turn's overrides are applied).
+      let effectiveSettings = null;
       const requestId = this.nextId++;
       const initId = `init-${this.nextId++}`;
       const url = `ws+unix://${this.socketPath}:/`;
@@ -316,7 +323,7 @@ export class CodexAppServerClient {
           source: "missing-start-diagnostic", reason: "session-log-completed-without-observed-start" });
         this.observe(null, { method: "turn/completion-source", turnId,
           turnStatus: "completed", source: "session-log" });
-        finish(null, { ...startResult, finalText, turnId, source: "session-log" });
+        finish(null, { ...startResult, finalText, turnId, source: "session-log", effectiveSettings });
       }, SESSION_LOG_POLL_INTERVAL_MS);
 
       const finish = (err, result) => {
@@ -400,6 +407,17 @@ export class CodexAppServerClient {
           return;
         }
 
+        if (message.method === "thread/settings/updated" && message.params?.threadId === params?.threadId) {
+          const settings = message.params.threadSettings;
+          if (typeof settings?.model === "string") {
+            effectiveSettings = {
+              model: settings.model,
+              effort: typeof settings.effort === "string" ? settings.effort : null,
+            };
+          }
+          return;
+        }
+
         if (message.method === "turn/started" && message.params?.turn?.id) {
           turnId = turnId || message.params.turn.id;
           try {
@@ -439,7 +457,7 @@ export class CodexAppServerClient {
           if (!startedObserved) this.observe(message, { method: "turn/started", source: "missing-start-diagnostic",
             reason: "terminal-completed-without-observed-start" });
           this.observe(message, { source: "app-server-events", turnId });
-          finish(null, { ...startResult, finalText, turnId, source: "app-server-events" });
+          finish(null, { ...startResult, finalText, turnId, source: "app-server-events", effectiveSettings });
         }
       });
       socket.on("error", (err) => {
@@ -558,6 +576,7 @@ export const createCodexAppServerInjector = ({ Client = CodexAppServerClient, lo
     const bindingMetadata = threadStartBinding?.metadata ?? {};
     const shouldResumeThread = peer?.resume === true || (peer?.resume !== false && peer?.relayFinalToMurmur === true);
     let threadPath = null;
+    let threadStartEffective = null;
     const resumeThread = async (threadId) => {
       if (!threadId || peer?.resume === false) return;
       try {
@@ -567,6 +586,9 @@ export const createCodexAppServerInjector = ({ Client = CodexAppServerClient, lo
           model: peer?.model ?? null,
         });
         threadPath = resumed?.thread?.path || threadPath;
+        if (typeof resumed?.model === "string") {
+          threadStartEffective = { model: resumed.model, effort: typeof resumed.reasoningEffort === "string" ? resumed.reasoningEffort : null };
+        }
         log("info", "Codex app-server wake thread resumed", { msgId: payload.msgId, threadId, socketPath });
       } catch (err) {
         const e = err instanceof Error ? err : new Error(String(err));
@@ -577,6 +599,7 @@ export const createCodexAppServerInjector = ({ Client = CodexAppServerClient, lo
       threadId,
       input: [{ type: "text", text, text_elements: [] }],
       ...(peer?.model ? { model: peer.model } : {}),
+      ...(peer?.effort ? { effort: peer.effort } : {}),
       responsesapiClientMetadata: {
         murmur_msg_id: payload.msgId || "",
         murmur_conversation_id: payload.conversationId || "",
@@ -639,6 +662,9 @@ export const createCodexAppServerInjector = ({ Client = CodexAppServerClient, lo
       const seededId = started?.thread?.id;
       if (!seededId) throw new Error(`codex-app-server-thread-start-missing:${payload.from}`);
       threadPath = started?.thread?.path || threadPath;
+      if (typeof started?.model === "string") {
+        threadStartEffective = { model: started.model, effort: typeof started.reasoningEffort === "string" ? started.reasoningEffort : null };
+      }
       peer.threadId = seededId;
       log("info", `Codex app-server wake thread ${reason}`, { msgId: payload.msgId, threadId: seededId, socketPath, threadPath });
       return seededId;
@@ -662,6 +688,11 @@ export const createCodexAppServerInjector = ({ Client = CodexAppServerClient, lo
       result = await startTurn(threadId);
     }
     log("info", "Codex app-server wake completed", { msgId: payload.msgId, threadId, socketPath });
-    return result;
+    // The effective model/effort for display: the server's own settings notification if it
+    // arrived, else the thread start/resume response — never a guess from what was asked.
+    const effective = result?.effectiveSettings ?? threadStartEffective ?? null;
+    return effective && result && typeof result === "object"
+      ? { ...result, effective, effectiveSource: result.effectiveSettings ? "thread-settings" : "thread-start" }
+      : result;
   };
 };

@@ -613,6 +613,26 @@ or whose daemon is dead blocks the send with no outbox row and no local message 
 A coordinator that is mid-turn (`CLAIMED`, `WAKING`, `RUNNING`) is reported distinctly as
 **busy** rather than as dead — wait for the current task and send again.
 
+## Agent model control (`murmur claude` / `murmur codex`)
+
+```bash
+murmur claude murmur config [--json] [--refresh]   # selected / running / effective + the full picker
+murmur claude murmur model <id|inherit>            # alias ("sonnet") or pinned ("claude-sonnet-5")
+murmur claude murmur effort <low|medium|high|xhigh|max|inherit>
+murmur codex  murmur config [--json] [--refresh]
+murmur codex  murmur model <id|inherit>
+murmur codex  murmur effort <level|inherit>
+```
+
+Per-project preferences live beside the profile (`claude-preferences.json`,
+`codex-preferences.json`); the CLI is the only writer, the menu bar app goes through it. Models
+come from the installed tools' own catalogs (see [agent-model-discovery.md](agent-model-discovery.md));
+an id the catalog does not offer — or any free string — is refused. Claude applies a new
+choice when Murmur restarts; Codex applies an explicit choice from the next turn (and a return to
+`inherit` on a new Codex session). Cursor has no selector (account-global — see
+[cursor-model-discovery.md](cursor-model-discovery.md)). None of these commands writes any global
+agent configuration. The recipient's project policy picks its model: a sender cannot.
+
 ## Logs
 
 ```bash

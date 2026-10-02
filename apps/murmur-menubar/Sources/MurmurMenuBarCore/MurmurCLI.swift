@@ -230,6 +230,20 @@ public struct MurmurCLI: Sendable {
         CommandInvocation(executable: executable, arguments: ["claude", project, "effort", value])
     }
 
+    public func codexConfigInvocation(project: String) -> CommandInvocation {
+        CommandInvocation(executable: executable, arguments: ["codex", project, "config", "--json"])
+    }
+
+    /// `value` is an id the CLI itself reported in `availableModels`; the CLI re-validates it
+    /// against the Codex App Server's catalog regardless. Direct argv only.
+    public func setCodexModelInvocation(project: String, value: String) -> CommandInvocation {
+        CommandInvocation(executable: executable, arguments: ["codex", project, "model", value])
+    }
+
+    public func setCodexEffortInvocation(project: String, value: String) -> CommandInvocation {
+        CommandInvocation(executable: executable, arguments: ["codex", project, "effort", value])
+    }
+
     /// Read-only — there is deliberately no `setCursorModelInvocation`. See
     /// `cursor-config.mjs`'s header: Cursor's own model selection is real but ACCOUNT-
     /// GLOBAL, not project-scoped, so this app only ever displays it.
@@ -259,7 +273,21 @@ public struct MurmurCLI: Sendable {
     }
 
     public func claudeConfig(project: String) async throws -> ClaudeConfigReport {
-        try await decode(ClaudeConfigReport.self, from: claudeConfigInvocation(project: project), timeout: 20, allowNonZeroExit: true)
+        try await decode(ClaudeConfigReport.self, from: claudeConfigInvocation(project: project), timeout: 30, allowNonZeroExit: true)
+    }
+
+    /// A project with no Codex identity exits 3 with no JSON on stdout — callers treat a
+    /// thrown error as "no Codex rows to show".
+    public func codexConfig(project: String) async throws -> CodexConfigReport {
+        try await decode(CodexConfigReport.self, from: codexConfigInvocation(project: project), timeout: 30, allowNonZeroExit: true)
+    }
+
+    public func setCodexModel(project: String, value: String) async throws {
+        try await runLifecycle(setCodexModelInvocation(project: project, value: value), timeout: 30)
+    }
+
+    public func setCodexEffort(project: String, value: String) async throws {
+        try await runLifecycle(setCodexEffortInvocation(project: project, value: value), timeout: 30)
     }
 
     /// A project with no Cursor identity exits 3 with no JSON on stdout — callers treat

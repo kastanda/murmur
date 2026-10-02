@@ -34,6 +34,8 @@ public enum LifecycleOperation: String, Equatable, Sendable {
     case sending
     case settingClaudeModel
     case settingClaudeEffort
+    case settingCodexModel
+    case settingCodexEffort
 }
 
 /// Everything the views render.
@@ -45,6 +47,7 @@ public final class MurmurController: ObservableObject {
     @Published public private(set) var notify: NotifyStatus?
     @Published public private(set) var doctor: DoctorReport?
     @Published public private(set) var claudeConfig: ClaudeConfigReport?
+    @Published public private(set) var codexConfig: CodexConfigReport?
     @Published public private(set) var cursorConfig: CursorConfigReport?
     @Published public private(set) var operation: LifecycleOperation?
     @Published public private(set) var lastError: String?
@@ -138,6 +141,16 @@ public final class MurmurController: ObservableObject {
         perform(.settingClaudeEffort) { cli, project in try await cli.setClaudeEffort(project: project, value: value) }
     }
 
+    /// Codex model/effort go through the CLI exactly like Claude's — never a file edit — and
+    /// share the same single-flight guard. Offered only when `codexConfig.codex.controllable`.
+    public func setCodexModel(_ value: String) {
+        perform(.settingCodexModel) { cli, project in try await cli.setCodexModel(project: project, value: value) }
+    }
+
+    public func setCodexEffort(_ value: String) {
+        perform(.settingCodexEffort) { cli, project in try await cli.setCodexEffort(project: project, value: value) }
+    }
+
     /// Submit one root task and wait for the CLI's correlated reply.
     ///
     /// Correlation is NOT reimplemented here: the CLI enqueues the task, waits for the
@@ -168,6 +181,7 @@ public final class MurmurController: ObservableObject {
         status = nil
         doctor = nil
         claudeConfig = nil
+        codexConfig = nil
         cursorConfig = nil
         Task { await refresh() }
     }
@@ -205,6 +219,7 @@ public final class MurmurController: ObservableObject {
 
         guard let project = selectedProject?.cliArgument else {
             status = nil
+            codexConfig = nil
             cursorConfig = nil
             return
         }
@@ -217,6 +232,8 @@ public final class MurmurController: ObservableObject {
             lastError = describeFailure(error)
         }
         claudeConfig = try? await cli.claudeConfig(project: project)
+        // `nil` for a project with no Codex identity (exit 3, no JSON) — the Codex rows are simply omitted.
+        codexConfig = try? await cli.codexConfig(project: project)
         // `nil` whenever the project has no Cursor identity (exit 3, no JSON) — the menu
         // simply omits the Cursor section in that case, same pattern as `claudeConfig`.
         cursorConfig = try? await cli.cursorConfig(project: project)

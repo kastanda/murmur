@@ -612,3 +612,60 @@ test("a failed canonical-model cache write never fails, delays or retries the tu
   const result = await ctx.runtime.executeTurn(payload, dispatch);
   assert.equal(result.status, "completed", "the turn itself must succeed regardless of the cache write outcome");
 });
+
+// ---------------------------------------------------------------------------
+// Pinned model selections (alias vs pinned) — argv, effort, canonical evidence
+// ---------------------------------------------------------------------------
+
+test("a PINNED model id goes to --model verbatim, and effort still applies next to it", () => {
+  const args = buildClaudeOneShotArgs({ prompt: "p", sessionId: "s", model: "claude-sonnet-5", effort: "high" });
+  assert.deepEqual(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2), ["--model", "claude-sonnet-5"]);
+  assert.deepEqual(args.slice(args.indexOf("--effort"), args.indexOf("--effort") + 2), ["--effort", "high"]);
+});
+
+test("inherit sends no model override even when a pinned id was selected before (argv built from undefined)", () => {
+  const args = buildClaudeOneShotArgs({ prompt: "p", sessionId: "s", model: undefined, effort: undefined });
+  assert.equal(args.includes("--model"), false);
+  assert.equal(args.includes("--effort"), false);
+});
+
+test("a pinned selection reaches the runner and caches ONLY its own exact canonical id", async () => {
+  const cacheFile = path.join(mkdtempSync(path.join(os.tmpdir(), "murmur-canonical-cache-")), "claude-runtime-cache.json");
+  const runnerCalls = [];
+  const ctx = setup({
+    model: "claude-sonnet-5",
+    runner: async (options) => {
+      runnerCalls.push(options);
+      options.onSpawn({ pid: 1, processStartIdentity: "1:test" });
+      // A newer sibling in the same usage must never be mistaken for the pinned model.
+      return { text: "answer", sessionId: options.sessionId, raw: { modelUsage: { "claude-sonnet-5-5": { outputTokens: 50 }, "claude-sonnet-5": { outputTokens: 7 } } } };
+    },
+  });
+  ctx.runtime.canonicalModelCacheFile = cacheFile;
+  const { payload, dispatch } = claim(ctx);
+  await ctx.runtime.executeTurn(payload, dispatch);
+  assert.equal(runnerCalls[0].model, "claude-sonnet-5");
+  const fsp = await import("node:fs/promises");
+  let cached;
+  for (let attempt = 0; attempt < 50 && !cached; attempt += 1) {
+    try { cached = JSON.parse(await fsp.readFile(cacheFile, "utf8")); } catch { await delay(20); }
+  }
+  assert.equal(cached.selectedAlias, "claude-sonnet-5");
+  assert.equal(cached.canonicalModel, "claude-sonnet-5", "exact match, not the larger claude-sonnet-5-5 entry");
+});
+
+test("a pinned selection with only a different version in modelUsage records nothing instead of guessing", async () => {
+  const cacheFile = path.join(mkdtempSync(path.join(os.tmpdir(), "murmur-canonical-cache-")), "claude-runtime-cache.json");
+  const ctx = setup({
+    model: "claude-sonnet-5",
+    runner: async (options) => {
+      options.onSpawn({ pid: 1, processStartIdentity: "1:test" });
+      return { text: "answer", sessionId: options.sessionId, raw: { modelUsage: { "claude-sonnet-5-5": { outputTokens: 50 } } } };
+    },
+  });
+  ctx.runtime.canonicalModelCacheFile = cacheFile;
+  const { payload, dispatch } = claim(ctx);
+  await ctx.runtime.executeTurn(payload, dispatch);
+  await delay(40);
+  assert.equal(existsSync(cacheFile), false);
+});

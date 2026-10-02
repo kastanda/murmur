@@ -80,47 +80,93 @@ let doctorJSON = """
                            {"name":"telegram-notify","status":"PASS","detail":"configured (global: telegram:telegram)"}]}
 """
 
-/// Sonnet/Medium, explicitly selected and already matching what is running — the default
-/// shape most tests want, matching this project's OWN actual configured policy.
-let claudeConfigJSON = """
-{"project":"murmur",
- "capabilities":{"available":true,"modelSupported":true,"effortSupported":true,
-   "supportedModels":["sonnet","opus"],"supportedEfforts":["low","medium","high","xhigh","max"],
-   "modelLabels":{"sonnet":"Sonnet","opus":"Opus","inherit":"По настройкам Claude Code"},
-   "effortLabels":{"low":"Низкое","medium":"Среднее","high":"Высокое","xhigh":"Повышенное","max":"Максимальное","inherit":"По настройкам Claude Code"}},
- "claude":{"model":"sonnet","modelLabel":"Sonnet","effort":"medium","effortLabel":"Среднее",
-   "runningModel":"sonnet","runningEffort":"medium",
-   "effectiveModel":"sonnet","effectiveModelLabel":"Sonnet",
-   "effectiveEffort":"medium","effectiveEffortLabel":"Среднее",
-   "source":"murmur-project","effortSource":"murmur-project","pendingRestart":false,"configState":"configured"}}
+/// The complete Claude picker as `murmur claude <project> config --json` reports it: moving
+/// aliases, pinned versions, inherit — each already carrying its final label. (A fixture:
+/// it proves rendering, not that those models exist on any machine.)
+let claudeModelsJSON = """
+[{"id":"opus","kind":"alias","label":"Актуальный Opus","resolvesToLabel":"Opus 5.5","canonicalId":"claude-opus-5-5","selectable":true},
+ {"id":"sonnet","kind":"alias","label":"Актуальный Sonnet","resolvesToLabel":"Sonnet 5.5","canonicalId":"claude-sonnet-5-5","selectable":true},
+ {"id":"haiku","kind":"alias","label":"Актуальный Haiku","resolvesToLabel":"Haiku 4.5","canonicalId":"claude-haiku-4-5-20251001","selectable":true},
+ {"id":"claude-fable-5-1","kind":"pinned","label":"Fable 5.1","canonicalId":"claude-fable-5-1","selectable":true},
+ {"id":"claude-opus-5-5","kind":"pinned","label":"Opus 5.5","canonicalId":"claude-opus-5-5","selectable":true},
+ {"id":"claude-opus-5","kind":"pinned","label":"Opus 5","canonicalId":"claude-opus-5","selectable":true},
+ {"id":"claude-sonnet-5-5","kind":"pinned","label":"Sonnet 5.5","canonicalId":"claude-sonnet-5-5","selectable":true},
+ {"id":"claude-sonnet-5","kind":"pinned","label":"Sonnet 5","canonicalId":"claude-sonnet-5","selectable":true},
+ {"id":"claude-haiku-4-5-20251001","kind":"pinned","label":"Haiku 4.5","canonicalId":"claude-haiku-4-5-20251001","selectable":true},
+ {"id":"inherit","kind":"inherit","label":"По настройкам Claude Code","resolvesToLabel":"Opus 5.5","selectable":true}]
 """
 
-/// The operator just picked Opus/High while a Sonnet/Medium daemon is still running.
+let claudeEffortOptionsJSON = """
+[{"id":"low","label":"Низкое"},{"id":"medium","label":"Среднее"},{"id":"high","label":"Высокое"},{"id":"inherit","label":"По настройкам Claude Code"}]
+"""
+
+let claudeCapabilitiesFullJSON = """
+{"available":true,"modelSupported":true,"effortSupported":true,
+ "supportedModels":["opus","sonnet","haiku","claude-sonnet-5","claude-sonnet-5-5"],"supportedEfforts":["low","medium","high","xhigh","max"],
+ "modelLabels":{"sonnet":"Актуальный Sonnet","opus":"Актуальный Opus","inherit":"По настройкам Claude Code"},
+ "effortLabels":{"low":"Низкое","medium":"Среднее","high":"Высокое","xhigh":"Повышенное","max":"Максимальное","inherit":"По настройкам Claude Code"},
+ "catalogSource":"sdk-initialize"}
+"""
+
+/// The alias "Актуальный Sonnet" selected and running; it currently resolves to Sonnet 5.5.
+let claudeConfigJSON = """
+{"project":"murmur",
+ "capabilities":\(claudeCapabilitiesFullJSON),
+ "claude":{"model":"sonnet","modelLabel":"Актуальный Sonnet","effort":"medium","effortLabel":"Среднее",
+   "runningModel":"sonnet","runningEffort":"medium",
+   "effectiveModel":"sonnet","effectiveModelLabel":"Sonnet 5.5","canonicalModel":"claude-sonnet-5-5",
+   "effectiveEffort":"medium","effectiveEffortLabel":"Среднее",
+   "source":"murmur-project","effortSource":"murmur-project","pendingRestart":false,"configState":"configured",
+   "selected":{"id":"sonnet","kind":"alias","label":"Актуальный Sonnet","canonicalId":"claude-sonnet-5-5","resolvesToLabel":"Sonnet 5.5","effectiveLabel":"Sonnet 5.5"},
+   "running":{"id":"sonnet","kind":"alias","label":"Актуальный Sonnet","canonicalId":"claude-sonnet-5-5","resolvesToLabel":"Sonnet 5.5","effectiveLabel":"Sonnet 5.5"},
+   "effective":{"id":"sonnet","kind":"alias","label":"Актуальный Sonnet","canonicalId":"claude-sonnet-5-5","resolvesToLabel":"Sonnet 5.5","effectiveLabel":"Sonnet 5.5"},
+   "models":\(claudeModelsJSON),
+   "effortOptions":\(claudeEffortOptionsJSON)}}
+"""
+
+/// The operator pinned Sonnet 5 while the daemon still runs the moving alias (now Sonnet 5.5).
 let claudeConfigPendingRestartJSON = """
 {"project":"murmur",
- "capabilities":{"available":true,"modelSupported":true,"effortSupported":true,
-   "supportedModels":["sonnet","opus"],"supportedEfforts":["low","medium","high","xhigh","max"],
-   "modelLabels":{"sonnet":"Sonnet","opus":"Opus","inherit":"По настройкам Claude Code"},
-   "effortLabels":{"low":"Низкое","medium":"Среднее","high":"Высокое","xhigh":"Повышенное","max":"Максимальное","inherit":"По настройкам Claude Code"}},
- "claude":{"model":"opus","modelLabel":"Opus","effort":"high","effortLabel":"Высокое",
+ "capabilities":\(claudeCapabilitiesFullJSON),
+ "claude":{"model":"claude-sonnet-5","modelLabel":"Sonnet 5","effort":"high","effortLabel":"Высокое",
    "runningModel":"sonnet","runningEffort":"medium",
-   "effectiveModel":"sonnet","effectiveModelLabel":"Sonnet",
+   "effectiveModel":"sonnet","effectiveModelLabel":"Sonnet 5.5","canonicalModel":"claude-sonnet-5-5",
    "effectiveEffort":"medium","effectiveEffortLabel":"Среднее",
-   "source":"murmur-project","effortSource":"murmur-project","pendingRestart":true,"configState":"configured"}}
+   "source":"murmur-project","effortSource":"murmur-project","pendingRestart":true,"configState":"configured",
+   "selected":{"id":"claude-sonnet-5","kind":"pinned","label":"Sonnet 5","canonicalId":"claude-sonnet-5","effectiveLabel":"Sonnet 5"},
+   "running":{"id":"sonnet","kind":"alias","label":"Актуальный Sonnet","canonicalId":"claude-sonnet-5-5","resolvesToLabel":"Sonnet 5.5","effectiveLabel":"Sonnet 5.5"},
+   "effective":{"id":"sonnet","kind":"alias","label":"Актуальный Sonnet","canonicalId":"claude-sonnet-5-5","resolvesToLabel":"Sonnet 5.5","effectiveLabel":"Sonnet 5.5"},
+   "models":\(claudeModelsJSON),
+   "effortOptions":\(claudeEffortOptionsJSON)}}
+"""
+
+/// The pinned Sonnet 5 selected AND running (the live-acceptance end state).
+let claudeConfigPinnedJSON = """
+{"project":"murmur",
+ "capabilities":\(claudeCapabilitiesFullJSON),
+ "claude":{"model":"claude-sonnet-5","modelLabel":"Sonnet 5","effort":"medium","effortLabel":"Среднее",
+   "runningModel":"claude-sonnet-5","runningEffort":"medium",
+   "effectiveModel":"claude-sonnet-5","effectiveModelLabel":"Sonnet 5","canonicalModel":"claude-sonnet-5",
+   "effectiveEffort":"medium","effectiveEffortLabel":"Среднее",
+   "source":"murmur-project","effortSource":"murmur-project","pendingRestart":false,"configState":"configured",
+   "selected":{"id":"claude-sonnet-5","kind":"pinned","label":"Sonnet 5","canonicalId":"claude-sonnet-5","effectiveLabel":"Sonnet 5"},
+   "running":{"id":"claude-sonnet-5","kind":"pinned","label":"Sonnet 5","canonicalId":"claude-sonnet-5","effectiveLabel":"Sonnet 5"},
+   "effective":{"id":"claude-sonnet-5","kind":"pinned","label":"Sonnet 5","canonicalId":"claude-sonnet-5","effectiveLabel":"Sonnet 5"},
+   "models":\(claudeModelsJSON),
+   "effortOptions":\(claudeEffortOptionsJSON)}}
 """
 
 /// Nothing ever configured for this project: pure inherit, Claude Code's own default shown.
 let claudeConfigInheritJSON = """
 {"project":"murmur",
- "capabilities":{"available":true,"modelSupported":true,"effortSupported":true,
-   "supportedModels":["sonnet","opus"],"supportedEfforts":["low","medium","high","xhigh","max"],
-   "modelLabels":{"sonnet":"Sonnet","opus":"Opus","inherit":"По настройкам Claude Code"},
-   "effortLabels":{"low":"Низкое","medium":"Среднее","high":"Высокое","xhigh":"Повышенное","max":"Максимальное","inherit":"По настройкам Claude Code"}},
+ "capabilities":\(claudeCapabilitiesFullJSON),
  "claude":{"model":"inherit","modelLabel":"По настройкам Claude Code","effort":"inherit","effortLabel":"По настройкам Claude Code",
    "runningModel":null,"runningEffort":null,
-   "effectiveModel":"sonnet","effectiveModelLabel":"Sonnet",
+   "effectiveModel":"sonnet","effectiveModelLabel":"Sonnet 5.5","canonicalModel":"claude-sonnet-5-5",
    "effectiveEffort":null,"effectiveEffortLabel":null,
-   "source":"claude-code","effortSource":"claude-code","pendingRestart":false,"configState":"absent"}}
+   "source":"claude-code","effortSource":"claude-code","pendingRestart":false,"configState":"absent",
+   "models":\(claudeModelsJSON),
+   "effortOptions":\(claudeEffortOptionsJSON)}}
 """
 
 /// The installed CLI supports neither flag at all.
@@ -133,7 +179,81 @@ let claudeConfigUnsupportedJSON = """
    "runningModel":null,"runningEffort":null,
    "effectiveModel":null,"effectiveModelLabel":null,
    "effectiveEffort":null,"effectiveEffortLabel":null,
-   "source":"claude-code","effortSource":"claude-code","pendingRestart":false,"configState":"absent"}}
+   "source":"claude-code","effortSource":"claude-code","pendingRestart":false,"configState":"absent",
+   "models":[{"id":"inherit","kind":"inherit","label":"По настройкам Claude Code","selectable":true}],
+   "effortOptions":[{"id":"inherit","label":"По настройкам Claude Code"}]}}
+"""
+
+/// A controllable Codex: the App Server's own catalog (synthetic names), nothing running yet
+/// under an explicit choice — inherit resolves to the model Codex itself would use.
+let codexConfigJSON = """
+{"project":"murmur",
+ "codex":{"controllable":true,"reason":null,
+   "selectedModel":"inherit","selectedModelLabel":"По настройкам Codex",
+   "reasoningEffort":"inherit","reasoningEffortLabel":"По настройкам Codex",
+   "effectiveModel":"model-a","effectiveModelLabel":"Model A",
+   "effectiveReasoningEffort":"high","effectiveReasoningEffortLabel":"Высокое",
+   "availableModels":[{"id":"model-a","kind":"catalog","label":"Model A","selectable":true},
+                      {"id":"model-b","kind":"catalog","label":"Model B","selectable":true},
+                      {"id":"inherit","kind":"inherit","label":"По настройкам Codex","resolvesToLabel":"Model A","selectable":true}],
+   "effortOptions":[{"id":"low","label":"Низкое"},{"id":"medium","label":"Среднее"},{"id":"high","label":"Высокое"},{"id":"inherit","label":"По настройкам Codex"}],
+   "source":"codex-config","pendingRestart":false,"pendingNextTurn":false,"requiresNewThread":false,"configState":"absent"}}
+"""
+
+/// Model B selected while Model A last ran: applies from the next Codex turn.
+let codexConfigPendingNextTurnJSON = """
+{"project":"murmur",
+ "codex":{"controllable":true,"reason":null,
+   "selectedModel":"model-b","selectedModelLabel":"Model B",
+   "reasoningEffort":"low","reasoningEffortLabel":"Низкое",
+   "effectiveModel":"model-a","effectiveModelLabel":"Model A",
+   "effectiveReasoningEffort":"high","effectiveReasoningEffortLabel":"Высокое",
+   "availableModels":[{"id":"model-a","kind":"catalog","label":"Model A","selectable":true},
+                      {"id":"model-b","kind":"catalog","label":"Model B","selectable":true},
+                      {"id":"inherit","kind":"inherit","label":"По настройкам Codex","resolvesToLabel":"Model A","selectable":true}],
+   "effortOptions":[{"id":"low","label":"Низкое"},{"id":"medium","label":"Среднее"},{"id":"high","label":"Высокое"},{"id":"inherit","label":"По настройкам Codex"}],
+   "source":"murmur-project","pendingRestart":false,"pendingNextTurn":true,"requiresNewThread":false,"configState":"configured"}}
+"""
+
+/// Model B selected, nothing has run under it yet: effective is unknown, not assumed.
+let codexConfigSelectedNeverRunJSON = """
+{"project":"murmur",
+ "codex":{"controllable":true,"reason":null,
+   "selectedModel":"model-b","selectedModelLabel":"Model B",
+   "reasoningEffort":"low","reasoningEffortLabel":"Низкое",
+   "effectiveModel":null,"effectiveModelLabel":null,
+   "effectiveReasoningEffort":null,"effectiveReasoningEffortLabel":null,
+   "availableModels":[{"id":"model-a","kind":"catalog","label":"Model A","selectable":true},
+                      {"id":"model-b","kind":"catalog","label":"Model B","selectable":true},
+                      {"id":"inherit","kind":"inherit","label":"По настройкам Codex","selectable":true}],
+   "effortOptions":[{"id":"low","label":"Низкое"},{"id":"inherit","label":"По настройкам Codex"}],
+   "source":"murmur-project","pendingRestart":false,"pendingNextTurn":true,"requiresNewThread":false,"configState":"configured"}}
+"""
+
+/// Back to inherit while the thread holds an explicit model: needs a NEW Codex session.
+let codexConfigNewThreadJSON = """
+{"project":"murmur",
+ "codex":{"controllable":true,"reason":null,
+   "selectedModel":"inherit","selectedModelLabel":"По настройкам Codex",
+   "reasoningEffort":"inherit","reasoningEffortLabel":"По настройкам Codex",
+   "effectiveModel":"model-b","effectiveModelLabel":"Model B",
+   "effectiveReasoningEffort":"low","effectiveReasoningEffortLabel":"Низкое",
+   "availableModels":[{"id":"model-a","kind":"catalog","label":"Model A","selectable":true},
+                      {"id":"inherit","kind":"inherit","label":"По настройкам Codex","selectable":true}],
+   "effortOptions":[{"id":"inherit","label":"По настройкам Codex"}],
+   "source":"codex-config","pendingRestart":false,"pendingNextTurn":false,"requiresNewThread":true,"configState":"configured"}}
+"""
+
+/// The App Server's catalog could not be read: read-only, no selector data at all.
+let codexConfigUncontrollableJSON = """
+{"project":"murmur",
+ "codex":{"controllable":false,"reason":"codex-model-catalog-unavailable",
+   "selectedModel":"inherit","selectedModelLabel":"По настройкам Codex",
+   "reasoningEffort":"inherit","reasoningEffortLabel":"По настройкам Codex",
+   "effectiveModel":null,"effectiveModelLabel":null,
+   "effectiveReasoningEffort":null,"effectiveReasoningEffortLabel":null,
+   "availableModels":[],"effortOptions":[],
+   "source":"codex-config","pendingRestart":false,"pendingNextTurn":false,"requiresNewThread":false,"configState":"absent"}}
 """
 
 /// Read-only, non-controllable, exactly as the real `cursor-config.mjs` reports it.
@@ -163,6 +283,7 @@ func healthyRunner() -> FakeRunner {
         case "notify": return ok(notifyJSON)
         case "doctor": return ok(doctorJSON)
         case "claude": return ok(claudeConfigJSON)
+        case "codex": return ok(codexConfigJSON)
         case "cursor": return ok(cursorConfigJSON)
         default: return ok("")
         }

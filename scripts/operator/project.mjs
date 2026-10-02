@@ -116,6 +116,11 @@ export const projectPathsFor = (projectId, { home = murmurHome() } = {}) => {
     // only purpose would be painting a label. Written by the daemon, read by the CLI;
     // losing a write or a stale read is harmless (the UI falls back to the bare alias).
     claudeRuntimeCacheFile: path.join(root, "claude-runtime-cache.json"),
+    // Per-project Codex model/reasoning-effort preference (`{ version, model, effort }`,
+    // no credential of any kind) and the display-only record of what the Codex App Server
+    // last reported it was actually running — same split as the two Claude files above.
+    codexPreferencesFile: path.join(root, "codex-preferences.json"),
+    codexRuntimeCacheFile: path.join(root, "codex-runtime-cache.json"),
     agentsDir,
     agentDir: (agentName) => path.join(agentsDir, agentName),
     agentConfigFile: (agentName) => path.join(agentsDir, agentName, "agent-config.json"),

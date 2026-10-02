@@ -28,10 +28,20 @@
  * against a locally discovered allowlist before ever building argv, rather than trusting
  * the CLI to reject a bad value.
  */
-import { execFile } from "node:child_process";
-import { accessSync, constants } from "node:fs";
+import { execFile, spawn } from "node:child_process";
+import { accessSync, constants, statSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import {
+  INHERIT,
+  MODEL_KINDS,
+  capitalize,
+  defaultCatalogCacheFile,
+  parseClaudeCanonicalId,
+  readCatalogCache,
+  writeCatalogCache,
+} from "./agent-models.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -59,49 +69,212 @@ export const findClaudeExecutable = (command = "claude", env = process.env) => {
 };
 
 /**
- * The two model ALIASES Murmur ever offers. Not "every alias the CLI happens to
- * document" (its `--help` text also shows `fable` as an example, a different tier this
- * feature does not expose) — exactly the two the menu asks for, each individually
- * confirmed present in the installed CLI's own `--model` description before being
- * treated as supported.
- */
-const CANDIDATE_MODELS = Object.freeze(["sonnet", "opus"]);
-
-/**
  * Parse `--help` text for what `--model`/`--effort` actually document.
  *
  * Pure and synchronous so it is trivially unit-testable against captured real and
- * malformed help text, independent of the installed CLI being present at all.
+ * malformed help text, independent of the installed CLI being present at all. The
+ * quoted ALIASES next to `--model` are only the FALLBACK catalog (used when the real
+ * model catalog cannot be read); full ids such as 'claude-fable-5' in the example text
+ * are not aliases and are ignored here.
  */
 export const parseClaudeHelp = (helpText) => {
   const text = String(helpText ?? "");
   const modelFlagPresent = /--model\s*<model>/.test(text);
   const effortFlagPresent = /--effort\s*<level>/.test(text);
 
-  // Only the exact quoted aliases MENTIONED NEXT TO the --model flag's own description
-  // count as discovered — a model name appearing anywhere else in a multi-page --help
-  // dump (e.g. in `--agents` JSON example prose) must not be mistaken for a supported
-  // alias.
+  // Only the quoted aliases MENTIONED NEXT TO the --model flag's own description count —
+  // a model name elsewhere in a multi-page --help dump must not be mistaken for an alias.
   const modelSection = text.match(/--model\s*<model>[\s\S]{0,400}?(?=\n\s*(?:-{1,2}\S|\n)|$)/)?.[0] || "";
-  const quotedInModelSection = new Set([...modelSection.matchAll(/'([a-z][a-z0-9-]*)'/g)].map((m) => m[1]));
+  const quoted = [...modelSection.matchAll(/'([a-z][a-z0-9-]*)'/g)].map((m) => m[1]);
   const supportedModels = modelFlagPresent
-    ? CANDIDATE_MODELS.filter((alias) => quotedInModelSection.has(alias))
+    ? [...new Set(quoted.filter((alias) => !alias.startsWith("claude-")))]
     : [];
 
-  // The effort section states its full valid set as one literal parenthesised list —
-  // take it verbatim rather than guessing a fixed set ourselves, so a future CLI that
-  // adds or removes a level is reflected without a Murmur code change.
+  // The effort section states its full valid set as one literal parenthesised list.
   const effortSection = text.match(/--effort\s*<level>[\s\S]{0,400}?\(([a-z, ]+)\)/)?.[1] || "";
   const supportedEfforts = effortFlagPresent
     ? effortSection.split(",").map((level) => level.trim()).filter(Boolean)
     : [];
 
   return {
+    modelFlagPresent,
     modelFlagSupported: modelFlagPresent && supportedModels.length > 0,
     effortFlagSupported: effortFlagPresent && supportedEfforts.length > 0,
     supportedModels,
     supportedEfforts,
   };
+};
+
+/**
+ * Model catalog discovery — what the installed CLI/account actually offers
+ * -------------------------------------------------------------------------
+ * `claude --help` only documents a few example aliases. The authoritative, machine
+ * readable catalog is the one Claude Code's OWN `/model` picker uses: the SDK
+ * `initialize` control request answers with `models: [{ value, resolvedModel,
+ * displayName, supportedEffortLevels, ... }]`. Sending exactly that one request (no user
+ * message, so zero model tokens) over `--input-format stream-json` is the local,
+ * documented-by-use way to read it. Verified against claude 2.1.285: 12 entries, e.g.
+ * `{ value: "sonnet", resolvedModel: "claude-sonnet-5-5", displayName: "Sonnet 5.5" }`
+ * (a moving ALIAS: value != resolvedModel) next to `{ value: "claude-sonnet-5",
+ * resolvedModel: "claude-sonnet-5", displayName: "Sonnet 5" }` (a PINNED concrete id).
+ *
+ * The result is cached on disk (6 h, keyed by the binary's identity) so the 5-second menu
+ * poll never spawns it; the probe's `account` block (an email) is discarded and never
+ * cached.
+ */
+export const CLAUDE_CATALOG_SOURCE = Object.freeze({ sdk: "sdk-initialize", cache: "cache", staleCache: "stale-cache", help: "help", none: "none" });
+
+const FAMILY_ORDER = ["fable", "opus", "sonnet", "haiku"];
+const familyRank = (family) => {
+  const index = FAMILY_ORDER.indexOf(family);
+  return index === -1 ? FAMILY_ORDER.length : index;
+};
+const versionParts = (version) => String(version ?? "").split(".").map((part) => Number(part) || 0);
+const compareVersionsDesc = (a, b) => {
+  const [pa, pb] = [versionParts(a), versionParts(b)];
+  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
+    const diff = (pb[i] ?? 0) - (pa[i] ?? 0);
+    if (diff) return diff;
+  }
+  return 0;
+};
+
+/** Reduce one SDK `models[]` entry to the public fields Murmur keeps. Pure. */
+export const normalizeSdkModel = (entry) => {
+  if (!entry || typeof entry !== "object") return null;
+  const { value, resolvedModel, displayName, supportedEffortLevels, supportsEffort } = entry;
+  if (typeof value !== "string" || !value || typeof resolvedModel !== "string" || !resolvedModel) return null;
+  return {
+    value,
+    resolvedModel,
+    displayName: typeof displayName === "string" && displayName ? displayName : null,
+    efforts: Array.isArray(supportedEffortLevels)
+      ? supportedEffortLevels.filter((level) => typeof level === "string")
+      : (supportsEffort === false || supportsEffort === undefined ? [] : null),
+  };
+};
+
+/**
+ * Build the picker options from normalized SDK rows. Pure — the parser the tests drive
+ * with synthetic future ids.
+ *
+ *   value !== resolvedModel  -> ALIAS ("Актуальный <Family>", moves with the CLI)
+ *   value === resolvedModel  -> PINNED concrete version
+ *   every alias's resolvedModel that is not already listed as pinned is added as a
+ *   PINNED option too — it is the exact id the CLI itself resolves that alias to, so it
+ *   is accepted by construction (this is how "Sonnet 5.5" and "Haiku 4.5" become fixed
+ *   choices next to "Актуальный Sonnet").
+ *   value === "default" is Anthropic's recommendation, not an option: it is reported
+ *   separately as `defaultModel` and the operator's equivalent is `inherit`.
+ */
+export const buildClaudeModelOptions = (rows) => {
+  const aliases = [];
+  const pinned = new Map();
+  let defaultModel = null;
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!row || typeof row.value !== "string") continue;
+    if (row.value === "default") {
+      // `displayName` here is "Default (recommended)" — the concrete label comes from the id.
+      defaultModel = { canonicalId: row.resolvedModel, label: parseClaudeCanonicalId(row.resolvedModel)?.label ?? null };
+      continue;
+    }
+    const parsed = parseClaudeCanonicalId(row.resolvedModel);
+    const concreteLabel = row.displayName || parsed?.label || row.resolvedModel;
+    if (row.value !== row.resolvedModel) {
+      const family = parsed?.family ?? row.value;
+      aliases.push({
+        id: row.value,
+        canonicalId: row.resolvedModel,
+        alias: row.value,
+        family,
+        version: parsed?.version ?? null,
+        label: `Актуальный ${capitalize(family)}`,
+        resolvesToLabel: concreteLabel,
+        kind: MODEL_KINDS.alias,
+        selectable: true,
+        disabledReason: null,
+        efforts: row.efforts,
+      });
+      if (!pinned.has(row.resolvedModel)) {
+        pinned.set(row.resolvedModel, {
+          id: row.resolvedModel, canonicalId: row.resolvedModel, alias: null,
+          family, version: parsed?.version ?? null, label: concreteLabel, resolvesToLabel: null,
+          kind: MODEL_KINDS.pinned, selectable: true, disabledReason: null, efforts: row.efforts,
+        });
+      }
+    } else {
+      // An explicit listing always wins over an alias-derived one.
+      pinned.set(row.value, {
+        id: row.value, canonicalId: row.resolvedModel, alias: null,
+        family: parsed?.family ?? null, version: parsed?.version ?? null,
+        label: concreteLabel, resolvesToLabel: null,
+        kind: MODEL_KINDS.pinned, selectable: true, disabledReason: null, efforts: row.efforts,
+      });
+    }
+  }
+  const pinnedOptions = [...pinned.values()].sort((a, b) =>
+    familyRank(a.family) - familyRank(b.family)
+    || String(a.family).localeCompare(String(b.family))
+    || compareVersionsDesc(a.version, b.version));
+  return { options: [...aliases, ...pinnedOptions], defaultModel };
+};
+
+/**
+ * One bounded local probe: spawn `claude` in stream-json mode, send ONLY the
+ * `initialize` control request, read its response, kill the process. Argv only — no
+ * shell. `spawnImpl` is injectable so tests never run the real binary.
+ */
+export const probeClaudeModelCatalog = ({
+  binary, timeoutMs = 15_000, cwd = os.tmpdir(), env = process.env, spawnImpl = spawn,
+} = {}) => new Promise((resolve, reject) => {
+  const child = spawnImpl(binary, [
+    "-p", "--safe-mode", "--input-format", "stream-json", "--output-format", "stream-json",
+    "--verbose", "--no-session-persistence",
+  ], { cwd, env, stdio: ["pipe", "pipe", "ignore"] });
+  const requestId = "murmur-model-catalog";
+  let buffer = "";
+  let settled = false;
+  const finish = (error, value) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    try { child.kill("SIGTERM"); } catch { /* already gone */ }
+    if (error) reject(error); else resolve(value);
+  };
+  const timer = setTimeout(() => finish(new Error("claude-model-catalog-timeout")), timeoutMs);
+  timer.unref?.();
+  child.once("error", (error) => finish(error));
+  child.once("close", () => finish(new Error("claude-model-catalog-closed")));
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    buffer += chunk;
+    let index;
+    while ((index = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, index);
+      buffer = buffer.slice(index + 1);
+      let message;
+      try { message = JSON.parse(line); } catch { continue; }
+      if (message?.type !== "control_response" || message.response?.request_id !== requestId) continue;
+      if (message.response.subtype !== "success" || !Array.isArray(message.response.response?.models)) {
+        finish(new Error("claude-model-catalog-unavailable"));
+        return;
+      }
+      // Only the public model rows leave this function — never the `account` block.
+      finish(null, message.response.response.models.map(normalizeSdkModel).filter(Boolean));
+      return;
+    }
+  });
+  child.stdin.on("error", () => {});
+  child.stdin.write(`${JSON.stringify({ type: "control_request", request_id: requestId, request: { subtype: "initialize" } })}\n`);
+});
+
+const binaryIdentity = (binary) => {
+  try {
+    const stat = statSync(binary);
+    return `${binary}|${stat.size}|${Math.round(stat.mtimeMs)}`;
+  } catch {
+    return `${binary}|unknown`;
+  }
 };
 
 const EMPTY_CAPABILITIES = Object.freeze({
@@ -110,30 +283,36 @@ const EMPTY_CAPABILITIES = Object.freeze({
   effortFlagSupported: false,
   supportedModels: [],
   supportedEfforts: [],
+  models: [],
+  defaultModel: null,
+  catalogSource: CLAUDE_CATALOG_SOURCE.none,
 });
 
 /**
- * The CANONICAL model id actually used for a completed turn, e.g. `claude-sonnet-5` —
+ * The CANONICAL model id actually used for a completed turn, e.g. `claude-sonnet-5-5` —
  * distinct from the ALIAS Murmur configured (`sonnet`) and from the human LABEL
- * ("Sonnet 5"). Extracted from the real `modelUsage` object a completed
+ * ("Sonnet 5.5"). Extracted from the real `modelUsage` object a completed
  * `--output-format json` turn already returns (see `claude-one-shot-runtime.mjs`) —
  * never from a dedicated probe turn, so establishing it costs nothing beyond work
  * Murmur was already doing.
  *
  * `modelUsage` can carry more than one entry (a tiny Haiku helper call alongside the
- * main answering model is routinely observed), so the entry is chosen by matching the
- * CONFIGURED alias as a case-insensitive substring of the key — "sonnet" only ever
- * matches a key containing "sonnet" — rather than by picking the largest entry, which
- * would silently misattribute the helper call's model on a very short main turn.
+ * main answering model is routinely observed). A PINNED selection (`claude-sonnet-5`) is
+ * matched EXACTLY — never by substring, which would also match `claude-sonnet-5-5`. A
+ * moving ALIAS (`sonnet`) is matched as a case-insensitive substring of the key, so
+ * "sonnet" only ever matches a key containing "sonnet" rather than the largest entry.
  */
-export const extractCanonicalModel = (modelUsage, alias) => {
-  if (!modelUsage || typeof modelUsage !== "object" || typeof alias !== "string" || !alias) return null;
-  const needle = alias.toLowerCase();
-  const matches = Object.keys(modelUsage).filter((key) => key.toLowerCase().includes(needle));
+export const extractCanonicalModel = (modelUsage, selected) => {
+  if (!modelUsage || typeof modelUsage !== "object" || typeof selected !== "string" || !selected) return null;
+  const keys = Object.keys(modelUsage);
+  if (selected.startsWith("claude-")) {
+    return keys.find((key) => key === selected || key.startsWith(`${selected}[`)) ?? null;
+  }
+  const needle = selected.toLowerCase();
+  const matches = keys.filter((key) => key.toLowerCase().includes(needle));
   if (matches.length === 0) return null;
   if (matches.length === 1) return matches[0];
-  // More than one match (unlikely for "sonnet"/"opus", but not impossible): the entry
-  // with the most output tokens is the one that actually produced the answer.
+  // More than one match: the entry with the most output tokens actually produced the answer.
   return matches.reduce((best, key) => {
     const tokens = (entry) => Number(modelUsage[entry]?.outputTokens) || 0;
     return tokens(key) > tokens(best) ? key : best;
@@ -141,50 +320,96 @@ export const extractCanonicalModel = (modelUsage, alias) => {
 };
 
 /**
- * Parse a canonical model id into a truthful human label — "Sonnet 5", "Opus 5", and
- * (only if the installed CLI ever actually reports one) "Sonnet 5.5" for a hypothetical
- * `claude-sonnet-5-5`. This NEVER invents a version: an id that does not match the
- * expected `claude-<tier>-<version-parts>` shape returns `null`, and every caller falls
- * back to the bare alias label ("Sonnet") rather than guessing.
+ * Parse a canonical model id into a truthful human label — "Sonnet 5", "Opus 5.5",
+ * "Haiku 4.5" (a dated snapshot stamp is dropped). NEVER invents a version: an id that
+ * does not match the expected shape returns `null` and every caller falls back to the
+ * alias label rather than guessing.
  */
-export const canonicalModelLabel = (canonicalId) => {
-  if (typeof canonicalId !== "string") return null;
-  // Exactly one or two numeric version segments — "5" or "5-5" (→ "5.5") — never more.
-  // An unbounded segment count would also match a dated snapshot id like
-  // `claude-haiku-4-5-20251001` and render a nonsensical "Haiku 4.5.20251001"; real
-  // Anthropic version identifiers are at most major.minor, so this stays a precise parse
-  // rather than a loose one that happens to work for today's two known ids.
-  const match = canonicalId.match(/^claude-([a-z]+)-(\d+)(?:-(\d+))?$/i);
-  if (!match) return null;
-  const [, tier, major, minor] = match;
-  const tierLabel = tier.charAt(0).toUpperCase() + tier.slice(1).toLowerCase();
-  return `${tierLabel} ${minor ? `${major}.${minor}` : major}`;
-};
+export const canonicalModelLabel = (canonicalId) => parseClaudeCanonicalId(canonicalId)?.label ?? null;
 
 /**
- * Discover what the installed `claude` CLI supports, right now, with zero network
- * access: one local `--help` invocation (argv only — `execFile`, never a shell), parsed
- * with {@link parseClaudeHelp}.
- *
- * Returns a value object rather than throwing: "the CLI is missing" or "a future CLI
- * dropped `--effort`" are both ORDINARY states every caller (doctor, the config
- * resolver, the menu bar) must render as "not supported", never crash on.
+ * Discover what the installed `claude` CLI supports, right now, with no model tokens:
+ * one local `--help` (flags + effort levels) and the model catalog (cache, else one local
+ * `initialize` probe). Returns a value object rather than throwing: "the CLI is missing"
+ * is an ORDINARY state every caller must render as "not supported", never crash on.
  */
 export const discoverClaudeCapabilities = async ({
   command = "claude",
   env = process.env,
   timeoutMs = 10_000,
-  // Injectable so tests exercise the real parsing logic against FAKE `--help` text,
-  // without spawning the actual installed CLI — mirrors `operator/doctor.mjs`'s own
-  // `run` injection for `checkClaude`/`checkCursor`.
-  run = (binary, args) => execFileAsync(binary, args, { timeout: timeoutMs, encoding: "utf8" }),
+  // Injectable so tests exercise the real parsing logic against FAKE output, without
+  // spawning the installed CLI.
+  run,
+  // `probe` yields normalized catalog rows. When `run` is faked and no `probe` is given the
+  // catalog is skipped (help-only), so a unit test never reaches the real binary.
+  probe,
+  cacheFile,
+  refresh = false,
+  now = Date.now(),
 } = {}) => {
   const binary = findClaudeExecutable(command, env);
   if (!binary) return { ...EMPTY_CAPABILITIES, binary: null };
+  const runHelp = run ?? ((bin, args) => execFileAsync(bin, args, { timeout: timeoutMs, encoding: "utf8" }));
+  let help;
   try {
-    const { stdout } = await run(binary, ["--help"]);
-    return { ...parseClaudeHelp(stdout), available: true, binary };
+    const { stdout } = await runHelp(binary, ["--help"]);
+    help = parseClaudeHelp(stdout);
   } catch {
     return { ...EMPTY_CAPABILITIES, binary };
   }
+
+  const probeFn = probe !== undefined ? probe
+    : (run ? null : (bin) => probeClaudeModelCatalog({ binary: bin, env }));
+  const cachePath = cacheFile !== undefined ? cacheFile
+    : (probe === undefined && !run ? defaultCatalogCacheFile("claude", env) : null);
+  const identity = binaryIdentity(binary);
+
+  let rows = null;
+  let defaultFromRows = null;
+  let source = CLAUDE_CATALOG_SOURCE.none;
+  if (probeFn) {
+    const cached = refresh ? null : await readCatalogCache(cachePath, identity, { now });
+    if (cached) {
+      rows = cached.catalog.models;
+      source = CLAUDE_CATALOG_SOURCE.cache;
+    } else {
+      try {
+        rows = await probeFn(binary);
+        source = CLAUDE_CATALOG_SOURCE.sdk;
+        await writeCatalogCache(cachePath, identity, { models: rows }, { now });
+      } catch {
+        const stale = await readCatalogCache(cachePath, identity, { now, allowStale: true });
+        if (stale) {
+          rows = stale.catalog.models;
+          source = CLAUDE_CATALOG_SOURCE.staleCache;
+        }
+      }
+    }
+  }
+  let models = [];
+  if (rows) {
+    const built = buildClaudeModelOptions(rows);
+    models = built.options;
+    defaultFromRows = built.defaultModel;
+  } else if (help.modelFlagSupported) {
+    // The catalog is unreachable: fall back to the aliases `--help` itself documents.
+    models = help.supportedModels.map((alias) => ({
+      id: alias, canonicalId: null, alias, family: alias, version: null,
+      label: `Актуальный ${capitalize(alias)}`, resolvesToLabel: null,
+      kind: MODEL_KINDS.alias, selectable: true, disabledReason: null, efforts: null,
+    }));
+    if (models.length) source = CLAUDE_CATALOG_SOURCE.help;
+  }
+  const selectable = models.filter((option) => option.selectable).map((option) => option.id);
+  return {
+    available: true,
+    binary,
+    modelFlagSupported: help.modelFlagPresent && selectable.length > 0,
+    effortFlagSupported: help.effortFlagSupported,
+    supportedModels: selectable,
+    supportedEfforts: help.supportedEfforts,
+    models,
+    defaultModel: defaultFromRows,
+    catalogSource: source,
+  };
 };

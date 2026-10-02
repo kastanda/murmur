@@ -2,7 +2,7 @@
  * claude.mjs — operator surface for the per-project Claude model/effort preference.
  *
  *   murmur claude <project> config [--json]
- *   murmur claude <project> model <sonnet|opus|inherit>
+ *   murmur claude <project> model <id|inherit>        (an id from `config --json` `models`)
  *   murmur claude <project> effort <low|medium|high|xhigh|max|inherit>
  *
  * This is the ONLY writer of `claude-preferences.json`: the menu bar app, and any other
@@ -16,6 +16,9 @@ import os from "node:os";
 import path from "node:path";
 import {
   INHERIT,
+  claudeEffortApplies,
+  claudeEffortOptions,
+  claudeModelOptions,
   defaultClaudePreferencesFor,
   effortLabel,
   isSupportedEffort,
@@ -33,15 +36,18 @@ import { readAgentRuntimeState } from "./status.mjs";
 export const CLAUDE_USAGE = `murmur claude — per-project Claude model/effort preference
 
 Usage:
-  murmur claude <project> config [--json]
-  murmur claude <project> model <sonnet|opus|inherit>
+  murmur claude <project> config [--json] [--refresh]
+  murmur claude <project> model <id|inherit>
   murmur claude <project> effort <low|medium|high|xhigh|max|inherit>
 
-"inherit" means Murmur passes no override at all: the installed Claude CLI's own
-configuration decides, exactly as it did before this preference existed.
+A model id is either a moving ALIAS ("sonnet" = "Актуальный Sonnet", whatever the CLI
+currently resolves it to) or a PINNED concrete version ("claude-sonnet-5"). "inherit"
+means Murmur passes no override at all: the installed Claude CLI's own configuration
+decides, exactly as it did before this preference existed.
 
-Only values the INSTALLED Claude CLI actually supports right now are accepted; run
-\`murmur claude <project> config\` to see what was discovered. This never touches
+Only values the INSTALLED Claude CLI actually offers right now are accepted (its own
+model catalog, read locally — never a web list); run \`murmur claude <project> config\`
+to see them. --refresh re-reads the catalog instead of using the 6-hour cache. This never touches
 ~/.claude/settings.json or any other global Claude Code preference — it is scoped to
 this one Murmur project.
 `;
@@ -60,24 +66,42 @@ export const claudeSettingsPath = (homedir = os.homedir()) => path.join(homedir,
  * every human-facing rendering below is built from.
  */
 export const buildClaudeConfigReport = async ({
-  paths, project, discoverCapabilities = discoverClaudeCapabilities,
+  paths, project, discoverCapabilities = discoverClaudeCapabilities, refresh = false,
   // Injectable so tests never have to mutate the real $HOME to prove this path is never
   // written to — a global env mutation in a shared test process can corrupt whatever else
   // happens to be running concurrently in the same `node --test` invocation.
   settingsPath = claudeSettingsPath(),
 } = {}) => {
-  const capabilities = await discoverCapabilities();
+  const capabilities = await discoverCapabilities({ refresh });
   const resolved = await resolveClaudeConfig({
     paths,
     capabilities,
     claudeSettingsPath: settingsPath,
     readLiveClaudeBinding: project ? readLiveClaudeBindingFor(project) : undefined,
   });
-  // A value -> Russian-label map for EVERY selectable option, so a client (the menu bar
-  // app) never has to maintain its own copy of `modelLabel`/`effortLabel` and can never
-  // drift from the one place those labels are decided.
-  const modelLabels = Object.fromEntries([...capabilities.supportedModels, INHERIT].map((v) => [v, modelLabel(v)]));
+  const options = claudeModelOptions(capabilities);
+  // A value -> Russian-label map for EVERY selectable option, so a client never has to
+  // maintain its own copy of a label.
+  const modelLabels = Object.fromEntries([...options.filter((o) => o.selectable).map((o) => o.id), INHERIT].map((v) => [v, modelLabel(v, options)]));
   const effortLabels = Object.fromEntries([...capabilities.supportedEfforts, INHERIT].map((v) => [v, effortLabel(v)]));
+  const inheritView = resolved.model.inheritView;
+  const view = (v) => (v ? {
+    id: v.id, kind: v.kind, label: v.label, canonicalId: v.canonicalId,
+    resolvesToLabel: v.resolvesToLabel, effectiveLabel: v.effectiveLabel,
+  } : null);
+  // The picker, complete and ordered: aliases, then pinned versions, then inherit. Each
+  // entry already carries its final label — Swift renders, it never parses a model id.
+  const models = [
+    ...options.map((o) => ({
+      id: o.id, kind: o.kind, label: o.label, resolvesToLabel: o.resolvesToLabel ?? null,
+      canonicalId: o.canonicalId ?? null, family: o.family ?? null, version: o.version ?? null,
+      selectable: o.selectable === true, disabledReason: o.disabledReason ?? null,
+    })),
+    {
+      id: INHERIT, kind: "inherit", label: modelLabel(INHERIT), canonicalId: null, family: null, version: null,
+      resolvesToLabel: inheritView ? inheritView.resolvesToLabel : null, selectable: true, disabledReason: null,
+    },
+  ];
   return {
     capabilities: {
       available: capabilities.available,
@@ -87,6 +111,7 @@ export const buildClaudeConfigReport = async ({
       supportedEfforts: capabilities.supportedEfforts,
       modelLabels,
       effortLabels,
+      catalogSource: capabilities.catalogSource ?? null,
     },
     claude: {
       model: resolved.model.selected,
@@ -97,11 +122,9 @@ export const buildClaudeConfigReport = async ({
       runningEffort: resolved.effort.running,
       effectiveModel: resolved.model.effective,
       effectiveModelLabel: resolved.model.effectiveLabel,
-      // The THIRD, separate concept (Part A1): the canonical model id actually observed
-      // on a completed real turn (e.g. "claude-sonnet-5"), never inferred from the alias.
-      // `null` whenever no real turn has run yet under the currently effective alias —
-      // `effectiveModelLabel` above already falls back to the bare alias label in that
-      // case, so a client never has to branch on this field just to render correctly.
+      // The canonical model id the effective selection runs as ("claude-sonnet-5-5") —
+      // from a real completed turn when it correlates, else the CLI's own catalog
+      // resolution; null when neither is known.
       canonicalModel: resolved.model.canonicalModel,
       effectiveEffort: resolved.effort.effective,
       effectiveEffortLabel: resolved.effort.effectiveLabel,
@@ -110,29 +133,43 @@ export const buildClaudeConfigReport = async ({
       pendingRestart: resolved.model.pendingRestart || resolved.effort.pendingRestart,
       configState: resolved.configState,
       ...(resolved.configReason ? { configReason: resolved.configReason } : {}),
+      // Structured views (one resolver): what was SELECTED, what is RUNNING, the EFFECTIVE
+      // one, and the complete option list + effort choices for the menu.
+      selected: view(resolved.model.selectedView),
+      running: view(resolved.model.runningView),
+      effective: view(resolved.model.effectiveView),
+      models,
+      effortOptions: claudeEffortOptions({
+        capabilities, selectedModel: resolved.model.selected, selectedEffort: resolved.effort.selected,
+      }),
     },
   };
 };
 
 const renderClaudeConfigHuman = (out, report, projectArg) => {
+  const { claude } = report;
   out(`Project: ${projectArg}`);
   out("");
-  out(`Claude model:   ${report.claude.modelLabel}${report.claude.model !== INHERIT ? ` (${report.claude.model})` : ""}`);
-  out(`Claude effort:  ${report.claude.effortLabel}${report.claude.effort !== INHERIT ? ` (${report.claude.effort})` : ""}`);
-  out(`Effective model:  ${report.claude.effectiveModelLabel ?? "unknown"}`);
-  out(`Effective effort: ${report.claude.effectiveEffortLabel ?? "unknown"}`);
-  out(`Source: ${report.claude.source}`);
-  if (report.claude.pendingRestart) {
+  out(`Claude model:   ${claude.modelLabel}${claude.model !== INHERIT ? ` (${claude.model}, ${claude.selected?.kind})` : ""}`);
+  out(`Claude effort:  ${claude.effortLabel}${claude.effort !== INHERIT ? ` (${claude.effort})` : ""}`);
+  out(`Effective model:  ${claude.effectiveModelLabel ?? "unknown"}${claude.canonicalModel ? ` (${claude.canonicalModel})` : ""}`);
+  out(`Effective effort: ${claude.effectiveEffortLabel ?? "unknown"}`);
+  out(`Source: ${claude.source}`);
+  if (claude.pendingRestart) {
     out("");
     out("A Claude daemon is already running with a different model/effort than currently");
     out("selected. The change applies after Murmur is restarted for this project.");
   }
-  if (report.claude.configState === "invalid") {
+  if (claude.configState === "invalid") {
     out("");
-    out(`WARNING: claude-preferences.json is invalid (${report.claude.configReason}); running without an override.`);
+    out(`WARNING: claude-preferences.json is invalid (${claude.configReason}); running without an override.`);
   }
   out("");
-  out(`Supported models (installed CLI): ${report.capabilities.supportedModels.join(", ") || "(none discovered)"}`);
+  out(`Models (installed CLI, source: ${report.capabilities.catalogSource ?? "unknown"}):`);
+  for (const option of claude.models) {
+    const extra = option.kind === "alias" && option.resolvesToLabel ? ` -> ${option.resolvesToLabel}` : "";
+    out(`  ${option.id === claude.model ? "*" : " "} ${option.id}  [${option.kind}]  ${option.label}${extra}${option.selectable ? "" : `  (unavailable: ${option.disabledReason ?? "n/a"})`}`);
+  }
   out(`Supported effort levels (installed CLI): ${report.capabilities.supportedEfforts.join(", ") || "(none discovered)"}`);
 };
 
@@ -172,7 +209,7 @@ export const commandClaude = async ({
   }
 
   if (subcommand === "config") {
-    const report = await buildClaudeConfigReport({ paths, project, discoverCapabilities, settingsPath });
+    const report = await buildClaudeConfigReport({ paths, project, discoverCapabilities, settingsPath, refresh: Boolean(flags.refresh) });
     if (flags.json) {
       out(JSON.stringify({ project: path.basename(projectPath), ...report }, null, 2));
       return 0;
@@ -188,11 +225,13 @@ export const commandClaude = async ({
       err(CLAUDE_USAGE);
       return 1;
     }
-    const capabilities = await discoverCapabilities();
+    const capabilities = await discoverCapabilities({ refresh: Boolean(flags.refresh) });
     const isModel = subcommand === "model";
     const supported = isModel ? isSupportedModel(value, capabilities) : isSupportedEffort(value, capabilities);
     if (!supported) {
-      const allowed = (isModel ? capabilities.supportedModels : capabilities.supportedEfforts);
+      const allowed = isModel
+        ? claudeModelOptions(capabilities).filter((o) => o.selectable).map((o) => o.id)
+        : capabilities.supportedEfforts;
       err(`murmur: '${value}' is not supported by the installed Claude CLI.`);
       err(`Supported: ${[...allowed, INHERIT].join(", ")}`);
       return 1;
@@ -208,9 +247,16 @@ export const commandClaude = async ({
       ? loaded.preferences
       : defaultClaudePreferencesFor(capabilities);
     const next = isModel ? { ...current, model: value } : { ...current, effort: value };
+    // A concrete model can lack an effort level (an older Opus has no "xhigh"; Haiku takes
+    // none): refuse the combination rather than store something the runtime will drop.
+    if (!claudeEffortApplies(next.model, next.effort, capabilities)) {
+      err(`murmur: the model '${next.model}' does not support effort '${next.effort}'.`);
+      err("Change the effort first (low/medium/high), or choose another model.");
+      return 1;
+    }
     await writeClaudePreferences(paths, next);
 
-    const label = isModel ? modelLabel(value) : effortLabel(value);
+    const label = isModel ? modelLabel(value, claudeModelOptions(capabilities)) : effortLabel(value);
     out(`Claude ${subcommand} set to ${label}${value !== INHERIT ? ` (${value})` : ""}.`);
 
     const report = await buildClaudeConfigReport({ paths, project, discoverCapabilities, settingsPath });

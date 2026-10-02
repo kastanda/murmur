@@ -36,6 +36,7 @@ import {
   publicProfileSummary,
 } from "./profile.mjs";
 import { commandClaude } from "./claude.mjs";
+import { commandCodex } from "./codex-model.mjs";
 import { commandCursor } from "./cursor.mjs";
 import { commandNotify } from "./notify.mjs";
 import { locateProject, murmurHome, projectPathsFor } from "./project.mjs";
@@ -103,7 +104,8 @@ Usage:
   murmur logs    <project> [supervisor|root|claude|codex|cursor|codex-app-server] [-n <lines>] [--follow]
   murmur send    <project> "<task>" [--timeout <seconds>] [--no-wait]
   murmur projects [--json]
-  murmur claude   <project> config [--json] | model <sonnet|opus|inherit> | effort <level>
+  murmur claude   <project> config [--json] [--refresh] | model <id|inherit> | effort <level>
+  murmur codex    <project> config [--json] [--refresh] | model <id|inherit> | effort <level>
   murmur cursor   <project> config [--json]
   murmur notify  status | mode <activity|errors|default> | migrate [--from <dir>] | test
 
@@ -135,6 +137,7 @@ export const parseArgs = (argv) => {
     else if (arg === "-n" || arg === "--lines") flags.lines = Number(argv[++i]);
     else if (arg === "--timeout") flags.timeoutSeconds = Number(argv[++i]);
     else if (arg === "--from") flags.from = argv[++i];
+    else if (arg === "--refresh") flags.refresh = true;
     else if (arg === "--help" || arg === "-h") flags.help = true;
     else if (arg === "--version" || arg === "-v") flags.version = true;
     else if (arg.startsWith("-")) throw new Error(`unknown-flag:${arg}`);
@@ -1301,6 +1304,7 @@ const COMMANDS = {
   send: commandSend,
   notify: (parsed) => commandNotify({ ...parsed, out, err }),
   claude: (parsed) => commandClaude({ ...parsed, out, err }),
+  codex: (parsed) => commandCodex({ ...parsed, out, err }),
   cursor: (parsed) => commandCursor({ ...parsed, out, err }),
 };
 

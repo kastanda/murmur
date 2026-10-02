@@ -33,6 +33,12 @@ struct StatusWindow: View {
                         row(L.claudeSelected, "\(claude.modelLabel) · \(claude.effortLabel)")
                         row(L.claudeEffective, "\(claude.effectiveModelLabel ?? L.unknown) · \(claude.effectiveEffortLabel ?? L.unknown)")
                     }
+                    if let codex = controller.codexConfig?.codex {
+                        if codex.controllable {
+                            row("\(L.codex): \(L.modelSelected.lowercased())", "\(codex.selectedModelLabel) · \(codex.reasoningEffortLabel)")
+                        }
+                        row("\(L.codex): \(L.claudeEffective.lowercased())", "\(codex.effectiveModelLabel ?? L.unknown) · \(codex.effectiveReasoningEffortLabel ?? L.unknown)")
+                    }
                     if let cursor = controller.cursorConfig?.cursor {
                         // Read-only, same as `cursorSection` in the main menu — no
                         // selected/effective split to show, since Murmur has no
@@ -40,8 +46,11 @@ struct StatusWindow: View {
                         row(L.cursor, cursor.effectiveModelLabel ?? L.cursorByCursorSettings)
                     }
                 }
-                if controller.claudeConfig?.claude.pendingRestart == true {
-                    Text(L.claudePendingRestart).font(.callout).foregroundStyle(.orange)
+                if let claude = controller.claudeConfig?.claude, claude.pendingRestart {
+                    ForEach(ModelMenu.claudePendingLines(claude), id: \.self) { Text($0).font(.callout).foregroundStyle(.orange) }
+                }
+                if let codex = controller.codexConfig?.codex {
+                    ForEach(ModelMenu.codexPendingLines(codex), id: \.self) { Text($0).font(.callout).foregroundStyle(.orange) }
                 }
                 if let problems = controller.status?.problems, !problems.isEmpty {
                     Divider()

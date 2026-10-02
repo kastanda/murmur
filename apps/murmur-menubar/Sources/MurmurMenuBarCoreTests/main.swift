@@ -455,18 +455,21 @@ await test("claudeConfig decodes selected, running and effective exactly as the 
     let cli = MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(claudeConfigJSON) })
     let report = try await cli.claudeConfig(project: "murmur")
     await expectEqual(report.claude.model, "sonnet")
-    await expectEqual(report.claude.modelLabel, "Sonnet")
+    await expectEqual(report.claude.modelLabel, "Актуальный Sonnet")
     await expectEqual(report.claude.effort, "medium")
     await expectEqual(report.claude.pendingRestart, false)
-    await expectEqual(report.capabilities.modelMenuOptions, ["sonnet", "opus", "inherit"])
-    await expectEqual(report.capabilities.effortMenuOptions, ["low", "medium", "high", "inherit"])
+    await expectEqual(report.claude.selected?.kind, "alias")
+    await expectEqual(report.claude.effective?.effectiveLabel, "Sonnet 5.5")
+    await expectEqual(report.claude.canonicalModel, "claude-sonnet-5-5")
+    await expectEqual(report.claude.models.count, 10)
+    await expectEqual(report.claude.effortOptions.map(\.id), ["low", "medium", "high", "inherit"])
 }
 
 await test("refresh loads the Claude config alongside status") {
     let controller = await makeController(runner: healthyRunner())
     await controller.refresh()
     await expectEqual(await controller.claudeConfig?.claude.model, "sonnet")
-    await expectEqual(await controller.claudeConfig?.claude.modelLabel, "Sonnet")
+    await expectEqual(await controller.claudeConfig?.claude.modelLabel, "Актуальный Sonnet")
 }
 
 await test("switching project clears the previous project's Claude config immediately") {
@@ -521,11 +524,12 @@ await test("selecting an effort level invokes exactly that argv") {
     await expect(calls.contains { $0.arguments == ["claude", "/Users/x/Projects/murmur", "effort", "high"] })
 }
 
-await test("a model the installed CLI does not support is never offered in the menu options") {
+await test("a CLI that supports neither flag offers only inherit, and no picker is built from it") {
     let report = try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(claudeConfigUnsupportedJSON) })
         .claudeConfig(project: "murmur")
-    await expectEqual(report.capabilities.modelMenuOptions, ["inherit"])
-    await expectEqual(report.capabilities.effortMenuOptions, ["inherit"])
+    await expectEqual(report.claude.models.map(\.id), ["inherit"])
+    await expectEqual(report.claude.effortOptions.map(\.id), ["inherit"])
+    await expectEqual(report.capabilities.modelSupported, false)
 }
 
 await test("a rejected model value surfaces as a Russian error, not a silent no-op") {
@@ -566,10 +570,18 @@ await test("pending-restart wording is shown only when the CLI reports one, and 
     await controller.refresh()
     let config = await controller.claudeConfig
     await expectEqual(config?.claude.pendingRestart, true)
-    // Opus is SELECTED but Sonnet is what is actually running — the UI must be able to
-    // tell those apart, never claim Opus is already active.
-    await expectEqual(config?.claude.model, "opus")
+    // Sonnet 5 is SELECTED (pinned) but the moving alias, currently Sonnet 5.5, is what is
+    // actually running — the UI must tell those apart, never claim Sonnet 5 is already active.
+    await expectEqual(config?.claude.model, "claude-sonnet-5")
     await expectEqual(config?.claude.effectiveModel, "sonnet")
+    await expectEqual(config?.claude.effectiveModelLabel, "Sonnet 5.5")
+    if let claude = config?.claude {
+        await expectEqual(ModelMenu.claudePendingLines(claude), [
+            "Выбрано: Sonnet 5 · Высокое",
+            "Сейчас: Sonnet 5.5 · Среднее",
+            "Применится после перезапуска Murmur.",
+        ])
+    }
 }
 
 await test("no pending-restart banner when selected already matches what is running") {
@@ -621,29 +633,248 @@ await test("starting Murmur is refused while a Claude model change is in flight"
     try? await Task.sleep(nanoseconds: 400_000_000)
 }
 
-await test("the Claude section of the menu is entirely Russian, including every option label") {
+await test("the Claude section of the menu is entirely Russian, including every option label and heading") {
     let report = try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(claudeConfigJSON) })
         .claudeConfig(project: "murmur")
     await expect(isRussian(report.claude.modelLabel))
     await expect(isRussian(report.claude.effortLabel))
-    for value in report.capabilities.modelMenuOptions {
-        let label = report.capabilities.modelLabels[value] ?? value
-        await expect(isRussian(label), "«\(label)» must be Russian (Sonnet/Opus are proper nouns)")
+    for row in ModelMenu.claudeRows(options: report.claude.models, selectedId: report.claude.model) {
+        switch row {
+        case let .heading(title): await expect(isRussian(title), "«\(title)» must be Russian")
+        case let .option(_, title, _, _): await expect(isRussian(title), "«\(title)» must be Russian (model names are proper nouns)")
+        case .divider: break
+        }
     }
-    for (_, label) in report.capabilities.effortLabels {
-        await expect(isRussian(label), "«\(label)» must be Russian")
+    for option in report.claude.effortOptions {
+        await expect(isRussian(option.label), "«\(option.label)» must be Russian")
     }
+    await expect(isRussian(ModelMenu.claudeSummary(report.claude)))
     await expect(isRussian(L.claudeModelMenu))
     await expect(isRussian(L.claudeEffortMenu))
     await expect(isRussian(L.claudePendingRestart))
+    await expect(isRussian(L.modelAliasesSection))
+    await expect(isRussian(L.modelPinnedSection))
 }
 
-await test("no fabricated minor version ever appears in a Claude label") {
+await test("every discovered Claude option renders: aliases, then fixed versions, then inherit") {
     let report = try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(claudeConfigJSON) })
         .claudeConfig(project: "murmur")
-    for (_, label) in report.capabilities.modelLabels {
-        await expect(label.range(of: "5\\.5|[0-9]", options: .regularExpression) == nil, "«\(label)» must not invent a version number")
+    let rows = ModelMenu.claudeRows(options: report.claude.models, selectedId: report.claude.model)
+    let optionIds = rows.compactMap { row -> String? in if case let .option(id, _, _, _) = row { return id } else { return nil } }
+    await expectEqual(optionIds, report.claude.models.map(\.id), "no discovered option is dropped and none is invented")
+    await expectEqual(rows.first, .heading("Актуальные"))
+    await expect(rows.contains(.heading("Фиксированные версии")))
+    await expect(rows.contains(.divider))
+    // order: aliases before pinned before inherit
+    let kinds = report.claude.models.map(\.kind)
+    await expectEqual(kinds, ["alias", "alias", "alias", "pinned", "pinned", "pinned", "pinned", "pinned", "pinned", "inherit"])
+}
+
+await test("a moving alias is labelled «Актуальный …» with what it resolves to; a pinned version is just its version") {
+    let report = try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(claudeConfigJSON) })
+        .claudeConfig(project: "murmur")
+    let byId = Dictionary(uniqueKeysWithValues: report.claude.models.map { ($0.id, $0) })
+    await expectEqual(ModelMenu.title(for: byId["sonnet"]!), "Актуальный Sonnet — сейчас Sonnet 5.5")
+    await expectEqual(ModelMenu.title(for: byId["claude-sonnet-5"]!), "Sonnet 5")
+    await expectEqual(ModelMenu.title(for: byId["claude-sonnet-5-5"]!), "Sonnet 5.5")
+    await expectEqual(ModelMenu.title(for: byId["inherit"]!), "По настройкам Claude Code — сейчас Opus 5.5")
+    await expect(ModelMenu.title(for: byId["claude-sonnet-5"]!) != ModelMenu.title(for: byId["claude-sonnet-5-5"]!),
+                 "Sonnet 5 and Sonnet 5.5 are two distinct choices")
+    await expect(ModelMenu.title(for: byId["sonnet"]!).hasPrefix("Актуальный"), "an alias is never presented as a version")
+}
+
+await test("the checkmark follows the SELECTED option, exactly one row, alias or pinned") {
+    func checked(_ json: String) async throws -> [String] {
+        let report = try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(json) }).claudeConfig(project: "murmur")
+        return ModelMenu.claudeRows(options: report.claude.models, selectedId: report.claude.model).compactMap { row in
+            if case let .option(id, _, true, _) = row { return id } else { return nil }
+        }
     }
+    await expectEqual(try await checked(claudeConfigJSON), ["sonnet"])
+    await expectEqual(try await checked(claudeConfigPinnedJSON), ["claude-sonnet-5"])
+    await expectEqual(try await checked(claudeConfigInheritJSON), ["inherit"])
+    // pending restart: the SELECTION (pinned Sonnet 5) is checked even though the alias is what runs
+    await expectEqual(try await checked(claudeConfigPendingRestartJSON), ["claude-sonnet-5"])
+    await expectEqual(ModelMenu.rowText(title: "Sonnet 5", checked: true), "✓ Sonnet 5")
+    await expectEqual(ModelMenu.rowText(title: "Sonnet 5", checked: false), "  Sonnet 5")
+}
+
+await test("the main Claude line follows the EFFECTIVE model; selection and effective never share a label by accident") {
+    let alias = try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(claudeConfigJSON) }).claudeConfig(project: "murmur")
+    await expectEqual(ModelMenu.claudeSummary(alias.claude), "Claude: Sonnet 5.5 · Среднее")
+    let pinned = try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(claudeConfigPinnedJSON) }).claudeConfig(project: "murmur")
+    await expectEqual(ModelMenu.claudeSummary(pinned.claude), "Claude: Sonnet 5 · Среднее")
+    let pending = try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(claudeConfigPendingRestartJSON) }).claudeConfig(project: "murmur")
+    await expectEqual(ModelMenu.claudeSummary(pending.claude), "Claude: Sonnet 5.5 · Среднее", "the daemon still runs the alias")
+    let inherit = try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(claudeConfigInheritJSON) }).claudeConfig(project: "murmur")
+    await expectEqual(ModelMenu.claudeSummary(inherit.claude), "Claude: Sonnet 5.5 · По настройкам Claude Code")
+    // the SAME resolver output feeds the summary and the pending text
+    await expectEqual(pending.claude.effective?.effectiveLabel, pending.claude.effectiveModelLabel)
+    await expectEqual(ModelMenu.claudePendingLines(alias.claude), [], "no pending text without a pending restart")
+}
+
+await test("an option the CLI marks unselectable renders disabled and stays out of the way") {
+    let options = [
+        ModelOption(id: "sonnet", kind: "alias", label: "Актуальный Sonnet", resolvesToLabel: "Sonnet 5.5"),
+        ModelOption(id: "claude-old", kind: "pinned", label: "Old 1", selectable: false, disabledReason: "no-longer-offered"),
+        ModelOption(id: "inherit", kind: "inherit", label: "По настройкам Claude Code"),
+    ]
+    let rows = ModelMenu.claudeRows(options: options, selectedId: "sonnet")
+    await expect(rows.contains(.option(id: "claude-old", title: "Old 1", checked: false, enabled: false)))
+    await expect(rows.contains(.option(id: "sonnet", title: "Актуальный Sonnet — сейчас Sonnet 5.5", checked: true, enabled: true)))
+}
+
+await test("only sections that actually have options are rendered") {
+    let onlyInherit = ModelMenu.claudeRows(options: [ModelOption(id: "inherit", kind: "inherit", label: "По настройкам Claude Code")], selectedId: "inherit")
+    await expectEqual(onlyInherit, [.option(id: "inherit", title: "По настройкам Claude Code", checked: true, enabled: true)])
+    await expectEqual(ModelMenu.claudeRows(options: [], selectedId: "inherit"), [])
+}
+
+await test("selecting a pinned version sends exactly its id as one argv entry, never a shell string") {
+    let runner = healthyRunner()
+    let controller = await makeController(runner: runner)
+    await controller.refresh()
+    let before = runner.invocations.count
+    await controller.setClaudeModel("claude-sonnet-5")
+    try? await Task.sleep(nanoseconds: 200_000_000)
+    let calls = runner.invocations.dropFirst(before)
+    await expect(calls.contains { $0.arguments == ["claude", "/Users/x/Projects/murmur", "model", "claude-sonnet-5"] })
+    for call in calls { await expect(!call.arguments.contains("-c") && !call.arguments.contains("sh")) }
+}
+
+// MARK: - Codex model/reasoning (project-scoped, shown only when the CLI says controllable)
+
+suite("Codex model/effort")
+
+await test("argv for reading and setting the Codex policy is direct argv") {
+    let cli = MurmurCLI(executable: "/opt/homebrew/bin/murmur", runner: FakeRunner { _ in ok("") })
+    await expectEqual(cli.codexConfigInvocation(project: "murmur").arguments, ["codex", "murmur", "config", "--json"])
+    await expectEqual(cli.setCodexModelInvocation(project: "murmur", value: "model-b").arguments, ["codex", "murmur", "model", "model-b"])
+    await expectEqual(cli.setCodexEffortInvocation(project: "murmur", value: "low").arguments, ["codex", "murmur", "effort", "low"])
+    await expect(!cli.setCodexModelInvocation(project: "murmur", value: "x").arguments.contains("-c"))
+}
+
+await test("codexConfig decodes selected, effective, catalog and transition flags exactly as the CLI reports them") {
+    let report = try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(codexConfigPendingNextTurnJSON) }).codexConfig(project: "murmur")
+    await expectEqual(report.codex.controllable, true)
+    await expectEqual(report.codex.selectedModel, "model-b")
+    await expectEqual(report.codex.effectiveModelLabel, "Model A")
+    await expectEqual(report.codex.availableModels.map(\.id), ["model-a", "model-b", "inherit"])
+    await expectEqual(report.codex.pendingNextTurn, true)
+    await expectEqual(report.codex.requiresNewThread, false)
+    await expectEqual(report.codex.pendingRestart, false)
+}
+
+await test("the Codex summary follows the EFFECTIVE model and reasoning; transitions are the technically true ones") {
+    let plain = try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(codexConfigJSON) }).codexConfig(project: "murmur")
+    await expectEqual(ModelMenu.codexSummary(plain.codex), "Codex: Model A · Высокое")
+    await expectEqual(ModelMenu.codexPendingLines(plain.codex), [])
+    let next = try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(codexConfigPendingNextTurnJSON) }).codexConfig(project: "murmur")
+    await expectEqual(ModelMenu.codexSummary(next.codex), "Codex: Model A · Высокое")
+    await expectEqual(ModelMenu.codexPendingLines(next.codex), [
+        "Выбрано: Model B · Низкое", "Сейчас: Model A · Высокое", "Применится со следующего запроса к Codex.",
+    ])
+    // An explicit choice nothing has run under yet: no fake "now", just the true transition.
+    let neverRun = try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(codexConfigSelectedNeverRunJSON) }).codexConfig(project: "murmur")
+    await expectEqual(neverRun.codex.effectiveModelLabel, nil)
+    await expectEqual(ModelMenu.codexPendingLines(neverRun.codex), ["Применится со следующего запроса к Codex."])
+    let newThread = try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(codexConfigNewThreadJSON) }).codexConfig(project: "murmur")
+    await expectEqual(ModelMenu.codexPendingLines(newThread.codex).last, "Применится к новой сессии Codex.")
+    await expect(!ModelMenu.codexPendingLines(newThread.codex).joined().contains("перезапуска"), "Codex never needs a Murmur restart")
+}
+
+await test("Codex rows: every catalog model, checkmark on the SELECTED one, inherit last") {
+    let report = try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(codexConfigPendingNextTurnJSON) }).codexConfig(project: "murmur")
+    let rows = ModelMenu.codexRows(options: report.codex.availableModels, selectedId: report.codex.selectedModel)
+    await expectEqual(rows, [
+        .option(id: "model-a", title: "Model A", checked: false, enabled: true),
+        .option(id: "model-b", title: "Model B", checked: true, enabled: true),
+        .divider,
+        .option(id: "inherit", title: "По настройкам Codex — сейчас Model A", checked: false, enabled: true),
+    ])
+    let effort = ModelMenu.effortRows(options: report.codex.effortOptions, selectedId: report.codex.reasoningEffort)
+    await expectEqual(effort.compactMap { row -> String? in if case let .option(id, _, true, _) = row { return id } else { return nil } }, ["low"])
+}
+
+await test("a Codex whose catalog is unreadable shows the effective model only — no controls data, no fake selector") {
+    let report = try await MurmurCLI(executable: "/m", runner: FakeRunner { _ in ok(codexConfigUncontrollableJSON) }).codexConfig(project: "murmur")
+    await expectEqual(report.codex.controllable, false)
+    await expectEqual(report.codex.availableModels, [])
+    await expectEqual(ModelMenu.codexSummary(report.codex), "Codex: по настройкам Codex")
+    await expectEqual(ModelMenu.codexPendingLines(report.codex), [])
+    await expect(isRussian(L.codexModelUnavailable))
+}
+
+await test("refresh loads the Codex config alongside status; switching project clears it immediately") {
+    let controller = await makeController(runner: healthyRunner())
+    await controller.refresh()
+    await expectEqual(await controller.codexConfig?.codex.effectiveModelLabel, "Model A")
+    await controller.selectProject("other-aaaaaaaaaaaa")
+    await expectNil(await controller.codexConfig, "the old project's Codex info must not be shown for the new selection even briefly")
+}
+
+await test("a project without a Codex identity simply omits the Codex rows") {
+    let runner = FakeRunner { invocation in
+        switch invocation.arguments.first {
+        case "projects": return ok(projectsJSON)
+        case "status": return ok(healthyStatusJSON)
+        case "notify": return ok(notifyJSON)
+        case "codex": return CommandOutcome(exitCode: 3, stdout: "", stderr: "murmur: this project has no Codex identity.")
+        default: return ok("")
+        }
+    }
+    let controller = await makeController(runner: runner)
+    await controller.refresh()
+    await expectNil(await controller.codexConfig)
+}
+
+await test("selecting a Codex model or effort invokes exactly that argv and refreshes") {
+    let runner = healthyRunner()
+    let controller = await makeController(runner: runner)
+    await controller.refresh()
+    let before = runner.invocations.count
+    await controller.setCodexModel("model-b")
+    try? await Task.sleep(nanoseconds: 200_000_000)
+    await controller.setCodexEffort("low")
+    try? await Task.sleep(nanoseconds: 200_000_000)
+    let calls = runner.invocations.dropFirst(before)
+    await expect(calls.contains { $0.arguments == ["codex", "/Users/x/Projects/murmur", "model", "model-b"] })
+    await expect(calls.contains { $0.arguments == ["codex", "/Users/x/Projects/murmur", "effort", "low"] })
+}
+
+await test("a Codex model change is refused while another lifecycle command is in flight, and vice versa") {
+    let runner = healthyRunner()
+    runner.gate = { @Sendable in try? await Task.sleep(nanoseconds: 150_000_000) }
+    let controller = await makeController(runner: runner)
+    await controller.refresh()
+    let before = runner.invocations.count
+    await controller.setCodexModel("model-b")
+    try? await Task.sleep(nanoseconds: 20_000_000)
+    await expect(await controller.isBusy)
+    await controller.start()
+    await controller.setCodexEffort("low")
+    await controller.setClaudeModel("opus")
+    let lifecycle = runner.invocations.dropFirst(before).filter { ["start", "claude", "codex"].contains($0.arguments.first ?? "") }
+    await expectEqual(lifecycle.count, 1, "only the first command may reach the CLI while one is in flight")
+    try? await Task.sleep(nanoseconds: 400_000_000)
+}
+
+await test("the app never edits a model preference file itself — every write is a CLI argv") {
+    // This test file lives in Sources/MurmurMenuBarCoreTests; scan the app's own sources.
+    let sources = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+    let enumerator = FileManager.default.enumerator(at: sources, includingPropertiesForKeys: nil)
+    var offenders: [String] = []
+    while let url = enumerator?.nextObject() as? URL {
+        guard url.pathExtension == "swift", !url.path.contains("MurmurMenuBarCoreTests") else { continue }
+        let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        for needle in ["claude-preferences", "codex-preferences", "cli-config.json", "acp-config.json", "settings.json", "config.toml"] where text.contains(needle) {
+            // doc comments may NAME a file; code must not open one — flag only non-comment lines
+            for line in text.split(separator: "\n") where line.contains(needle) && !line.trimmingCharacters(in: .whitespaces).hasPrefix("//") {
+                offenders.append("\(url.lastPathComponent): \(line)")
+            }
+        }
+    }
+    await expect(offenders.isEmpty, offenders.joined(separator: "\n"))
 }
 
 // MARK: - Cursor model (read-only, non-controllable)

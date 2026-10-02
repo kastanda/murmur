@@ -78,7 +78,7 @@ func expectThrows<T>(
 // Longer phrases are listed BEFORE their component words ("Claude Code" before "Claude"):
 // `isRussian` strips them in order, and removing "Claude" first would leave a stray
 // " Code" behind.
-let properNouns = ["Claude Code", "Murmur", "Menu Bar", "Claude", "Codex", "Cursor", "Telegram", "NATS", "Sonnet", "Opus"]
+let properNouns = ["Claude Code", "Murmur", "Menu Bar", "Claude", "Codex", "Cursor", "Telegram", "NATS", "Sonnet", "Opus", "Haiku", "Fable"]
 
 /// Is this string Russian once the proper nouns are removed?
 ///

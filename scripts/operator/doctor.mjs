@@ -294,7 +294,7 @@ export const checkClaudeModelConfig = async ({ paths, discoverCapabilities = dis
   results.push(isSupportedModel(model, capabilities)
     ? check("claude-model-config", PASS, model === "inherit" ? "inherit" : `${model} (supported by installed CLI)`)
     : check("claude-model-config", FAIL, `configured model '${model}' is no longer supported by the installed Claude CLI`, {
-      fix: `murmur claude <project> model <${[...capabilities.supportedModels, "inherit"].join("|")}>`,
+      fix: "murmur claude <project> model <id|inherit>  (ids: murmur claude <project> config)",
     }));
   results.push(isSupportedEffort(effort, capabilities)
     ? check("claude-effort-config", PASS, effort === "inherit" ? "inherit" : `${effort} (supported by installed CLI)`)

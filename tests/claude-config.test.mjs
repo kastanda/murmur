@@ -10,6 +10,10 @@ import path from "node:path";
 import test from "node:test";
 import {
   INHERIT,
+  claudeEffortApplies,
+  claudeEffortOptions,
+  claudeModelOptions,
+  claudeModelView,
   defaultClaudePreferencesFor,
   effortLabel,
   isSupportedEffort,
@@ -195,7 +199,7 @@ test("no preference at all: inherits, and the effective model is read from Claud
     assert.equal(resolved.model.selected, INHERIT);
     assert.equal(resolved.model.source, "claude-code");
     assert.equal(resolved.model.effective, "sonnet");
-    assert.equal(resolved.model.effectiveLabel, "Sonnet");
+    assert.equal(resolved.model.effectiveLabel, "Актуальный Sonnet", "only the alias is known: family label, no invented version");
     // Effort has no local non-network inherited source; never fabricated.
     assert.equal(resolved.effort.effective, null);
     assert.equal(resolved.effort.effectiveLabel, null);
@@ -291,11 +295,13 @@ test("an invalid preferences file never crashes resolution; it is surfaced as co
 // Labels
 // ---------------------------------------------------------------------------
 
-test("model labels never fabricate a minor version", () => {
-  assert.equal(modelLabel("sonnet"), "Sonnet");
-  assert.equal(modelLabel("opus"), "Opus");
-  assert.equal(modelLabel(INHERIT), "По настройкам Claude Code");
-  assert.doesNotMatch(modelLabel("sonnet"), /5\.5|[0-9]/, "no invented version number");
+test("model labels never fabricate a version", () => {
+  const options = claudeModelOptions(CAPS_FULL);
+  assert.equal(modelLabel("sonnet", options), "Актуальный Sonnet");
+  assert.equal(modelLabel("opus", options), "Актуальный Opus");
+  assert.equal(modelLabel(INHERIT, options), "По настройкам Claude Code");
+  assert.doesNotMatch(modelLabel("sonnet", options), /[0-9]/, "an alias label carries no version number");
+  assert.equal(modelLabel("claude-unknown-9", options), "claude-unknown-9", "an unknown id is shown verbatim, never prettified");
 });
 
 test("effort labels are Russian and bounded to the known set", () => {
@@ -361,8 +367,8 @@ test("resolveClaudeConfig upgrades BOTH the selected and effective labels to the
       readLiveClaudeBinding: () => null, claudeRuntimeCacheFile: file,
     });
     assert.equal(resolved.model.canonicalModel, "claude-sonnet-5");
-    assert.equal(resolved.model.effectiveLabel, "Sonnet 5", "the UI-facing label is upgraded, not merely the raw field");
-    assert.equal(resolved.model.selectedLabel, "Sonnet 5", "the selected alias is also known precisely — it must not stay bare");
+    assert.equal(resolved.model.effectiveLabel, "Sonnet 5", "the effective (running) label carries the exact observed version");
+    assert.equal(resolved.model.selectedLabel, "Актуальный Sonnet", "the SELECTION stays a moving alias — never silently pinned to the observed version");
   } finally {
     rmSync(paths.dir, { recursive: true, force: true });
     rmSync(dir, { recursive: true, force: true });
@@ -384,10 +390,11 @@ test("resolveClaudeConfig upgrades selected and running labels INDEPENDENTLY whe
       claudeRuntimeCacheFile: file,
     });
     assert.equal(resolved.model.pendingRestart, true);
-    assert.equal(resolved.model.selectedLabel, "Opus 5", "the new selection's own cached version");
-    // The cache only has evidence for opus, not sonnet — the running alias stays bare.
-    assert.equal(resolved.model.runningLabel, "Sonnet");
-    assert.equal(resolved.model.effectiveLabel, "Sonnet", "effective mirrors what is actually running");
+    assert.equal(resolved.model.selectedLabel, "Актуальный Opus", "the new selection is an alias");
+    assert.equal(resolved.model.selectedView.resolvesToLabel, "Opus 5", "...whose own cached version is shown as what it resolves to");
+    // The cache only has evidence for opus, not sonnet — the running alias stays family-only.
+    assert.equal(resolved.model.runningLabel, "Актуальный Sonnet");
+    assert.equal(resolved.model.effectiveLabel, "Актуальный Sonnet", "effective mirrors what is actually running");
   } finally {
     rmSync(paths.dir, { recursive: true, force: true });
     rmSync(dir, { recursive: true, force: true });
@@ -403,7 +410,7 @@ test("resolveClaudeConfig falls back to the bare alias label with no cache evide
       readLiveClaudeBinding: () => null, claudeRuntimeCacheFile: undefined,
     });
     assert.equal(resolved.model.canonicalModel, null);
-    assert.equal(resolved.model.effectiveLabel, "Sonnet");
+    assert.equal(resolved.model.effectiveLabel, "Актуальный Sonnet");
   } finally {
     rmSync(paths.dir, { recursive: true, force: true });
   }
@@ -419,9 +426,141 @@ test("switching alias away from a cached one falls back to the bare label for th
       readLiveClaudeBinding: () => null, claudeRuntimeCacheFile: file,
     });
     assert.equal(resolved.model.canonicalModel, null, "the cache belongs to the previous alias");
-    assert.equal(resolved.model.effectiveLabel, "Opus", "bare label for opus, never sonnet's stale canonical version");
+    assert.equal(resolved.model.effectiveLabel, "Актуальный Opus", "family label for opus, never sonnet's stale canonical version");
   } finally {
     rmSync(paths.dir, { recursive: true, force: true });
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Alias vs pinned, driven by a catalog (synthetic ids are parser proofs only)
+// ---------------------------------------------------------------------------
+
+import { buildClaudeModelOptions, normalizeSdkModel } from "../scripts/claude-capabilities.mjs";
+
+const catalogCaps = (rows, extra = {}) => {
+  const { options, defaultModel } = buildClaudeModelOptions(rows.map(normalizeSdkModel));
+  return {
+    modelFlagSupported: true, effortFlagSupported: true, supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+    models: options, supportedModels: options.filter((o) => o.selectable).map((o) => o.id), defaultModel, ...extra,
+  };
+};
+const ROWS = [
+  { value: "sonnet", resolvedModel: "claude-sonnet-5-5", displayName: "Sonnet 5.5", supportedEffortLevels: ["low", "medium", "high"] },
+  { value: "claude-sonnet-5", resolvedModel: "claude-sonnet-5", displayName: "Sonnet 5", supportedEffortLevels: ["low", "medium", "high"] },
+  { value: "claude-opus-4-6", resolvedModel: "claude-opus-4-6", displayName: "Opus 4.6", supportedEffortLevels: ["low", "medium", "high", "max"] },
+  { value: "default", resolvedModel: "claude-opus-5-5", displayName: "Default (recommended)" },
+];
+
+const resolveWith = async (preferences, { running = null, caps = catalogCaps(ROWS), cache = undefined, settings = "/nonexistent" } = {}) => {
+  const paths = await withPrefs(preferences);
+  try {
+    return await resolveClaudeConfig({
+      paths, capabilities: caps, claudeSettingsPath: settings, claudeRuntimeCacheFile: cache,
+      readLiveClaudeBinding: () => (running ? { bindings: [{ live: true, metadata: running }] } : null),
+    });
+  } finally {
+    rmSync(paths.dir, { recursive: true, force: true });
+  }
+};
+
+test("selecting the alias keeps it an alias even though it resolves to Sonnet 5.5", async () => {
+  const resolved = await resolveWith({ version: 1, model: "sonnet", effort: "medium" });
+  assert.equal(resolved.model.selectedView.kind, "alias");
+  assert.equal(resolved.model.selectedLabel, "Актуальный Sonnet");
+  assert.equal(resolved.model.selectedView.resolvesToLabel, "Sonnet 5.5");
+  assert.equal(resolved.model.effectiveLabel, "Sonnet 5.5");
+  assert.equal(resolved.model.canonicalModel, "claude-sonnet-5-5");
+  assert.equal(resolved.model.selected, "sonnet", "the stored selection is unchanged");
+});
+
+test("selecting a pinned version is exact: Sonnet 5 is Sonnet 5 while the alias is Sonnet 5.5", async () => {
+  const resolved = await resolveWith({ version: 1, model: "claude-sonnet-5", effort: "medium" });
+  assert.equal(resolved.model.selectedView.kind, "pinned");
+  assert.equal(resolved.model.selectedLabel, "Sonnet 5");
+  assert.equal(resolved.model.effectiveLabel, "Sonnet 5");
+  assert.equal(resolved.model.canonicalModel, "claude-sonnet-5");
+});
+
+test("ONE resolver: selected, running and effective labels agree for the same option", async () => {
+  const resolved = await resolveWith(
+    { version: 1, model: "claude-sonnet-5", effort: "medium" },
+    { running: { model: "claude-sonnet-5", effort: "medium" } },
+  );
+  assert.equal(resolved.model.pendingRestart, false);
+  assert.equal(resolved.model.selectedLabel, resolved.model.runningLabel);
+  assert.equal(resolved.model.selectedLabel, resolved.model.effectiveLabel);
+});
+
+test("pending restart: Выбрано Sonnet 5, Сейчас the alias at Sonnet 5.5", async () => {
+  const resolved = await resolveWith(
+    { version: 1, model: "claude-sonnet-5", effort: "medium" },
+    { running: { model: "sonnet", effort: "medium" } },
+  );
+  assert.equal(resolved.model.pendingRestart, true);
+  assert.equal(resolved.model.selectedLabel, "Sonnet 5");
+  assert.equal(resolved.model.runningLabel, "Актуальный Sonnet");
+  assert.equal(resolved.model.effectiveLabel, "Sonnet 5.5");
+});
+
+test("a pinned id in the cache never upgrades an alias selection (and vice versa)", async () => {
+  const { dir, file } = await withCache({ version: 1, selectedAlias: "sonnet", canonicalModel: "claude-sonnet-5-5", observedAt: "2026-01-01T00:00:00.000Z" });
+  try {
+    const pinned = await resolveWith({ version: 1, model: "claude-sonnet-5", effort: "medium" }, { cache: file });
+    assert.equal(pinned.model.effectiveLabel, "Sonnet 5", "the cache for the alias does not describe a pinned selection");
+    assert.equal(pinned.model.canonicalModel, "claude-sonnet-5");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("inherit resolves through Claude Code's own settings, else the catalog default; never guessed", async () => {
+  const settingsDir = mkdtempSync(path.join(os.tmpdir(), "mur-cc-settings-"));
+  const settingsPath = path.join(settingsDir, "settings.json");
+  writeFileSync(settingsPath, JSON.stringify({ model: "sonnet" }));
+  try {
+    const viaSettings = await resolveWith(null, { settings: settingsPath });
+    assert.equal(viaSettings.model.effectiveLabel, "Sonnet 5.5");
+    assert.equal(viaSettings.model.selectedLabel, "По настройкам Claude Code");
+    const viaDefault = await resolveWith(null, { settings: "/nonexistent" });
+    assert.equal(viaDefault.model.effectiveLabel, "Opus 5.5", "the catalog's own default entry");
+    const noEvidence = await resolveWith(null, { caps: CAPS_FULL, settings: "/nonexistent" });
+    assert.equal(noEvidence.model.effectiveLabel, null, "no settings and no catalog default: unknown");
+  } finally {
+    rmSync(settingsDir, { recursive: true, force: true });
+  }
+});
+
+test("a stored selection the catalog no longer lists is shown verbatim and flagged unselectable", () => {
+  const view = claudeModelView("claude-sonnet-4-5", { options: catalogCaps(ROWS).models });
+  assert.equal(view.label, "claude-sonnet-4-5");
+  assert.equal(view.selectable, false);
+  assert.equal(view.kind, "pinned");
+});
+
+test("a catalog-listed pinned id is accepted; an unlisted concrete id and a free string are rejected", () => {
+  const caps = catalogCaps(ROWS);
+  assert.equal(isSupportedModel("claude-sonnet-5", caps), true);
+  assert.equal(isSupportedModel("sonnet", caps), true);
+  assert.equal(isSupportedModel("claude-sonnet-4-5", caps), false);
+  assert.equal(isSupportedModel("opus; echo hi", caps), false);
+  assert.equal(isSupportedModel("claude-sonnet-5", { ...caps, modelFlagSupported: false }), false);
+});
+
+test("effort is checked against the SELECTED model's own levels", () => {
+  const caps = catalogCaps(ROWS);
+  assert.equal(claudeEffortApplies("claude-opus-4-6", "xhigh", caps), false, "this catalog entry lists no xhigh");
+  assert.equal(claudeEffortApplies("claude-opus-4-6", "max", caps), true);
+  assert.equal(claudeEffortApplies("claude-sonnet-5", "xhigh", caps), false);
+  assert.equal(claudeEffortApplies("inherit", "xhigh", caps), true);
+  assert.equal(claudeEffortApplies("claude-sonnet-5", "inherit", caps), true);
+});
+
+test("menu effort choices: the simple levels the model takes, plus an already-chosen advanced one, plus inherit", () => {
+  const caps = catalogCaps(ROWS);
+  assert.deepEqual(claudeEffortOptions({ capabilities: caps, selectedModel: "sonnet", selectedEffort: "medium" }).map((o) => o.id),
+    ["low", "medium", "high", "inherit"]);
+  assert.deepEqual(claudeEffortOptions({ capabilities: caps, selectedModel: "claude-opus-4-6", selectedEffort: "max" }).map((o) => o.id),
+    ["low", "medium", "high", "max", "inherit"]);
 });

@@ -68,7 +68,7 @@ test("config --json reports selected, effective and effective, with source label
     const report = JSON.parse(out.join("\n"));
     // This is a brand-new profile: bootstrapProfile already wrote sonnet/medium defaults.
     assert.equal(report.claude.model, "sonnet");
-    assert.equal(report.claude.modelLabel, "Sonnet");
+    assert.equal(report.claude.modelLabel, "Актуальный Sonnet");
     assert.equal(report.claude.effort, "medium");
     assert.equal(report.claude.effectiveModel, "sonnet");
     assert.equal(report.claude.source, "murmur-project");
@@ -137,7 +137,7 @@ test("an unsupported model is rejected and nothing is written", async () => {
   const ctx = await setup();
   try {
     const before = readFileSync(ctx.paths.claudePreferencesFile, "utf8");
-    const { code, err } = await run(ctx, ["model", "haiku"]);
+    const { code, err } = await run(ctx, ["model", "haiku"]); // this fake CLI offers only sonnet/opus
     assert.equal(code, 1);
     assert.match(err.join("\n"), /not supported/);
     assert.equal(readFileSync(ctx.paths.claudePreferencesFile, "utf8"), before, "the file must be byte-for-byte unchanged");
@@ -277,7 +277,7 @@ test("the JSON carries a value->label map for every selectable option, not just 
   try {
     const { out } = await run(ctx, ["config"], { json: true });
     const report = JSON.parse(out.join("\n"));
-    assert.deepEqual(report.capabilities.modelLabels, { sonnet: "Sonnet", opus: "Opus", inherit: "По настройкам Claude Code" });
+    assert.deepEqual(report.capabilities.modelLabels, { sonnet: "Актуальный Sonnet", opus: "Актуальный Opus", inherit: "По настройкам Claude Code" });
     assert.equal(report.capabilities.effortLabels.medium, "Среднее");
     assert.equal(report.capabilities.effortLabels.inherit, "По настройкам Claude Code");
   } finally {
@@ -291,7 +291,137 @@ test("config --json includes canonicalModel, null until a real turn has run", as
     const { out } = await run(ctx, ["config"], { json: true });
     const report = JSON.parse(out.join("\n"));
     assert.equal(report.claude.canonicalModel, null);
-    assert.equal(report.claude.effectiveModelLabel, "Sonnet", "bare label with no canonical evidence yet");
+    assert.equal(report.claude.effectiveModelLabel, "Актуальный Sonnet", "family label only: no catalog resolution and no canonical evidence yet");
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Full model catalog: aliases + pinned versions (synthetic fake catalog)
+// ---------------------------------------------------------------------------
+
+import { buildClaudeModelOptions, normalizeSdkModel } from "../scripts/claude-capabilities.mjs";
+
+const FULL_ROWS = [
+  { value: "sonnet", resolvedModel: "claude-sonnet-5-5", displayName: "Sonnet 5.5", supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"] },
+  { value: "opus", resolvedModel: "claude-opus-5-5", displayName: "Opus 5.5", supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"] },
+  { value: "claude-fable-5-1", resolvedModel: "claude-fable-5-1", displayName: "Fable 5.1", supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"] },
+  { value: "claude-sonnet-5", resolvedModel: "claude-sonnet-5", displayName: "Sonnet 5", supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"] },
+  { value: "claude-opus-4-6", resolvedModel: "claude-opus-4-6", displayName: "Opus 4.6", supportedEffortLevels: ["low", "medium", "high", "max"] },
+  { value: "haiku", resolvedModel: "claude-haiku-4-5-20251001", displayName: "Haiku 4.5" },
+  { value: "default", resolvedModel: "claude-opus-5-5", displayName: "Default (recommended)" },
+];
+const CAPS_CATALOG = async () => {
+  const { options, defaultModel } = buildClaudeModelOptions(FULL_ROWS.map(normalizeSdkModel));
+  return {
+    available: true, modelFlagSupported: true, effortFlagSupported: true,
+    supportedModels: options.map((o) => o.id), supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+    models: options, defaultModel, catalogSource: "sdk-initialize",
+  };
+};
+
+test("config --json exposes the whole picker: aliases, every pinned version, inherit — with final labels", async () => {
+  const ctx = await setup({ discoverCapabilities: CAPS_CATALOG });
+  try {
+    const { out } = await run(ctx, ["config"], { json: true }, CAPS_CATALOG, "/nonexistent/settings.json");
+    const { claude } = JSON.parse(out.join("\n"));
+    const byId = Object.fromEntries(claude.models.map((m) => [m.id, m]));
+    assert.deepEqual(claude.models.map((m) => m.kind), [
+      "alias", "alias", "alias", "pinned", "pinned", "pinned", "pinned", "pinned", "pinned", "inherit",
+    ]);
+    assert.equal(byId.sonnet.label, "Актуальный Sonnet");
+    assert.equal(byId.sonnet.resolvesToLabel, "Sonnet 5.5");
+    assert.equal(byId["claude-sonnet-5"].label, "Sonnet 5");
+    assert.equal(byId["claude-sonnet-5-5"].label, "Sonnet 5.5");
+    assert.notEqual(byId["claude-sonnet-5"].label, byId["claude-sonnet-5-5"].label);
+    assert.equal(byId["claude-fable-5-1"].label, "Fable 5.1");
+    assert.equal(byId["claude-haiku-4-5-20251001"].label, "Haiku 4.5");
+    assert.equal(byId.inherit.resolvesToLabel, "Opus 5.5");
+    assert.ok(claude.models.every((m) => m.selectable === true));
+    // the three label surfaces agree on the same option
+    assert.equal(claude.modelLabel, "Актуальный Sonnet");
+    assert.equal(claude.selected.label, claude.modelLabel);
+    assert.equal(claude.effective.effectiveLabel, "Sonnet 5.5");
+    assert.equal(claude.effectiveModelLabel, claude.effective.effectiveLabel);
+    assert.deepEqual(claude.effortOptions.map((o) => o.id), ["low", "medium", "high", "inherit"]);
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+test("pin Sonnet 5 through the CLI: stored as the pinned id, reported pinned, alias preference untouched until then", async () => {
+  const ctx = await setup({ discoverCapabilities: CAPS_CATALOG });
+  try {
+    assert.equal(JSON.parse(readFileSync(ctx.paths.claudePreferencesFile, "utf8")).model, "sonnet", "existing alias preference preserved");
+    const { code, out } = await run(ctx, ["model", "claude-sonnet-5"], {}, CAPS_CATALOG);
+    assert.equal(code, 0);
+    assert.match(out.join("\n"), /Sonnet 5 \(claude-sonnet-5\)/);
+    assert.deepEqual(JSON.parse(readFileSync(ctx.paths.claudePreferencesFile, "utf8")), { version: 1, model: "claude-sonnet-5", effort: "medium" });
+    const report = JSON.parse((await run(ctx, ["config"], { json: true }, CAPS_CATALOG)).out.join("\n"));
+    assert.equal(report.claude.selected.kind, "pinned");
+    assert.equal(report.claude.modelLabel, "Sonnet 5");
+    assert.equal(report.claude.effectiveModelLabel, "Sonnet 5");
+    // ...and pinning Sonnet 5.5 is a different, distinct choice
+    assert.equal((await run(ctx, ["model", "claude-sonnet-5-5"], {}, CAPS_CATALOG)).code, 0);
+    assert.equal(JSON.parse(readFileSync(ctx.paths.claudePreferencesFile, "utf8")).model, "claude-sonnet-5-5");
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+test("unknown concrete ids and arbitrary strings are rejected and nothing is written", async () => {
+  const ctx = await setup({ discoverCapabilities: CAPS_CATALOG });
+  try {
+    const before = readFileSync(ctx.paths.claudePreferencesFile, "utf8");
+    for (const bad of ["claude-sonnet-9", "claude-sonnet-5.5", "sonnet --dangerously-skip-permissions", "$(touch pwned)", "../../etc/passwd", "default"]) {
+      const { code, err } = await run(ctx, ["model", bad], {}, CAPS_CATALOG);
+      assert.equal(code, 1, bad);
+      assert.match(err.join("\n"), /not supported/);
+    }
+    assert.equal(readFileSync(ctx.paths.claudePreferencesFile, "utf8"), before);
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+test("a model that does not take the current effort is refused with a hint; fixing the effort first works", async () => {
+  const ctx = await setup({ discoverCapabilities: CAPS_CATALOG });
+  try {
+    assert.equal((await run(ctx, ["effort", "xhigh"], {}, CAPS_CATALOG)).code, 0);
+    const refused = await run(ctx, ["model", "claude-opus-4-6"], {}, CAPS_CATALOG);
+    assert.equal(refused.code, 1);
+    assert.match(refused.err.join("\n"), /does not support effort 'xhigh'/);
+    assert.equal(JSON.parse(readFileSync(ctx.paths.claudePreferencesFile, "utf8")).model, "sonnet", "nothing written");
+    assert.equal((await run(ctx, ["effort", "high"], {}, CAPS_CATALOG)).code, 0);
+    assert.equal((await run(ctx, ["model", "claude-opus-4-6"], {}, CAPS_CATALOG)).code, 0);
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+test("a stored selection the catalog no longer offers is reported verbatim and unselectable, not silently converted", async () => {
+  const ctx = await setup({ discoverCapabilities: CAPS_CATALOG });
+  try {
+    const { writeClaudePreferences } = await import("../scripts/operator/claude-config.mjs");
+    await writeClaudePreferences(ctx.paths, { version: 1, model: "claude-sonnet-4-5", effort: "medium" });
+    const report = JSON.parse((await run(ctx, ["config"], { json: true }, CAPS_CATALOG)).out.join("\n"));
+    assert.equal(report.claude.model, "claude-sonnet-4-5");
+    assert.equal(report.claude.selected.label, "claude-sonnet-4-5");
+    assert.equal(report.claude.models.some((m) => m.id === "claude-sonnet-4-5"), false);
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+test("--refresh is forwarded to catalog discovery; a normal read is not a refresh", async () => {
+  const ctx = await setup({ discoverCapabilities: CAPS_CATALOG });
+  try {
+    const seen = [];
+    const spy = async (options) => { seen.push(Boolean(options?.refresh)); return CAPS_CATALOG(); };
+    await run(ctx, ["config"], { json: true, refresh: true }, spy);
+    await run(ctx, ["config"], { json: true }, spy);
+    assert.deepEqual(seen, [true, false]);
   } finally {
     ctx.cleanup();
   }

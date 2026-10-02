@@ -185,13 +185,92 @@ public struct SendResult: Codable, Equatable, Sendable {
     }
 }
 
+// MARK: - model options (shared by Claude and Codex)
+
+/// One entry of an agent's model picker, exactly as `murmur <agent> <project> config --json`
+/// reports it. The CLI decides `label`, `resolvesToLabel`, `kind` and `selectable` — this app
+/// never parses a model id or derives a version, it only renders.
+///
+/// `kind`: `alias` (a moving "latest in tier" name — "Актуальный Sonnet"), `pinned` (one
+/// concrete version), `catalog` (a concrete id from the agent's own catalog), `inherit`.
+public struct ModelOption: Codable, Equatable, Sendable, Identifiable {
+    public let id: String
+    public let kind: String
+    public let label: String
+    public let resolvesToLabel: String?
+    public let canonicalId: String?
+    public let selectable: Bool
+    public let disabledReason: String?
+
+    public init(
+        id: String, kind: String, label: String, resolvesToLabel: String? = nil,
+        canonicalId: String? = nil, selectable: Bool = true, disabledReason: String? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.label = label
+        self.resolvesToLabel = resolvesToLabel
+        self.canonicalId = canonicalId
+        self.selectable = selectable
+        self.disabledReason = disabledReason
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, kind, label, resolvesToLabel, canonicalId, selectable, disabledReason
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        kind = try c.decode(String.self, forKey: .kind)
+        label = try c.decode(String.self, forKey: .label)
+        resolvesToLabel = try c.decodeIfPresent(String.self, forKey: .resolvesToLabel)
+        canonicalId = try c.decodeIfPresent(String.self, forKey: .canonicalId)
+        selectable = try c.decodeIfPresent(Bool.self, forKey: .selectable) ?? true
+        disabledReason = try c.decodeIfPresent(String.self, forKey: .disabledReason)
+    }
+}
+
+/// An effort/reasoning choice the CLI says the menu may offer.
+public struct EffortOption: Codable, Equatable, Sendable, Identifiable {
+    public let id: String
+    public let label: String
+
+    public init(id: String, label: String) {
+        self.id = id
+        self.label = label
+    }
+}
+
+/// A resolved model selection (selected / running / effective) from the CLI's single label
+/// resolver. `label` names the SELECTION ("Актуальный Sonnet", "Sonnet 5"); `effectiveLabel`
+/// names the concrete model it runs as ("Sonnet 5.5").
+public struct ModelView: Codable, Equatable, Sendable {
+    public let id: String
+    public let kind: String
+    public let label: String
+    public let canonicalId: String?
+    public let resolvesToLabel: String?
+    public let effectiveLabel: String?
+
+    public init(
+        id: String, kind: String, label: String, canonicalId: String? = nil,
+        resolvesToLabel: String? = nil, effectiveLabel: String? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.label = label
+        self.canonicalId = canonicalId
+        self.resolvesToLabel = resolvesToLabel
+        self.effectiveLabel = effectiveLabel
+    }
+}
+
 // MARK: - claude model/effort
 
-/// What the INSTALLED Claude CLI actually supports, discovered locally (no network —
-/// see the JS-side `claude-capabilities.mjs`). `modelLabels`/`effortLabels` is a
-/// value -> Russian-label map for EVERY selectable option (including `"inherit"`), so
-/// this app never maintains its own copy of a label and can never drift from the one
-/// place those labels are decided.
+/// What the INSTALLED Claude CLI actually supports, discovered locally (see the JS-side
+/// `claude-capabilities.mjs`). Kept for compatibility and diagnostics; the picker itself is
+/// `ClaudePreference.models`.
 public struct ClaudeCapabilities: Codable, Equatable, Sendable {
     public let available: Bool
     public let modelSupported: Bool
@@ -200,11 +279,12 @@ public struct ClaudeCapabilities: Codable, Equatable, Sendable {
     public let supportedEfforts: [String]
     public let modelLabels: [String: String]
     public let effortLabels: [String: String]
+    public let catalogSource: String?
 
     public init(
         available: Bool, modelSupported: Bool, effortSupported: Bool,
         supportedModels: [String], supportedEfforts: [String],
-        modelLabels: [String: String], effortLabels: [String: String]
+        modelLabels: [String: String], effortLabels: [String: String], catalogSource: String? = nil
     ) {
         self.available = available
         self.modelSupported = modelSupported
@@ -213,21 +293,13 @@ public struct ClaudeCapabilities: Codable, Equatable, Sendable {
         self.supportedEfforts = supportedEfforts
         self.modelLabels = modelLabels
         self.effortLabels = effortLabels
-    }
-
-    /// The menu offers only a FIXED, simple subset (section 12: "keep the menu simple"),
-    /// intersected with what the installed CLI actually supports, so an option is never
-    /// shown that would just be rejected. `"inherit"` is appended last and unconditionally.
-    public var modelMenuOptions: [String] { supportedModels + ["inherit"] }
-    public var effortMenuOptions: [String] {
-        ["low", "medium", "high"].filter(supportedEfforts.contains) + ["inherit"]
+        self.catalogSource = catalogSource
     }
 }
 
 /// The project's Claude model/effort preference: what was SELECTED, what is actually
 /// RUNNING right now (nil when nothing is), and the resulting EFFECTIVE value — see
-/// `operator/claude-config.mjs`'s `resolveClaudeConfig` for why these three can differ
-/// and which one is truth at any moment.
+/// `operator/claude-config.mjs`'s `resolveClaudeConfig`. All labels come from the CLI.
 public struct ClaudePreference: Codable, Equatable, Sendable {
     public let model: String
     public let modelLabel: String
@@ -244,12 +316,14 @@ public struct ClaudePreference: Codable, Equatable, Sendable {
     public let pendingRestart: Bool
     public let configState: String
     public let configReason: String?
-    /// The THIRD, separate concept (selected alias / canonical id / human label): the
-    /// exact model id observed on a completed real turn (e.g. "claude-sonnet-5"), never
-    /// inferred from the alias. `nil` until a real turn has run under the effective
-    /// alias — `effectiveModelLabel`/`modelLabel` above already fall back to the bare
-    /// alias label in that case, so this field is informational, not required to render.
+    /// The canonical model id the effective selection runs as (e.g. "claude-sonnet-5-5").
     public let canonicalModel: String?
+    public let selected: ModelView?
+    public let running: ModelView?
+    public let effective: ModelView?
+    /// The complete picker, ordered: aliases, pinned versions, inherit.
+    public let models: [ModelOption]
+    public let effortOptions: [EffortOption]
 
     public init(
         model: String, modelLabel: String, effort: String, effortLabel: String,
@@ -257,7 +331,9 @@ public struct ClaudePreference: Codable, Equatable, Sendable {
         effectiveModel: String?, effectiveModelLabel: String?,
         effectiveEffort: String?, effectiveEffortLabel: String?,
         source: String, effortSource: String, pendingRestart: Bool,
-        configState: String, configReason: String? = nil, canonicalModel: String? = nil
+        configState: String, configReason: String? = nil, canonicalModel: String? = nil,
+        selected: ModelView? = nil, running: ModelView? = nil, effective: ModelView? = nil,
+        models: [ModelOption] = [], effortOptions: [EffortOption] = []
     ) {
         self.model = model
         self.modelLabel = modelLabel
@@ -275,6 +351,107 @@ public struct ClaudePreference: Codable, Equatable, Sendable {
         self.configState = configState
         self.configReason = configReason
         self.canonicalModel = canonicalModel
+        self.selected = selected
+        self.running = running
+        self.effective = effective
+        self.models = models
+        self.effortOptions = effortOptions
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case model, modelLabel, effort, effortLabel, runningModel, runningEffort
+        case effectiveModel, effectiveModelLabel, effectiveEffort, effectiveEffortLabel
+        case source, effortSource, pendingRestart, configState, configReason, canonicalModel
+        case selected, running, effective, models, effortOptions
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        model = try c.decode(String.self, forKey: .model)
+        modelLabel = try c.decode(String.self, forKey: .modelLabel)
+        effort = try c.decode(String.self, forKey: .effort)
+        effortLabel = try c.decode(String.self, forKey: .effortLabel)
+        runningModel = try c.decodeIfPresent(String.self, forKey: .runningModel)
+        runningEffort = try c.decodeIfPresent(String.self, forKey: .runningEffort)
+        effectiveModel = try c.decodeIfPresent(String.self, forKey: .effectiveModel)
+        effectiveModelLabel = try c.decodeIfPresent(String.self, forKey: .effectiveModelLabel)
+        effectiveEffort = try c.decodeIfPresent(String.self, forKey: .effectiveEffort)
+        effectiveEffortLabel = try c.decodeIfPresent(String.self, forKey: .effectiveEffortLabel)
+        source = try c.decode(String.self, forKey: .source)
+        effortSource = try c.decode(String.self, forKey: .effortSource)
+        pendingRestart = try c.decode(Bool.self, forKey: .pendingRestart)
+        configState = try c.decode(String.self, forKey: .configState)
+        configReason = try c.decodeIfPresent(String.self, forKey: .configReason)
+        canonicalModel = try c.decodeIfPresent(String.self, forKey: .canonicalModel)
+        selected = try c.decodeIfPresent(ModelView.self, forKey: .selected)
+        running = try c.decodeIfPresent(ModelView.self, forKey: .running)
+        effective = try c.decodeIfPresent(ModelView.self, forKey: .effective)
+        models = try c.decodeIfPresent([ModelOption].self, forKey: .models) ?? []
+        effortOptions = try c.decodeIfPresent([EffortOption].self, forKey: .effortOptions) ?? []
+    }
+}
+
+// MARK: - codex model/effort (project-scoped; see `operator/codex-config.mjs`)
+
+/// The project's Codex model/reasoning preference. `controllable` must be checked before a
+/// client builds any selector: when the App Server's catalog cannot be read there is
+/// nothing truthful to select, and only the (possibly unknown) effective model is shown.
+public struct CodexPreference: Codable, Equatable, Sendable {
+    public let controllable: Bool
+    public let reason: String?
+    public let selectedModel: String
+    public let selectedModelLabel: String
+    public let reasoningEffort: String
+    public let reasoningEffortLabel: String
+    public let effectiveModel: String?
+    public let effectiveModelLabel: String?
+    public let effectiveReasoningEffort: String?
+    public let effectiveReasoningEffortLabel: String?
+    public let availableModels: [ModelOption]
+    public let effortOptions: [EffortOption]
+    public let source: String
+    public let pendingRestart: Bool
+    public let pendingNextTurn: Bool
+    public let requiresNewThread: Bool
+    public let configState: String
+
+    public init(
+        controllable: Bool, reason: String? = nil,
+        selectedModel: String, selectedModelLabel: String,
+        reasoningEffort: String, reasoningEffortLabel: String,
+        effectiveModel: String? = nil, effectiveModelLabel: String? = nil,
+        effectiveReasoningEffort: String? = nil, effectiveReasoningEffortLabel: String? = nil,
+        availableModels: [ModelOption] = [], effortOptions: [EffortOption] = [],
+        source: String = "codex-config", pendingRestart: Bool = false,
+        pendingNextTurn: Bool = false, requiresNewThread: Bool = false, configState: String = "absent"
+    ) {
+        self.controllable = controllable
+        self.reason = reason
+        self.selectedModel = selectedModel
+        self.selectedModelLabel = selectedModelLabel
+        self.reasoningEffort = reasoningEffort
+        self.reasoningEffortLabel = reasoningEffortLabel
+        self.effectiveModel = effectiveModel
+        self.effectiveModelLabel = effectiveModelLabel
+        self.effectiveReasoningEffort = effectiveReasoningEffort
+        self.effectiveReasoningEffortLabel = effectiveReasoningEffortLabel
+        self.availableModels = availableModels
+        self.effortOptions = effortOptions
+        self.source = source
+        self.pendingRestart = pendingRestart
+        self.pendingNextTurn = pendingNextTurn
+        self.requiresNewThread = requiresNewThread
+        self.configState = configState
+    }
+}
+
+public struct CodexConfigReport: Codable, Equatable, Sendable {
+    public let project: String
+    public let codex: CodexPreference
+
+    public init(project: String, codex: CodexPreference) {
+        self.project = project
+        self.codex = codex
     }
 }
 

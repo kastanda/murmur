@@ -123,10 +123,16 @@ export class CodexAppServerRuntimeAdapter {
   constructor({ bindingStore, dispatchStore, agentId, projectId, peer, injector, sendReply,
     now = () => Date.now(), heartbeatIntervalMs = 5_000, retryDelayMs = 1_000, log = () => {},
     handoff = null,
+    // The RECIPIENT project's model policy, resolved per turn: `async () => ({ model, effort })`
+    // (null = no override). Sender identity and message text never reach this — Claude,
+    // Cursor and root all get the same Codex policy because it belongs to this project.
+    modelPolicy = null,
+    // Display-only record of what the App Server reported running; best-effort.
+    recordEffective = null,
     readServerIdentity = unixSocketIdentity, threadStore = new CodexConversationThreadStore() }) {
     if (typeof injector !== "function") throw new Error("codex-app-server-adapter-injector-required");
     Object.assign(this, { bindingStore, dispatchStore, agentId, projectId, peer, injector, sendReply,
-      now, heartbeatIntervalMs, retryDelayMs, log, handoff, readServerIdentity, threadStore });
+      now, heartbeatIntervalMs, retryDelayMs, log, handoff, modelPolicy, recordEffective, readServerIdentity, threadStore });
     this.runtimeKind = CODEX_APP_SERVER_KIND;
     this.memberSlot = CODEX_APP_SERVER_MEMBER_SLOT;
     this.capabilities = RUNTIME_CAPABILITIES[this.runtimeKind];
@@ -255,6 +261,28 @@ export class CodexAppServerRuntimeAdapter {
       const runtimePeer = { ...this.peer, ...(existingSession ? { threadId: existingSession.threadId } : {}) };
       if (!existingSession) delete runtimePeer.threadId;
       runtimePeer.mode = "codex_app_server";
+      let policy = { model: null, effort: null };
+      if (typeof this.modelPolicy === "function") {
+        try {
+          policy = { ...policy, ...(await this.modelPolicy()) };
+        } catch (error) {
+          this.log("warn", "Codex model policy could not be resolved; running without an override", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      if (typeof this.modelPolicy === "function") {
+        // The project policy is the ONLY source of a model/effort here: a static value in
+        // the runtime config must not leak through when the policy says "inherit".
+        delete runtimePeer.model;
+        delete runtimePeer.effort;
+      }
+      if (policy.model) {
+        runtimePeer.model = policy.model;
+        // ...and an explicit project choice outranks a channel persona's model on thread/start.
+        runtimePeer.projectModelPolicy = true;
+      }
+      if (policy.effort) runtimePeer.effort = policy.effort;
       runtimePeer.relayFinalToMurmur = false;
       runtimePeer.returnFinalToCaller = true;
       const turnPayload = turn?.promptText != null ? { ...payload, text: turn.promptText } : payload;
@@ -270,6 +298,17 @@ export class CodexAppServerRuntimeAdapter {
       if (!sessionId) throw new Error("codex-app-server-thread-id-missing");
       this.replaceSession(affinityKey, serverGeneration, sessionId);
       if (!this.bindingStore.validateFence(fence, identity)) return { status: "late-result-dropped" };
+      if (typeof this.recordEffective === "function" && result?.effective) {
+        // Display-only and never awaited into the fenced path; a failure here is harmless.
+        void Promise.resolve().then(() => this.recordEffective({
+          model: result.effective.model,
+          effort: result.effective.effort ?? null,
+          source: result.effectiveSource ?? null,
+          threadId: sessionId,
+          selection: { model: policy.model ?? "inherit", effort: policy.effort ?? "inherit" },
+          observedAt: new Date(this.now()).toISOString(),
+        })).catch(() => {});
+      }
       return await settleRuntimeTurn({
         runtimeKind: this.runtimeKind,
         dispatchStore: this.dispatchStore,

@@ -66,7 +66,9 @@ import { SessionLeaseStore, createNativeLeaseGate } from "./lease.mjs";
 import { ensurePrivateDirectory, readPrivateJson, setPrivateUmask } from "./secure-state.mjs";
 import { murmurHome, projectPathsFor } from "./operator/project.mjs";
 import { discoverClaudeCapabilities } from "./claude-capabilities.mjs";
-import { isSupportedEffort, isSupportedModel, loadClaudePreferences } from "./operator/claude-config.mjs";
+import { claudeEffortApplies, isSupportedEffort, isSupportedModel, loadClaudePreferences } from "./operator/claude-config.mjs";
+import { clearCodexRuntimeCache, loadCodexPreferences, resolveCodexRuntimePolicy, writeCodexRuntimeCache } from "./operator/codex-config.mjs";
+import { discoverCodexCapabilities } from "./codex-capabilities.mjs";
 // vault-guard: optional content policy hook (not included in OSS release)
 
 setPrivateUmask();
@@ -322,6 +324,9 @@ const claudeProjectId = claudeOneShotConfig.projectId || path.resolve(claudeOneS
  */
 let resolvedClaudeModel;
 let resolvedClaudeEffort;
+// Whether a valid `claude-preferences.json` governs this project. When one does — including
+// an explicit "inherit" — no other source may add a model override.
+let claudePreferencesConfigured = false;
 // Hoisted so the "claudeRuntimeCacheFile" path is also available where
 // `ClaudeOneShotRuntime` is constructed, further below — the opportunistic
 // canonical-model cache is a project-scoped, display-only file exactly like
@@ -333,6 +338,7 @@ if (claudeOneShotEnabled) {
     claudeProjectPaths = projectPathsFor(murmurProjectId, { home: murmurHome() });
     const loadedClaudePrefs = await loadClaudePreferences(claudeProjectPaths);
     if (loadedClaudePrefs.state === "configured") {
+      claudePreferencesConfigured = true;
       const capabilities = await discoverClaudeCapabilities();
       const { model: selectedModel, effort: selectedEffort } = loadedClaudePrefs.preferences;
       if (isSupportedModel(selectedModel, capabilities)) {
@@ -343,7 +349,15 @@ if (claudeOneShotEnabled) {
         });
       }
       if (isSupportedEffort(selectedEffort, capabilities)) {
-        if (selectedEffort !== "inherit") resolvedClaudeEffort = selectedEffort;
+        if (selectedEffort !== "inherit") {
+          if (claudeEffortApplies(resolvedClaudeModel ?? "inherit", selectedEffort, capabilities)) {
+            resolvedClaudeEffort = selectedEffort;
+          } else {
+            log("warn", "Configured Claude effort is not supported by the configured model; running without an effort override", {
+              configuredModel: resolvedClaudeModel, configuredEffort: selectedEffort,
+            });
+          }
+        }
       } else {
         log("warn", "Configured Claude effort no longer supported by installed CLI; running without an override", {
           configuredEffort: selectedEffort,
@@ -352,6 +366,20 @@ if (claudeOneShotEnabled) {
     } else if (loadedClaudePrefs.state === "invalid") {
       log("warn", "Project Claude preferences are invalid; running without an override", { reason: loadedClaudePrefs.reason });
     }
+  }
+}
+// A hand-edited `runtime.claudeOneShot.model` is only a fallback for a profile with no
+// preference file (a legacy identity), and it passes the SAME allowlist as a preference:
+// an arbitrary string never reaches `claude --model`.
+let fallbackClaudeModel;
+if (claudeOneShotEnabled && resolvedClaudeModel === undefined && !claudePreferencesConfigured
+  && typeof claudeOneShotConfig.model === "string" && claudeOneShotConfig.model && claudeOneShotConfig.model !== "inherit") {
+  if (isSupportedModel(claudeOneShotConfig.model, await discoverClaudeCapabilities())) {
+    fallbackClaudeModel = claudeOneShotConfig.model;
+  } else {
+    log("warn", "Configured runtime.claudeOneShot.model is not offered by the installed Claude CLI; running without an override", {
+      configuredModel: claudeOneShotConfig.model,
+    });
   }
 }
 const cursorAcpConfig = normalizeCursorAcpRuntimeConfig(config.runtime?.cursorAcp);
@@ -760,10 +788,9 @@ const claudeOneShotRuntime = claudeOneShotEnabled ? new ClaudeOneShotRuntime({
   terminateGraceMs: Number(claudeOneShotConfig.terminateGraceMs) || 5_000,
   permissionMode: claudeOneShotConfig.permissionMode || "dontAsk",
   // `resolvedClaudeModel`/`resolvedClaudeEffort` (the project's preference, validated
-  // against this installed CLI) take precedence; `claudeOneShotConfig.model` remains as a
-  // fallback for the rare case of a hand-edited `agent-config.json`, so nothing that
-  // already worked stops working.
-  model: resolvedClaudeModel ?? claudeOneShotConfig.model,
+  // against this installed CLI) take precedence; a hand-edited
+  // `claudeOneShotConfig.model` survives only as a validated fallback (see above).
+  model: resolvedClaudeModel ?? fallbackClaudeModel,
   effort: resolvedClaudeEffort,
   canonicalModelCacheFile: claudeProjectPaths?.claudeRuntimeCacheFile,
   handoff: handoffCoordinator,
@@ -787,7 +814,35 @@ const cursorAcpRuntime = cursorAcpEnabled ? new CursorAcpRuntime({
   handoff: handoffCoordinator,
   log,
 }) : null;
+/**
+ * The project's Codex model/effort policy, resolved PER TURN (Codex applies `model`/`effort`
+ * on each `turn/start`, so unlike Claude no restart is needed). Only a modern operator
+ * profile has `MURMUR_PROJECT_ID` and a `codex-preferences.json`; anything else, an absent
+ * file, or "inherit" sends no override — the prior behaviour exactly. The saved value is
+ * re-validated against the live App Server catalog every time, so a model that is no
+ * longer offered is never forwarded.
+ */
+const codexProjectPaths = codexAppServerRuntimeEnabled && typeof process.env.MURMUR_PROJECT_ID === "string"
+  ? projectPathsFor(process.env.MURMUR_PROJECT_ID, { home: murmurHome() })
+  : null;
+if (codexProjectPaths) await clearCodexRuntimeCache(codexProjectPaths).catch(() => {});
+const codexModelPolicy = codexProjectPaths ? async () => {
+  const loaded = await loadCodexPreferences(codexProjectPaths);
+  if (loaded.state === "invalid") {
+    log("warn", "Project Codex preferences are invalid; running without an override", { reason: loaded.reason });
+    return { model: null, effort: null };
+  }
+  if (loaded.state !== "configured") return { model: null, effort: null };
+  const capabilities = await discoverCodexCapabilities({ override: codexAppServerRuntimeConfig.command ?? null });
+  const policy = resolveCodexRuntimePolicy({ preferences: loaded.preferences, capabilities });
+  if (policy.reasons.length) {
+    log("warn", "Configured Codex model/effort not honoured; running without that override", { reasons: policy.reasons });
+  }
+  return { model: policy.model, effort: policy.effort };
+} : null;
 const codexAppServerRuntime = codexAppServerRuntimeEnabled ? new CodexAppServerRuntimeAdapter({
+  modelPolicy: codexModelPolicy,
+  recordEffective: codexProjectPaths ? (record) => writeCodexRuntimeCache(codexProjectPaths, record) : null,
   bindingStore: runtimeBindingStore,
   dispatchStore: wakeDispatchStore,
   agentId,
