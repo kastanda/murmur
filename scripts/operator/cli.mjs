@@ -86,6 +86,7 @@ import {
 import { enqueueRootTask, findRejectedCandidates, rootWorkflowCancelledAt, waitForCorrelatedReply } from "./send.mjs";
 import { lowLimitWarnings } from "./usage.mjs";
 import { classifyRuntimeOutput, OUTPUT_KINDS } from "../runtime-output.mjs";
+import { applyReleaseGate } from "../review-gate.mjs";
 import { collectStatus } from "./status.mjs";
 import { CODEX_APP_SERVER_CHILD, cleanupRuntimeArtifacts, reapOrphanedChildren } from "./supervisor.mjs";
 
@@ -106,7 +107,7 @@ Usage:
   murmur stop    <project> [--timeout <seconds>]
   murmur doctor  <project> [--json]
   murmur logs    <project> [supervisor|root|claude|codex|cursor|codex-app-server] [-n <lines>] [--follow]
-  murmur send    <project> "<task>" [--timeout <seconds>] [--no-wait]
+  murmur send    <project> "<task>" [--timeout <seconds>] [--no-wait] [--release-gate]
   murmur projects [--json]
   murmur claude   <project> config [--json] [--refresh] | model <id|inherit> | effort <level>
   murmur codex    <project> config [--json] [--refresh] | model <id|inherit> | effort <level>
@@ -146,6 +147,7 @@ export const parseArgs = (argv) => {
     else if (arg === "--timeout") flags.timeoutSeconds = Number(argv[++i]);
     else if (arg === "--from") flags.from = argv[++i];
     else if (arg === "--refresh") flags.refresh = true;
+    else if (arg === "--release-gate") flags.releaseGate = true;
     else if (arg === "--help" || arg === "-h") flags.help = true;
     else if (arg === "--version" || arg === "-v") flags.version = true;
     else if (arg.startsWith("-")) throw new Error(`unknown-flag:${arg}`);
@@ -1208,6 +1210,13 @@ const commandSend = async ({ args, flags }) => {
     fail("task-required");
     return 1;
   }
+  // A release gate is meaningless without the correlated reply it judges: never allow it to be
+  // "satisfied" by an enqueue that does not wait.
+  if (flags.releaseGate && !flags.wait) {
+    if (!flags.json) err("murmur: --release-gate needs the reply; it cannot be combined with --no-wait.");
+    fail("release-gate-requires-wait");
+    return 1;
+  }
   if (!(await profileExists(paths))) {
     if (!flags.json) err("murmur: no profile for this project. Run `murmur start <project>` first.");
     fail("no-profile");
@@ -1311,6 +1320,20 @@ const commandSend = async ({ args, flags }) => {
       err(`murmur: the correlated reply is not substantive (${verdict.kind}); it does not count as a result (msgId ${sent.msgId}).`);
     }
     return 3;
+  }
+  // Opt-in RELEASE policy (`--release-gate`): the correlated reply must also declare a SAFE verdict.
+  if (flags.releaseGate) {
+    const judged = applyReleaseGate({ ok: true, waited: true, substantive: true, msgId: sent.msgId, conversationId: sent.conversationId, replyMsgId: reply.msgId, from: reply.sender, text: reply.text });
+    if (!judged.ok) {
+      if (flags.json) sendResult(judged);
+      else {
+        out("");
+        out(reply.text);
+        err(`murmur: release gate FAILED (${judged.releaseGate.reason}${judged.releaseGate.verdict ? `, verdict ${judged.releaseGate.verdict}` : ""}); this review does not allow release.`);
+      }
+      return 3;
+    }
+    if (flags.json) { sendResult(judged); return 0; }
   }
   if (flags.json) {
     sendResult({

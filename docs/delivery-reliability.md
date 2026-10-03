@@ -27,13 +27,44 @@
   (digest, conversation, sender/recipient, in-window timestamp, signature, one-time nonce — and for
   the WS relay a durable nonce store). Stale, spoofed, wrong-peer, replayed, NACK-for-acked and
   ACK-for-failed frames are still rejected with their specific reason.
-* **One logical msgId, one thread, one turn.** `runtime_turns` (per `msgId/recipient/slot`) records the
-  seeded thread and the launched turn. A retry or a restarted daemon **reuses the thread**, or
-  **attaches** to the launched turn (`thread/resume` + wait for that turn / read its rollout) — it never
-  seeds another thread or starts another turn. Redelivery of an already-completed msgId is a no-op
-  (`wake_dispatch` is unique per message). The record is retired only after the result was *settled*.
-  The one exception is explicit and logged: the App Server itself was replaced (identity changed) or
-  the thread no longer exists — that turn is gone, so a fresh one is started.
+* **One logical msgId, one thread, one turn — across a crash at any of the boundaries below, provided the App Server remains queryable.** Intent is
+  written FIRST: before any server call `runtime_turns` records `planned`, and the deterministic
+  identities this message uses are sent *to the server*, namespaced by the whole durable identity
+  (a SHA-256 over an unambiguous encoding of `[msgId, recipient, slot]`, so neither the same msgId for
+  another recipient/slot nor a concatenation trick can be mistaken for it): the thread's **`threadSource =
+  murmur:v1:<digest>`** (`thread/start`) and the turn's **`clientUserMessageId = murmur-turn:v1:<digest>`**
+  (`turn/start`, stored by the server as the user message's `clientId`). The state then walks
+  `planned → seeded → launched → finished`. A retry or a restarted daemon **reconciles with the
+  server before mutating anything**:
+  * thread accepted but never recorded → `thread/loaded/list` + `thread/read` finds the thread whose
+    `threadSource` matches and **adopts** it (verified live: a thread whose creating connection died
+    is still loaded, readable and accepts the first turn);
+  * turn accepted but never recorded → `thread/turns/list` finds the user message whose `clientId`
+    matches and **attaches** to that turn (works after an App Server restart too: a thread with a turn
+    is persisted);
+  * discovery reads EVERY page of loaded threads (no order assumed); a read that fails for any reason
+    other than "that thread is gone" makes the search incomplete, and an incomplete search FAILS the
+    attempt instead of seeding a second thread; the turn search likewise reads every page;
+  * a turn still in flight whose user message is not listed yet — the server briefly reports a
+    just-accepted turn as "not materialized" — is never trusted on first sight: the thread must stay idle
+    and the turn absent over several consecutive looks *and for a quiescence period (15 s plus the client's
+    send bound) after the durable launch stamp* — the stamp is written (and MUST succeed, or nothing is
+    sent) immediately before every `thread/start` / `turn/start`, — long enough for a request still in flight when the process died to have been
+    processed — before "no turn" is concluded; a busy thread
+    that never lists the turn is an *unknown* state and the attempt **fails rather than start another
+    turn**;
+  * a thread with **no turn** is not materialized by the server (not listed, not resumable, gone after
+    a server restart): nothing ever ran in it, so when it cannot be found a fresh one is created — the
+    only case with a second thread *object*, and it is inert;
+  * a recorded turn whose thread the server provably no longer has (replaced server) is abandoned and
+    the next retry starts fresh.
+  A retry never seeds another thread or starts another turn while one can be found or while the state is
+  ambiguous; redelivery of an already-completed msgId is a no-op (`wake_dispatch` is unique per message).
+  The record is retired only after the result was *settled* — a result dropped by a lost fence leaves it
+  `launched` so the newer generation reconciles. Proven by deterministic crash tests at both boundaries and, against the
+  real App Server, by `node scripts/codex-crash-recovery-drill.mjs thread|turn` (drops the durable write,
+  restarts the adapter, then counts threads/turns on the server): one `thread/start`, one `turn/start`,
+  one reply.
 * **Outputs are classified before they can be results** (`runtime-output.mjs`): `text`, `handoff`,
   `tool-intent-only`, `empty`, `error`. Only `text` can be a final reply. `claude -p` exit 0 with empty
   output → `claude-one-shot-empty-output:exit=0,subtype=…,stop=…,ms=…` (bounded, redacted
@@ -42,11 +73,17 @@
   suppresses the parent reply and keeps the root workflow waiting until the correlated continuation
   produces a substantive result. Failures use the dispatch retry budget, then end `terminal` with the
   reason; nothing is relayed.
-* **Review gate.** `murmur send` reports `ok` only for a substantive correlated reply
+* **Review gate (two layers).** `murmur send` reports `ok` only for a substantive correlated reply
   (`"substantive": true`); empty/tool-intent replies return `non-substantive-reply` (exit 3).
   `satisfiesReviewGate(result)` is true only for a waited, correlated, substantive reply — never for
   queued/delivered/ACKed, a timeout, a cancellation or an empty/intent reply. It establishes that a
-  review *response* exists; whether its verdict is SAFE remains the caller's decision.
+  review *response* exists and never reads a verdict. The **release policy layer**
+  (`review-gate.mjs`, `evaluateReleaseGate`) additionally requires the reviewer's *declared* verdict
+  (the first non-empty line consisting of ONLY `SAFE` / `BLOCKED` / `UNSAFE`) to be SAFE: BLOCKED/UNSAFE,
+  a missing or qualified verdict ("SAFE, but …"), a SAFE that lists BLOCKER findings anywhere below, empty/tool-intent replies, and transport/ACK/notification-only
+  successes all fail closed. Nothing is inferred from prose. The policy is wired into the CLI:
+  `murmur send <project> "<review request>" --release-gate [--json]` exits 3 with
+  `reason: release-gate-failed` (and the reviewer's text) unless the correlated reply declares SAFE.
 * **Cancelled continuations are never open after a restart**: `reconcileCancelledContinuations`
   (daemon flush loop) closes any open continuation whose root has a cancel intent.
 * **Health polling is protocol-correct**: a real WebSocket upgrade, closed politely; a listener that
@@ -54,9 +91,12 @@
 
 ## Remaining limitations
 
-* The persistence of the seeded thread / launched turn happens the instant the server answers; a
-  process death in that instant (before the row is written) can still leave a retry unable to find the
-  first thread. The window is one event-loop tick; it is logged when persistence fails.
+* This is "exactly one *Murmur-launched* thread/turn per message", not exactly-once for the *external
+  effects* a turn may have had. If the whole Codex App Server is replaced, a recorded turn that no
+  longer exists is abandoned and re-run; whatever the old turn already did outside the server (files,
+  network) is not undone or de-duplicated by Murmur.
+* Reconciliation needs the App Server to answer `thread/loaded/list`, `thread/read` and
+  `thread/turns/list`; when it cannot, the attempt fails and retries — it never guesses.
 * A killed Claude/Cursor turn is re-run by the retry budget (its first execution was terminated, so it
   is not concurrent, and Claude runs with tools disabled).
 * The readiness probe proves the WebSocket upgrade, not an App Server `initialize` exchange.

@@ -1,4 +1,5 @@
 import { IGNORED_DUE_TO_CANCELLED_WORKFLOW } from "./workflow-control.mjs";
+import { createHash } from "node:crypto";
 import { RuntimeTurnStore } from "./runtime-turn-store.mjs";
 import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
@@ -101,6 +102,10 @@ const unixSocketIdentity = (socketPath) => {
   const stat = statSync(socketPath);
   return `${stat.dev}:${stat.ino}:${stat.birthtimeMs}:${stat.ctimeMs}`;
 };
+
+/** Unambiguous, collision-free digest of one durable dispatch identity. */
+export const identityDigest = ({ msgId, recipientId, memberSlot }) =>
+  createHash("sha256").update(JSON.stringify([msgId, recipientId, memberSlot])).digest("hex");
 
 export class CodexConversationThreadStore {
   constructor() { this.sessions = new Map(); }
@@ -279,6 +284,12 @@ export class CodexAppServerRuntimeAdapter {
             }
           }
         },
+        // Called by the injector immediately BEFORE it sends a thread/start or a fresh turn/start.
+        // It MUST succeed: without a fresh durable anchor the request is not sent at all (the error
+        // propagates, the attempt fails, and the retry reconciles instead).
+        observeLaunch: () => {
+          if (this.turnStore.touch(identity, this.now()) !== 1) throw new Error("runtime-turn-launch-stamp-failed");
+        },
         observeSeed: ({ threadId }) => {
           if (!threadId) return;
           try {
@@ -310,20 +321,33 @@ export class CodexAppServerRuntimeAdapter {
         : payload;
       const runtimePeer = { ...this.peer, ...(existingSession ? { threadId: existingSession.threadId } : {}) };
       if (!existingSession) delete runtimePeer.threadId;
-      // EXACTLY-ONCE. If an earlier attempt of THIS message already created a thread / launched a
-      // turn on the SAME App Server, this attempt must not create another: it reuses the thread,
-      // or attaches to the launched turn. Only when that server is gone is the old turn abandoned.
-      const prior = this.turnStore.get(identity);
-      if (prior && prior.state !== "finished" && prior.state !== "abandoned") {
-        if (prior.serverIdentity === this.serverIdentity && prior.threadId) {
-          runtimePeer.threadId = prior.threadId;
-          if (prior.state === "launched" && prior.turnId) runtimePeer.attachTurn = { threadId: prior.threadId, turnId: prior.turnId };
-        } else {
-          this.turnStore.markAbandoned(identity, this.now());
-          this.log("warn", "Previous Codex thread/turn of this message belonged to a server that is gone; starting fresh", {
-            msgId: identity.msgId, previousState: prior.state,
-          });
-        }
+      // EXACTLY-ONCE. INTENT FIRST: before any server call, durably record the deterministic
+      // identities this message will use (thread `threadSource`, turn `clientUserMessageId`). A
+      // retry — or a restart after a crash at ANY point — reconciles against the server by those
+      // identities (see the injector) instead of creating a second thread or turn.
+      const priorRecord = this.turnStore.get(identity);
+      const prior = priorRecord && priorRecord.state !== "finished" && priorRecord.state !== "abandoned" ? priorRecord : null;
+      this.turnStore.recordPlanned(identity, { runtimeKind: this.runtimeKind }, this.now());
+      runtimePeer.intent = {
+        msgId: identity.msgId,
+        // Namespaced by the WHOLE durable identity, so the same msgId delivered to another
+        // recipient/slot on one App Server can never be mistaken for this execution.
+        // Hashed over an UNAMBIGUOUS encoding (JSON array), so no two distinct identities can collide
+        // by concatenation (`a:b`+`c` vs `a`+`b:c`).
+        threadSource: `murmur:v1:${identityDigest(identity)}`,
+        clientUserMessageId: `murmur-turn:v1:${identityDigest(identity)}`,
+        retry: Boolean(prior),
+        pollMs: this.peer?.reconcilePollMs,
+        quiescenceMs: this.peer?.reconcileQuiescenceMs,
+        // when the previous attempt last wrote durable state about this message
+        recordedAt: priorRecord?.updatedAt ?? 0,
+        threadId: prior?.threadId ?? null,
+        turnId: prior?.state === "launched" ? prior.turnId : null,
+      };
+      if (prior?.threadId) runtimePeer.threadId = prior.threadId;
+      // Fast path: the very same App Server still owns the recorded turn.
+      if (prior?.state === "launched" && prior.turnId && prior.threadId && prior.serverIdentity === this.serverIdentity) {
+        runtimePeer.attachTurn = { threadId: prior.threadId, turnId: prior.turnId };
       }
       // A review/analysis turn legitimately takes minutes; the wait is not the execution, and a
       // retry attaches rather than re-running, so a generous default is safe.
@@ -399,10 +423,13 @@ export class CodexAppServerRuntimeAdapter {
         log: this.log,
         now: this.now,
       });
-      // Only a SETTLED result retires the record. If settlement rejected the output (empty / tool
+      // Only a SETTLED result retires the record — never a dropped/stale one (a newer generation
+      // must still reconcile it), and never one that settlement rejected. If settlement rejected the output (empty / tool
       // intent) the record stays `launched`, so a retry ATTACHES to the same turn instead of
       // starting another one for the same msgId.
-      this.turnStore.markFinished(identity, this.now());
+      if (["completed", "completed-handoff", "completed-reply-pending", "completed-cancelled-workflow"].includes(settled?.status)) {
+        this.turnStore.markFinished(identity, this.now());
+      }
       return settled;
     } catch (error) {
       const failure = asError(error);

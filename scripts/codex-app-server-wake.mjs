@@ -158,7 +158,9 @@ export const buildThreadStartParams = (binding = null, peer = null) => ({
   personality: binding?.personality ?? null,
   ephemeral: false,
   sessionStartSource: null,
-  threadSource: null,
+  // Deterministic, client-supplied identity (set by the runtime adapter from the msgId): the
+  // server returns it on the Thread, so a thread created just before a crash can be found again.
+  threadSource: peer?.intent?.threadSource ?? null,
   environments: null,
   dynamicTools: null,
   selectedCapabilityRoots: null,
@@ -626,6 +628,9 @@ export const createCodexAppServerInjector = ({ Client = CodexAppServerClient, lo
       input: [{ type: "text", text, text_elements: [] }],
       ...(peer?.model ? { model: peer.model } : {}),
       ...(peer?.effort ? { effort: peer.effort } : {}),
+      // Deterministic per message; the server stores it as the user message's `clientId`, so a turn
+      // accepted just before a crash can be found again (and a duplicate is recognisable).
+      ...(peer?.intent?.clientUserMessageId ? { clientUserMessageId: peer.intent.clientUserMessageId } : {}),
       responsesapiClientMetadata: {
         murmur_msg_id: payload.msgId || "",
         murmur_conversation_id: payload.conversationId || "",
@@ -635,8 +640,14 @@ export const createCodexAppServerInjector = ({ Client = CodexAppServerClient, lo
       },
     });
     const startTurn = async (threadId) => {
+      processing?.observeLaunch?.();   // durable stamp BEFORE the server can see the turn/start
       if (!processing && peer?.relayFinalToMurmur !== true && peer?.returnFinalToCaller !== true) {
         return client.request("turn/start", turnParams(threadId));
+      }
+      // The wait's completion fallback is the thread's rollout file. A thread this attempt did not
+      // seed itself (adopted after a crash, or reused on a retry) has no path yet: ask the server.
+      if (!threadPath) {
+        try { threadPath = (await client.request("thread/read", { threadId, includeTurns: false }))?.thread?.path || null; } catch { /* best effort */ }
       }
       const result = await client.startTurnAndWaitForFinal(turnParams(threadId), {
         completionTimeoutMs: Number(peer?.replyTimeoutMs) || DEFAULT_TURN_COMPLETION_TIMEOUT_MS,
@@ -690,6 +701,7 @@ export const createCodexAppServerInjector = ({ Client = CodexAppServerClient, lo
     // `thread/resume` can only fail on it — and that failure is what used to leave
     // `threadPath` null and silently disable the session-log completion fallback.
     const seedThread = async (reason) => {
+      processing?.observeLaunch?.();   // durable stamp BEFORE the server can see the request
       const started = await client.request("thread/start", buildThreadStartParams(threadStartBinding, peer));
       const seededId = started?.thread?.id;
       if (!seededId) throw new Error(`codex-app-server-thread-start-missing:${payload.from}`);
@@ -703,6 +715,126 @@ export const createCodexAppServerInjector = ({ Client = CodexAppServerClient, lo
       log("info", `Codex app-server wake thread ${reason}`, { msgId: payload.msgId, threadId: seededId, socketPath, threadPath });
       return seededId;
     };
+
+    // CRASH RECONCILIATION. On a retry, before ANY server mutation, ask the server whether the
+    // previous attempt already created this message's thread or launched its turn — even if this
+    // process died before it could record that. Both identities were supplied by us up front:
+    //   thread: `thread/loaded/list` + `thread/read` -> `threadSource === intent.threadSource`
+    //   turn:   `thread/turns/list` -> a user message whose `clientId === intent.clientUserMessageId`
+    const intent = peer?.intent ?? null;
+    const gone = (error) => /no rollout found|thread not found/i.test(error instanceof Error ? error.message : String(error));
+    const asList = (result) => (Array.isArray(result) ? result : (result?.data ?? result?.turns ?? result?.threads ?? []));
+    const unknown = (why) => new Error(`codex-app-server-reconcile-state-unknown:${why}`);
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const discoverThreadBySource = async () => {
+      // EVERY loaded thread, every page: order is not assumed and nothing is silently skipped — if the
+      // search cannot be completed the attempt FAILS (and is retried) rather than seeding a second thread.
+      const ids = [];
+      let cursor = null;
+      for (let page = 0; page < 200; page += 1) {
+        const listed = await client.request("thread/loaded/list", { limit: 100, ...(cursor ? { cursor } : {}) });
+        ids.push(...asList(listed));
+        cursor = listed?.nextCursor ?? null;
+        if (!cursor) break;
+        if (page === 199) throw unknown("loaded-thread-list-incomplete");
+      }
+      for (let i = 0; i < ids.length; i += 8) {
+        const batch = ids.slice(i, i + 8);
+        const reads = await Promise.all(batch.map((id) => client.request("thread/read", { threadId: id, includeTurns: false })
+          .then((read) => ({ id, read }))
+          // Only a DEFINITIVE "this thread is gone" may be skipped. Any other failure means we could not
+          // look at a thread that might be ours, so the search is incomplete: fail, never guess "no match".
+          .catch((error) => { if (gone(error)) return { id, read: null }; throw unknown(`thread-read-failed:${String(error?.message ?? error).slice(0, 60)}`); })));
+        const match = reads.find(({ read }) => read?.thread?.threadSource === intent.threadSource);
+        if (match) return { id: match.id, path: match.read.thread.path || null };
+      }
+      return null;
+    };
+    const threadStatus = async (threadId) => {
+      try { return (await client.request("thread/read", { threadId, includeTurns: false }))?.thread?.status?.type ?? null; } catch { return null; }
+    };
+    // Every page of the thread's turns (newest first); `null` => not present on ANY page.
+    const scanTurns = async (threadId) => {
+      let cursor = null;
+      for (let page = 0; page < 200; page += 1) {
+        const listed = await client.request("thread/turns/list", { threadId, itemsView: "full", limit: 50, sortDirection: "desc", ...(cursor ? { cursor } : {}) });
+        for (const turn of asList(listed)) {
+          if ((turn?.items ?? []).some((item) => item?.type === "userMessage" && item?.clientId === intent.clientUserMessageId)) return turn.id;
+        }
+        cursor = listed?.nextCursor ?? null;
+        if (!cursor) return null;
+      }
+      throw unknown("turn-list-incomplete");
+    };
+    const findTurnByClientId = async (threadId) => {
+      const pollMs = intent.pollMs ?? 500;
+      // The launch stamp is written BEFORE the connection is opened; the request can reach the server up
+      // to one client timeout later. The quiescence window therefore starts counting only after that
+      // bound, so a request still in flight when the process died has been processed before "no turn".
+      const sendBoundMs = Number(client?.timeoutMs) || 0;
+      const quiescenceMs = (intent.quiescenceMs ?? 15_000) + sendBoundMs;
+      const recordedAt = intent.recordedAt ?? 0;
+      const startedAt = Date.now();
+      const deadline = startedAt + Math.max(20_000, quiescenceMs + 5_000);
+      let idleLooks = 0;
+      while (Date.now() < deadline) {
+        let found = null;
+        let unmaterialized = false;
+        try {
+          found = await scanTurns(threadId);
+        } catch (error) {
+          // Real App Server: a thread with no user message yet is "not materialized". That is the proof
+          // that no turn exists — but ALSO what a turn that was just accepted looks like for a moment.
+          if (!/not materialized/i.test(error instanceof Error ? error.message : String(error))) throw error;
+          unmaterialized = true;
+        }
+        if (found) return found;
+        const status = await threadStatus(threadId);
+        if (status === "idle") {
+          idleLooks += 1;
+          // "No turn" is concluded only when the thread has stayed idle and the turn absent over several
+          // looks AND long enough after the last durable write that a request still in flight when the
+          // process died would have been processed. Anything less is an unknown state, not an answer.
+          if (idleLooks >= (unmaterialized ? 6 : 2) && Date.now() - recordedAt >= quiescenceMs) return null;
+        } else {
+          idleLooks = 0;   // a turn is in flight (or the state is unknown): keep waiting, never duplicate it
+        }
+        await sleep(pollMs);
+      }
+      // Could not prove either way: do NOT start another turn — fail this attempt, reconcile again next time.
+      throw unknown("turn-in-flight-not-listable");
+    };
+    if (intent?.retry && !peer.attachTurn) {
+      // The thread this message's turn runs on: the recorded one, else the conversation/continuation
+      // thread it was routed to (a turn launched there must also be found again), else — if this
+      // message seeded its own thread — look it up by the identity we gave it.
+      let knownThread = intent.threadId ?? peer.threadId ?? null;
+      if (!knownThread) {
+        const found = await discoverThreadBySource();
+        knownThread = found?.id ?? null;
+        if (found?.path) threadPath = found.path;
+        if (knownThread) {
+          try { processing?.observeSeed?.({ threadId: knownThread }); } catch { /* recording only */ }
+          log("info", "Codex app-server wake adopted the thread a previous attempt created but never recorded", { msgId: payload.msgId, threadId: knownThread });
+        }
+      }
+      if (knownThread) {
+        let turnId = null;
+        try {
+          turnId = await findTurnByClientId(knownThread);
+        } catch (error) {
+          // A thread the server cannot find: if no turn was ever recorded, nothing ran in it — seed fresh.
+          if (!gone(error) || intent.turnId) throw error;
+          knownThread = null;
+        }
+        if (turnId) {
+          peer.attachTurn = { threadId: knownThread, turnId };
+          log("info", "Codex app-server wake found the turn a previous attempt launched but never recorded", { msgId: payload.msgId, threadId: knownThread, turnId });
+        } else if (knownThread) {
+          peer.threadId = knownThread;
+        }
+      }
+    }
 
     // EXACTLY-ONCE: this message already launched a turn on a live server -> attach to it. No
     // thread/start, no thread/resume-for-continuation, no second turn/start.

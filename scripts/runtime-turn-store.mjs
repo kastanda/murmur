@@ -8,6 +8,9 @@
  *
  *   runtime_turns(msg_id, recipient_id, member_slot) -> thread_id, turn_id, server_identity, state
  *
+ *   planned    INTENT, written BEFORE any server call: the deterministic identities this message will use
+ *              (thread `threadSource`, turn `clientUserMessageId`) — what lets a restart find an
+ *              execution the server accepted but this process never got to record
  *   seeded     a thread exists for this message; no turn has been accepted yet (a retry reuses the thread)
  *   launched   the server accepted a turn on that thread (a retry attaches to it)
  *   finished   the turn's terminal result was observed (nothing is ever re-run)
@@ -33,7 +36,7 @@ const DDL = `
   );
 `;
 
-export const RUNTIME_TURN_STATES = Object.freeze({ seeded: "seeded", launched: "launched", finished: "finished", abandoned: "abandoned" });
+export const RUNTIME_TURN_STATES = Object.freeze({ planned: "planned", seeded: "seeded", launched: "launched", finished: "finished", abandoned: "abandoned" });
 
 const keyOf = (identity) => [identity.msgId, identity.recipientId, identity.memberSlot];
 
@@ -56,14 +59,28 @@ export class RuntimeTurnStore {
     return row ? { ...row } : null;
   }
 
+  /**
+   * INTENT-FIRST: record that this message is about to create a thread / launch a turn, BEFORE any
+   * server call. Idempotent; revives only an abandoned record.
+   */
+  recordPlanned(identity, { runtimeKind }, now = Date.now()) {
+    this.db.prepare(`
+      INSERT INTO runtime_turns (msg_id, recipient_id, member_slot, runtime_kind, state, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'planned', ?, ?)
+      ON CONFLICT(msg_id, recipient_id, member_slot) DO UPDATE SET
+        state = 'planned', thread_id = NULL, turn_id = NULL, server_identity = NULL, updated_at = excluded.updated_at
+        WHERE runtime_turns.state = 'abandoned'
+    `).run(...keyOf(identity), runtimeKind, now, now);
+  }
+
   /** The thread was created. Never downgrades a launched/finished record. */
   recordSeeded(identity, { runtimeKind, threadId, serverIdentity = null }, now = Date.now()) {
     this.db.prepare(`
       INSERT INTO runtime_turns (msg_id, recipient_id, member_slot, runtime_kind, thread_id, server_identity, state, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, 'seeded', ?, ?)
       ON CONFLICT(msg_id, recipient_id, member_slot) DO UPDATE SET
-        thread_id = excluded.thread_id, server_identity = excluded.server_identity, updated_at = excluded.updated_at
-        WHERE runtime_turns.state IN ('seeded', 'abandoned')
+        thread_id = excluded.thread_id, server_identity = excluded.server_identity, state = 'seeded', updated_at = excluded.updated_at
+        WHERE runtime_turns.state IN ('planned', 'seeded', 'abandoned')
     `).run(...keyOf(identity), runtimeKind, threadId, serverIdentity, now, now);
   }
 
@@ -75,8 +92,19 @@ export class RuntimeTurnStore {
       ON CONFLICT(msg_id, recipient_id, member_slot) DO UPDATE SET
         thread_id = excluded.thread_id, turn_id = excluded.turn_id, server_identity = excluded.server_identity,
         state = 'launched', updated_at = excluded.updated_at
-        WHERE runtime_turns.state IN ('seeded', 'launched', 'abandoned')
+        WHERE runtime_turns.state IN ('planned', 'seeded', 'launched', 'abandoned')
     `).run(...keyOf(identity), runtimeKind, threadId, turnId, serverIdentity, now, now);
+  }
+
+  /**
+   * Stamp "we are about to send something to the server for this message" — written BEFORE every
+   * thread/start and turn/start. It anchors the quiescence period a later reconcile must observe, so
+   * a request that was in flight when the process died is always measured from when it was SENT.
+   */
+  touch(identity, now = Date.now()) {
+    return Number(this.db.prepare(
+      "UPDATE runtime_turns SET updated_at = ? WHERE msg_id = ? AND recipient_id = ? AND member_slot = ? AND state != 'finished'",
+    ).run(now, ...keyOf(identity)).changes);
   }
 
   markFinished(identity, now = Date.now()) {
