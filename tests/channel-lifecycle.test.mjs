@@ -131,6 +131,19 @@ test("cleanup re-reads the process immediately before signalling: a change in th
   assert.equal(reads, 2, "re-verified, then re-read once more right before the signal");
 });
 
+test("the final pre-signal read must itself show the process ownerless (a new live parent in that gap blocks the signal)", () => {
+  const orphan = psRow(11, 1, `${NODE} ${SCRIPT}`);
+  const snapshot = listChannelServers({ psImpl: fakePs([orphan]) });
+  const adopted = psRow(11, 99, `${NODE} ${SCRIPT}`); // same pid, start time and command, now under a live parent
+  const parent = psRow(99, 1, "codex app-server");
+  let reads = 0;
+  const psImpl = () => { reads += 1; return reads === 1 ? orphan : [adopted, parent].join("\n"); };
+  const signalled = [];
+  const [result] = cleanupOrphanedChannelServers({ snapshot, psImpl, kill: (pid) => signalled.push(pid) });
+  assert.deepEqual(signalled, []);
+  assert.equal(result.outcome, "skipped-identity-changed");
+});
+
 test("accumulation under one owner is reported as crowded but never as orphaned", () => {
   const rows = [psRow(7, 1, "codex app-server --listen stdio://")];
   for (let pid = 100; pid < 112; pid += 1) rows.push(psRow(pid, 7, `${NODE} ${SCRIPT}`, "20:00:00"));

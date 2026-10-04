@@ -209,8 +209,10 @@ export const cleanupOrphanedChannelServers = ({ snapshot, psImpl = ps, kill = pr
     // Narrow the check-to-signal window to one more single-pid read. Without a pidfd the gap
     // cannot be closed completely; it is microseconds, the target must be an ownerless approved
     // channel server both times, and the signal is SIGTERM (a clean shutdown request).
-    const last = readTable(psImpl).get(server.pid);
-    if (!last || last.startedAt !== server.startedAt || last.command !== server.command || last.ppid > 1 && table.get(last.ppid)) {
+    const finalTable = readTable(psImpl);
+    const last = finalTable.get(server.pid);
+    const ownerless = last && (last.ppid <= 1 || !finalTable.get(last.ppid));
+    if (!last || !ownerless || last.startedAt !== server.startedAt || last.command !== server.command) {
       results.push({ pid: server.pid, outcome: "skipped-identity-changed" });
       continue;
     }
