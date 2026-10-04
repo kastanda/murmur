@@ -8,10 +8,13 @@ import path from "node:path";
 import { SQLiteDedupeOutboxStore, SQLiteMessageStore, stableEnvelopePayload } from "@murmurv2/core";
 import { encryptPayload, signEnvelope } from "@murmurv2/security";
 import { readPrivateJson } from "./secure-state.mjs";
+import { REPLY_ORIGINS, ReplyOwnershipStore } from "./reply-ownership-store.mjs";
+import { DatabaseSync } from "node:sqlite";
 
 const args = process.argv.slice(2);
 const opt = {};
 let replyToFlagPresent = false;
+let originFlagPresent = false;
 for (let i = 0; i < args.length; i += 1) {
   const a = args[i];
   if (a === "--to") opt.to = args[++i];
@@ -23,6 +26,12 @@ for (let i = 0; i < args.length; i += 1) {
   else if (a === "--text") opt.text = args[++i];
   else if (a === "--text-file") opt.textFile = args[++i];
   else if (a === "--stdin") opt.stdin = true;
+  // Explicit reply owner for a CLIENT-originated request (`operator_client`). Autonomous
+  // responders and legacy callers omit it and stay unowned.
+  else if (a === "--origin") {
+    originFlagPresent = true;
+    opt.origin = args[++i];
+  }
   else if (a === "--help" || a === "-h") opt.help = true;
 }
 
@@ -35,9 +44,15 @@ if (
 }
 if (replyToFlagPresent) opt.replyToMessageId = opt.replyToMessageId.trim();
 
+// A present-but-missing/empty/flag-like value must FAIL, never degrade to an unowned send.
+if (originFlagPresent && opt.origin !== REPLY_ORIGINS.operatorClient) {
+  process.stderr.write(`error: --origin must be ${REPLY_ORIGINS.operatorClient}\n`);
+  process.exit(1);
+}
+
 if (opt.help || !opt.to || (!opt.text && !opt.textFile && !opt.stdin)) {
   process.stderr.write(
-    "usage: murmur-shell-send.mjs --to <peer-id> (--text <txt> | --text-file <path> | --stdin) [--conv <id>] [--reply-to <msg-id>]\n",
+    "usage: murmur-shell-send.mjs --to <peer-id> (--text <txt> | --text-file <path> | --stdin) [--conv <id>] [--reply-to <msg-id>] [--origin operator_client]\n",
   );
   process.exit(1);
 }
@@ -102,6 +117,13 @@ try {
 
   const outbox = new SQLiteDedupeOutboxStore(dbPath);
   outbox.db?.exec?.("PRAGMA busy_timeout=5000;");
+  if (opt.origin) {
+    // Durable BEFORE the message can leave: the reply must never become autonomous work.
+    const ownershipDb = new DatabaseSync(dbPath);
+    ownershipDb.exec("PRAGMA busy_timeout=5000;");
+    new ReplyOwnershipStore(ownershipDb).record({ msgId, origin: opt.origin, owner: `operator:${cfg.agentId}` });
+    ownershipDb.close();
+  }
   await outbox.enqueue(peer.subject, envelope);
 
   const store = new SQLiteMessageStore(dbPath);

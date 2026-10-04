@@ -26,7 +26,7 @@ export const enqueueRootTask = async ({
   exec = execFileAsync,
 }) => {
   const script = path.join(murmurRoot, "scripts", "murmur-shell-send.mjs");
-  const args = [script, "--to", to, "--text", text, ...(conversationId ? ["--conv", conversationId] : [])];
+  const args = [script, "--to", to, "--text", text, "--origin", "operator_client", ...(conversationId ? ["--conv", conversationId] : [])];
   const { stdout } = await exec(process.execPath, args, {
     env: { ...process.env, DATA_DIR: rootDataDir },
     encoding: "utf8",

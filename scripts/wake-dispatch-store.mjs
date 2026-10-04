@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { ProcessingReceiptStore } from "./processing-receipt-store.mjs";
+import { ReplyOwnershipStore } from "./reply-ownership-store.mjs";
 
 export const WAKE_DISPATCH_STATES = Object.freeze({
   pending: "pending",
@@ -115,12 +116,17 @@ export class WakeDispatchStore {
     if (!payload?.msgId) throw new Error("wake-dispatch-msg-id-required");
     if (!payload?.conversationId) throw new Error("wake-dispatch-conversation-id-required");
     const identity = this.identityFor(payload);
+    // Reply-ownership gate, decided from durable state at the single place every inbound
+    // message (live or restart-backfilled) becomes dispatchable. A reply some other owner holds
+    // is recorded as already handed to the durable inbox: auditable and retrievable, but never
+    // claimable, so no autonomous model turn can start and backfill cannot resurrect it.
+    const route = payload.handoff ? null : ReplyOwnershipStore.route(this.db, payload.replyToMessageId);
     this.db.prepare(`
       INSERT INTO wake_dispatch
         (msg_id, recipient_id, member_slot, conversation_id, payload_json, state,
          attempts, claim_count, max_attempts, next_attempt_at, claimed_at,
          last_error, created_at, updated_at, handed_off_at)
-      VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?, NULL, NULL, ?, ?, NULL)
+      VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?, NULL, ?, ?, ?, ?)
       ON CONFLICT(msg_id, recipient_id, member_slot) DO NOTHING
     `).run(
       identity.msgId,
@@ -128,10 +134,13 @@ export class WakeDispatchStore {
       identity.memberSlot,
       payload.conversationId,
       JSON.stringify(payload),
+      route ? "handed_off" : "pending",
       this.maxAttempts,
       now,
+      route ? `${route.reason}:${route.owner}` : null,
       now,
       now,
+      route ? now : null,
     );
     return this.get(identity);
   }

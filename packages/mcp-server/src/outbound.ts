@@ -14,6 +14,7 @@
  * Nothing here reads or returns key material, tokens or message text.
  */
 import { realpathSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import os from "node:os";
 import path from "node:path";
 import type { EnvelopeV1, LocalMessageRecord } from "@murmurv2/core";
@@ -118,6 +119,35 @@ export interface OutboxLike {
   getOutboxRecord(msgId: string): Promise<{ msgId: string; subject: string; status: string } | undefined>;
 }
 
+/**
+ * Durable reply ownership (see `scripts/reply-ownership-store.mjs`, the daemon-side reader —
+ * keep the table definition in sync). An interactive client's request is recorded as owned by
+ * that client BEFORE the outbox commit, so the autonomous daemon sharing this identity can
+ * never treat the correlated reply as new work, even across a restart.
+ */
+export interface ReplyOwnershipRecorder {
+  record(msgId: string, owner: string): void;
+}
+
+const REPLY_OWNERSHIP_DDL = `
+  CREATE TABLE IF NOT EXISTS reply_ownership (
+    msg_id     TEXT PRIMARY KEY,
+    origin     TEXT NOT NULL,
+    owner      TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+`;
+
+export const createMcpReplyOwnership = (dbPath: string): ReplyOwnershipRecorder => {
+  const db = new DatabaseSync(dbPath);
+  db.exec("PRAGMA busy_timeout=10000;");
+  db.exec(REPLY_OWNERSHIP_DDL);
+  const insert = db.prepare(
+    "INSERT INTO reply_ownership (msg_id, origin, owner, created_at) VALUES (?, 'mcp_client', ?, ?) ON CONFLICT(msg_id) DO NOTHING",
+  );
+  return { record: (msgId, owner) => { insert.run(msgId, owner, Date.now()); } };
+};
+
 export interface MessageStoreLike {
   append(record: Omit<LocalMessageRecord, "id">): Promise<unknown>;
 }
@@ -148,9 +178,10 @@ export interface DurableReceipt {
  * hidden, when it fails (the message is still going out).
  */
 export const commitOutbound = async ({
-  outbox, store, profile, subject, envelope, text, transport = "nats",
+  outbox, store, profile, subject, envelope, text, transport = "nats", ownership,
 }: {
   outbox: OutboxLike;
+  ownership?: ReplyOwnershipRecorder;
   store: MessageStoreLike;
   profile: ProfileIdentity;
   subject: string;
@@ -158,6 +189,15 @@ export const commitOutbound = async ({
   text: string;
   transport?: string;
 }): Promise<DurableReceipt> => {
+  if (ownership) {
+    // Before the message can leave: if ownership cannot be made durable the send is refused,
+    // because an un-owned request would let its reply start an autonomous turn.
+    try {
+      ownership.record(envelope.msgId, `mcp:${envelope.senderAgentId}`);
+    } catch (error) {
+      throw new OutboundError("reply-ownership-unrecorded", error instanceof Error ? error.message : "ownership write failed");
+    }
+  }
   try {
     await outbox.enqueue(subject, envelope);
   } catch (error) {

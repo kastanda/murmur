@@ -21,7 +21,10 @@ import {
 import { encryptPayload, signEnvelope } from "@murmurv2/security";
 import { NatsBroker, type BrokerSubscription } from "@murmurv2/broker-nats";
 import { buildReplyMatcher, waitForReply } from "./request-reply.js";
-import { assertProfileBinding, assertRouting, commitOutbound, resolveProfileIdentity } from "./outbound.js";
+import {
+  assertProfileBinding, assertRouting, commitOutbound, createMcpReplyOwnership, resolveProfileIdentity,
+  type ReplyOwnershipRecorder,
+} from "./outbound.js";
 
 interface JsonRpcRequest {
   jsonrpc: "2.0";
@@ -107,8 +110,10 @@ const channelRoster = new ChannelRosterStore(channelRosterPath);
 
 // Outbox store — shared with daemon, only created if agent config exists
 let outbox: SQLiteDedupeOutboxStore | null = null;
+let replyOwnership: ReplyOwnershipRecorder | null = null;
 if (agentConfig) {
   outbox = new SQLiteDedupeOutboxStore(dbPath);
+  replyOwnership = createMcpReplyOwnership(dbPath);
 }
 
 // Lazy read-only NATS tap for wake-accelerated murmur_request. Optional — if NATS is
@@ -309,7 +314,7 @@ const handleTool = async (name: string, args: Record<string, unknown>): Promise<
 
     // Commit to the outbox (the daemon flushes it to NATS) and read the row back. Only a
     // verified commit may be reported as queued.
-    return commitOutbound({ outbox, store, profile: profileIdentity, subject: peer.subject, envelope, text });
+    return commitOutbound({ outbox, store, profile: profileIdentity, subject: peer.subject, envelope, text, ownership: replyOwnership ?? undefined });
   }
 
   if (name === "murmur_inbox") {
@@ -372,7 +377,7 @@ const handleTool = async (name: string, args: Record<string, unknown>): Promise<
     );
 
     // Commit to the outbox and verify it before waiting on a reply to it.
-    await commitOutbound({ outbox, store, profile: profileIdentity, subject: peer.subject, envelope, text });
+    await commitOutbound({ outbox, store, profile: profileIdentity, subject: peer.subject, envelope, text, ownership: replyOwnership ?? undefined });
 
     // Wait for the reply. Store polling is the durable fallback and always runs;
     // an optional read-only NATS tap on our own subject accelerates the wait by

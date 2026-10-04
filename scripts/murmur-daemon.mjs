@@ -39,6 +39,7 @@ import {
 import { startJetStreamAdvisoryDlqIfEnabled } from "./murmur-jetstream-advisory.mjs";
 import { WakeMonitor, createAuditShellHook, createShellHook, normalizeWakeConfig } from "./wake-monitor.mjs";
 import { WakeDispatchStore } from "./wake-dispatch-store.mjs";
+import { ReplyOwnershipStore } from "./reply-ownership-store.mjs";
 import { RuntimeBindingStore } from "./runtime-binding-store.mjs";
 import {
   CLAUDE_AUTO_MEMBER_SLOT,
@@ -274,6 +275,7 @@ const parentTextFor = (replyToMessageId) => {
   }
 };
 const wakeDb = new DatabaseSync(dbPath);
+const replyOwnership = new ReplyOwnershipStore(wakeDb);
 const wakeDispatchStore = new WakeDispatchStore(dbPath, {
   maxAttempts: Number(process.env.MURMUR_WAKE_MAX_ATTEMPTS) || 5,
   recipientId: agentId,
@@ -1068,6 +1070,13 @@ const onMessage = async (envelope) => {
     });
   }
 
+  const replyRoute = handoffInbound ? null : ReplyOwnershipStore.route(wakeDb, envelope.replyToMessageId);
+  if (replyRoute) {
+    log("info", "Correlated reply routed to its owner; no autonomous turn", {
+      msgId: envelope.msgId, replyToMessageId: envelope.replyToMessageId,
+      owner: replyRoute.owner, reason: replyRoute.reason,
+    });
+  }
   await wakeMonitor.onInbound(payload);
 };
 

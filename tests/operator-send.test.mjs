@@ -55,6 +55,7 @@ test("enqueueRootTask delegates to the existing shell sender and returns its mes
     path.join("/opt/murmur", "scripts", "murmur-shell-send.mjs"),
     "--to", "proj-claude",
     "--text", "summarise the README",
+    "--origin", "operator_client",
     "--conv", "conv-9",
   ]);
   assert.equal(calls[0].options.env.DATA_DIR, "/state/agents/root");

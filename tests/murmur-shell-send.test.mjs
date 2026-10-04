@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { SQLiteDedupeOutboxStore } from "../packages/core/dist/src/index.js";
 import { createKeyPair, createSigningKeyPair } from "../packages/security/dist/src/index.js";
+import { DatabaseSync } from "node:sqlite";
+import { ReplyOwnershipStore } from "../scripts/reply-ownership-store.mjs";
 import { WakeDispatchStore } from "../scripts/wake-dispatch-store.mjs";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
@@ -139,3 +141,34 @@ test("LLM hook durably records model setup failure for its exact attempt", () =>
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("shell send --origin operator_client records durable reply ownership before enqueue; omitted origin stays unowned", async () => {
+  const dir = await makeDataDir();
+  try {
+    const owned = runShellSend(["--to", "agent-b", "--text", "task", "--origin", "operator_client"], { DATA_DIR: dir });
+    assert.equal(owned.status, 0, owned.stderr);
+    const plain = runShellSend(["--to", "agent-b", "--text", "reply"], { DATA_DIR: dir });
+    assert.equal(plain.status, 0, plain.stderr);
+    const db = new DatabaseSync(path.join(dir, "murmur.db"));
+    const ownedId = JSON.parse(owned.stdout).msgId;
+    const plainId = JSON.parse(plain.stdout).msgId;
+    assert.equal(ReplyOwnershipStore.route(db, ownedId)?.reason, "reply-owned-by-operator-client");
+    assert.equal(ReplyOwnershipStore.route(db, plainId), null);
+    const bad = runShellSend(["--to", "agent-b", "--text", "x", "--origin", "root"], { DATA_DIR: dir });
+    assert.notEqual(bad.status, 0);
+    assert.match(bad.stderr, /--origin must be operator_client/);
+    db.close();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const argv of [["--origin"], ["--origin", ""], ["--origin", "--text"], ["--origin", "root"]]) {
+  test(`shell send refuses a missing/invalid --origin instead of sending unowned: ${JSON.stringify(argv)}`, async () => {
+    const dir = await makeDataDir();
+    try {
+      const result = runShellSend(["--to", "agent-b", "--text", "task", ...argv], { DATA_DIR: dir });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /--origin must be operator_client/);
+      assert.equal(existsSync(path.join(dir, "murmur.db")), false, "nothing was enqueued");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
