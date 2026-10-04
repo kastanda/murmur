@@ -116,6 +116,7 @@ struct MenuContent: View {
     @ViewBuilder private var limitsMenu: some View {
         Menu(L.limits) {
             if let report = controller.usageReport {
+                ForEach(controller.recoveryNotices, id: \.self) { notice in Text("🟢 \(notice)") }
                 ForEach(report.orderedProviders, id: \.name) { entry in
                     ForEach(Array(WorkMenu.usageLines(name: entry.name, usage: entry.usage).enumerated()), id: \.offset) { _, line in
                         Text(line)

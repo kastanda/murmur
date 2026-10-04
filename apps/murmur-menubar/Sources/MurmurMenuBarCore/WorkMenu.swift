@@ -12,6 +12,8 @@ public enum WorkMenu {
         case "queued": return L.taskQueued
         case "running": return L.taskRunning
         case "waiting": return stalled ? L.taskWaitingStalled : L.taskWaiting
+        case "waiting_for_provider": return L.taskWaitingProvider
+        case "blocked_by_provider_quota": return L.taskBlockedProvider
         case "cancel_requested": return L.taskCancelRequested
         case "cancelled": return L.taskCancelled
         case "completed": return L.taskCompleted
@@ -98,6 +100,15 @@ public enum WorkMenu {
         switch task.status {
         case "queued": line = "\(L.taskQueued) · \(time)"
         case "cancel_requested": line = "\(L.taskCancelRequested) · \(time)"
+        case "waiting_for_provider", "blocked_by_provider_quota":
+            // Nothing is executing: no agent is named as active. The CLI's stage already reads
+            // «Ожидает лимита Codex» / «Заблокировано: лимит Codex исчерпан»; the reset follows.
+            let stage = task.currentStage ?? statusLabel(task.status)
+            let mandatory = task.providerWait?.mandatory == true ? L.mandatoryReviewWaiting : nil
+            var parts = [mandatory.map { "\($0) \(agent(task.providerWait?.provider ?? ""))" } ?? stage]
+            if let reset = providerWaitReset(task.providerWait, now: now) { parts.append(reset) }
+            parts.append(time)
+            line = parts.joined(separator: " · ")
         default:
             let parts = [task.currentAgent.map(agent), task.currentStage, time].compactMap { $0 }
             line = parts.joined(separator: " · ")
@@ -105,6 +116,19 @@ public enum WorkMenu {
         let chain = chainLine(task.chain)
         return TaskRow(workflowId: task.workflowId, title: task.requestSummary, detailLine: line,
                        chainLine: task.chain.count > 1 ? chain : nil)
+    }
+
+    /// `Сброс через 41м` for a wait whose provider reset is authoritative; `nil` otherwise.
+    public static func providerWaitReset(_ wait: ProviderWait?, now: Date = Date()) -> String? {
+        guard let wait else { return nil }
+        if let resets = parseISO(wait.resetsAt) {
+            let seconds = resets.timeIntervalSince(now)
+            if seconds <= 0 { return nil }
+            let minutes = Int(seconds / 60)
+            let text = minutes >= 60 ? "\(minutes / 60)ч \(String(format: "%02d", minutes % 60))м" : "\(max(minutes, 1))м"
+            return "\(L.reset) через \(text)"
+        }
+        return nil
     }
 
     // MARK: usage
@@ -153,6 +177,17 @@ public enum WorkMenu {
     /// stale and drops the colour; an unavailable provider says so — never a number.
     public static func usageLines(name: String, usage: ProviderUsage, now: Date = Date(), timeZone: TimeZone = .current) -> [String] {
         let title = agent(name)
+        // An authoritatively exhausted provider: text first, colour only as an accent. The router never
+        // substitutes another agent; the coordinator's own exhaustion makes NEW tasks wait for the reset.
+        if usage.availability == "exhausted" || usage.routing?.eligible == false {
+            let resets = usage.routing?.resetsAt ?? usage.windows?.compactMap { $0.resetsAt }.max()
+            return [
+                title,
+                "🔴 \(L.usageExhausted)",
+                name == "claude" ? L.usageCoordinatorWaits : L.usageExcluded,
+                resumeText(resetsAt: resets, now: now, timeZone: timeZone) ?? L.usageResetUnknown,
+            ]
+        }
         guard usage.available, let windows = usage.windows, !windows.isEmpty else {
             return [title, L.usageUnavailable]
         }
@@ -164,7 +199,10 @@ public enum WorkMenu {
         if stale { lines.append(L.usageStale) }
         for window in windows {
             let expired = window.expired == true
-            let dot = (stale || expired || usage.kind != "subscription_usage") ? "" : "\(dot(level(remaining: window.remainingPercent))) "
+            // With routing availability, red is reserved for EXHAUSTED: a low-but-routable window is yellow.
+            var shade = level(remaining: window.remainingPercent)
+            if usage.availability != nil, shade == .red, window.remainingPercent > 0 { shade = .yellow }
+            let dot = (stale || expired || usage.kind != "subscription_usage") ? "" : "\(dot(shade)) "
             if expired {
                 lines.append("\(window.label): \(L.usageStale)")
                 continue
@@ -172,7 +210,52 @@ public enum WorkMenu {
             lines.append("\(window.label): \(dot)\(remainingText(window))")
             if let reset = resetText(window, now: now, timeZone: timeZone) { lines.append("  \(reset)") }
         }
+        // Degraded = low but still routable: a warning, never an exclusion.
+        if usage.availability == "degraded", !stale { lines.append(L.lowLimitTitle) }
         return lines
+    }
+
+    /// `Возобновление после 03:00` (today/tomorrow within a day) or `… после 7 октября, 03:00`.
+    public static func resumeText(resetsAt: String?, now: Date = Date(), timeZone: TimeZone = .current) -> String? {
+        guard let resets = parseISO(resetsAt), resets.timeIntervalSince(now) > 0 else { return nil }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ru_RU")
+        formatter.timeZone = timeZone
+        formatter.dateFormat = resets.timeIntervalSince(now) < 24 * 3600 ? "HH:mm" : "d MMMM, HH:mm"
+        return "\(L.usageResumesAfter) \(formatter.string(from: resets))"
+    }
+
+    /// Shown instead of sending when the coordinator (Claude) is authoritatively exhausted. The task is
+    /// NOT queued and nothing is rerouted to another agent: the operator re-sends after the reset.
+    public static func providerUnavailableMessage(provider: String, resetsAt: String?, now: Date = Date(), timeZone: TimeZone = .current) -> String {
+        let who = agent(provider)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ru_RU")
+        formatter.timeZone = timeZone
+        if let resets = parseISO(resetsAt), resets.timeIntervalSince(now) > 0 {
+            formatter.dateFormat = resets.timeIntervalSince(now) < 24 * 3600 ? "HH:mm" : "d MMMM, HH:mm"
+            return "\(who) недоступен до \(formatter.string(from: resets)).\nЗадача не отправлена и не передана другому агенту — повторите после сброса."
+        }
+        return "\(who) недоступен: лимит исчерпан, время сброса неизвестно.\nЗадача не отправлена и не передана другому агенту."
+    }
+
+    /// The pre-send block for the coordinator, from the last usage report (nil = nothing known to block on).
+    public static func sendBlock(_ report: UsageReport?, coordinator: String = "claude", now: Date = Date(), timeZone: TimeZone = .current) -> String? {
+        guard let usage = report?.providers[coordinator], usage.availability == "exhausted" || usage.routing?.eligible == false else { return nil }
+        // A reset that has already passed means the report is out of date: let the CLI re-evaluate.
+        if let resets = parseISO(usage.routing?.resetsAt), resets <= now { return nil }
+        return providerUnavailableMessage(provider: coordinator, resetsAt: usage.routing?.resetsAt, now: now, timeZone: timeZone)
+    }
+
+    /// Providers that were exhausted in `previous` and are routable again in `current` (automatic recovery).
+    public static func recoveredProviders(previous: UsageReport?, current: UsageReport?) -> [String] {
+        guard let previous, let current else { return [] }
+        return ["claude", "codex", "cursor"].filter { name in
+            let was = previous.providers[name]
+            let now = current.providers[name]
+            return (was?.availability == "exhausted" || was?.routing?.eligible == false)
+                && now != nil && now?.availability != "exhausted" && now?.routing?.eligible != false
+        }.map { "\(agent($0)) \(L.providerRecovered)" }
     }
 
     /// Passive pre-send warnings: a fresh SUBSCRIPTION window under 10%. Never blocks, never
@@ -181,7 +264,8 @@ public enum WorkMenu {
         guard let report else { return [] }
         var lines: [String] = []
         for (name, usage) in report.orderedProviders {
-            guard usage.available, usage.kind == "subscription_usage", usage.stale != true else { continue }
+            guard usage.available, usage.kind == "subscription_usage", usage.stale != true,
+                  usage.availability != "exhausted" else { continue }
             for window in usage.windows ?? [] where window.expired != true && window.remainingPercent < 10 {
                 lines.append("\(agent(name)): \(L.lowLimitPrefix) \(Int(window.remainingPercent.rounded()))% \(L.lowLimitSuffix)")
             }

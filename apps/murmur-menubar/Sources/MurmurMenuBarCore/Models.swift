@@ -170,11 +170,18 @@ public struct SendResult: Codable, Equatable, Sendable {
     /// The coordinator's exact correlated reply. Correlation is the CLI's job, not ours.
     public let text: String?
     public let timeoutSeconds: Int?
+    /// Set when the coordinator's provider is authoritatively out of quota (`provider-quota-exhausted`):
+    /// the task was NOT queued and no other agent was substituted.
+    public let provider: String?
+    public let resetsAt: String?
 
     public init(
         ok: Bool, reason: String?, detail: String?, msgId: String?,
-        replyMsgId: String?, text: String?, timeoutSeconds: Int?
+        replyMsgId: String?, text: String?, timeoutSeconds: Int?,
+        provider: String? = nil, resetsAt: String? = nil
     ) {
+        self.provider = provider
+        self.resetsAt = resetsAt
         self.ok = ok
         self.reason = reason
         self.detail = detail

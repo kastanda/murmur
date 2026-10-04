@@ -1164,6 +1164,145 @@ await test("low-limit warning: only a fresh subscription window under 10%, passi
     for text in [L.sendAnyway, L.lowLimitTitle, L.refreshLimits, L.limits] { await expect(isRussian(text), text) }
 }
 
+// MARK: - Quota-aware availability
+
+suite("Quota-aware availability")
+
+let availabilityNow = workNow
+func availabilityReport(claude: String, codex: String, cursor: String) async throws -> UsageReport {
+    try await decodeUsage("""
+    {"project":"murmur","providers":{"claude":\(claude),"codex":\(codex),"cursor":\(cursor)}}
+    """)
+}
+let w64 = #"{"id":"session","label":"5 часов","usedPercent":36,"remainingPercent":64,"resetsAt":null,"expired":false}"#
+let w3 = #"{"id":"codex:primary","label":"Неделя","usedPercent":97,"remainingPercent":3,"resetsAt":null,"expired":false}"#
+let claudeOK = #"{"available":true,"kind":"subscription_usage","stale":false,"availability":"available","routing":{"eligible":true},"windows":[\#(w64)]}"#
+let codexLow = #"{"available":true,"kind":"subscription_usage","stale":false,"availability":"degraded","routing":{"eligible":true},"windows":[\#(w3)]}"#
+let cursorUnknown = #"{"available":false,"reason":"not-exposed-by-runtime","availability":"unknown","routing":{"eligible":true,"reason":"not-exposed-by-runtime"}}"#
+func codexExhausted(reset: String?) -> String {
+    let resets = reset.map { "\"\($0)\"" } ?? "null"
+    return #"{"available":true,"kind":"subscription_usage","stale":false,"availability":"exhausted","routing":{"eligible":false,"reason":"usage-window-exhausted","resetsAt":\#(resets),"waitReason":"waiting_for_provider"},"windows":[{"id":"codex:primary","label":"Неделя","usedPercent":100,"remainingPercent":0,"resetsAt":\#(resets),"expired":false}]}"#
+}
+
+await test("AVAILABLE and DEGRADED render the percentage; degraded adds the warning line and stays sendable") {
+    let report = try await availabilityReport(claude: claudeOK, codex: codexLow, cursor: cursorUnknown)
+    await expectEqual(WorkMenu.usageLines(name: "claude", usage: report.providers["claude"]!, now: availabilityNow), ["Claude", "5 часов: 🟢 64% осталось"])
+    let codex = WorkMenu.usageLines(name: "codex", usage: report.providers["codex"]!, now: availabilityNow)
+    await expectEqual(codex, ["Codex", "Неделя: 🟡 3% осталось", "Лимит почти исчерпан"])
+    await expect(codex.joined().contains("3% осталось"), "text without colour")
+    await expectNil(WorkMenu.sendBlock(report), "a degraded or healthy coordinator never blocks sending")
+    await expectEqual(WorkMenu.lowLimitWarnings(report).count, 1, "the existing low-limit confirmation still applies to degraded")
+}
+
+await test("UNKNOWN (Cursor, no quota source) is plain «Данные недоступны» — never red, never excluded") {
+    let report = try await availabilityReport(claude: claudeOK, codex: codexLow, cursor: cursorUnknown)
+    let lines = WorkMenu.usageLines(name: "cursor", usage: report.providers["cursor"]!, now: availabilityNow)
+    await expectEqual(lines, ["Cursor", "Данные недоступны"])
+    await expect(!lines.joined().contains("🔴") && !lines.joined().contains("исключ"))
+}
+
+await test("EXHAUSTED Codex with an authoritative reset: red text, auto-excluded from new tasks, resume time") {
+    let moscow = TimeZone(identifier: "Europe/Moscow")!
+    let report = try await availabilityReport(claude: claudeOK, codex: codexExhausted(reset: "2026-10-04T00:00:00Z"), cursor: cursorUnknown)
+    let lines = WorkMenu.usageLines(name: "codex", usage: report.providers["codex"]!, now: availabilityNow, timeZone: moscow)
+    await expectEqual(lines.prefix(3).map { $0 }, ["Codex", "🔴 Лимит исчерпан", "Автоисключён из новых задач"])
+    await expect(lines.last?.hasPrefix("Возобновление после ") == true, "\(lines)")
+    await expect(!lines.joined().contains("осталось"), "no remaining percentage for an exhausted provider")
+}
+
+await test("EXHAUSTED without an authoritative reset says so instead of inventing one") {
+    let report = try await availabilityReport(claude: claudeOK, codex: codexExhausted(reset: nil), cursor: cursorUnknown)
+    let lines = WorkMenu.usageLines(name: "codex", usage: report.providers["codex"]!, now: availabilityNow)
+    await expectEqual(lines, ["Codex", "🔴 Лимит исчерпан", "Автоисключён из новых задач", "Время сброса неизвестно"])
+}
+
+await test("EXHAUSTED Claude: new tasks wait for the reset; sending is blocked with the reset time, and nothing is queued or rerouted") {
+    let claudeEx = codexExhausted(reset: "2026-10-04T00:00:00Z")
+    let report = try await availabilityReport(claude: claudeEx, codex: codexLow, cursor: cursorUnknown)
+    let lines = WorkMenu.usageLines(name: "claude", usage: report.providers["claude"]!, now: availabilityNow)
+    await expectEqual(Array(lines.prefix(3)), ["Claude", "🔴 Лимит исчерпан", "Новые задачи ожидают сброса"])
+    let moscow = TimeZone(identifier: "Europe/Moscow")!
+    let block = WorkMenu.sendBlock(report, now: availabilityNow, timeZone: moscow)
+    await expect(block?.contains("Claude недоступен до ") == true, block ?? "nil")
+    await expect(block?.contains("не передана другому агенту") == true)
+    await expectNil(WorkMenu.sendBlock(nil))
+    // a stale report whose reset already passed does not block: the CLI re-evaluates
+    await expectNil(WorkMenu.sendBlock(report, now: availabilityNow.addingTimeInterval(48 * 3600)))
+    await expect(WorkMenu.lowLimitWarnings(report).allSatisfy { !$0.contains("Claude") }, "exhausted is not the low-limit warning")
+}
+
+await test("the CLI's provider-quota refusal is explained, not shown as a generic failure") {
+    let result = SendResult(ok: false, reason: "provider-quota-exhausted", detail: nil, msgId: nil, replyMsgId: nil, text: nil,
+                            timeoutSeconds: nil, provider: "claude", resetsAt: nil)
+    let text = describeSendFailure(result)
+    await expect(text.contains("Claude недоступен") && text.contains("время сброса неизвестно"), text)
+    await expect(isRussian(L.usageExhausted) && isRussian(L.usageExcluded) && isRussian(L.usageCoordinatorWaits) && isRussian(L.usageResumesAfter))
+}
+
+await test("automatic recovery: a provider that was exhausted and is routable in the next report is announced") {
+    let before = try await availabilityReport(claude: claudeOK, codex: codexExhausted(reset: "2026-10-04T00:00:00Z"), cursor: cursorUnknown)
+    let after = try await availabilityReport(claude: claudeOK, codex: codexLow, cursor: cursorUnknown)
+    await expectEqual(WorkMenu.recoveredProviders(previous: before, current: after), ["Codex снова доступен"])
+    await expectEqual(WorkMenu.recoveredProviders(previous: before, current: before), [])
+    await expectEqual(WorkMenu.recoveredProviders(previous: nil, current: after), [])
+    await expect(isRussian(L.providerRecovered))
+}
+
+await test("a stale report with availability unknown shows the stale text, uncoloured") {
+    let staleCodex = #"{"available":true,"kind":"subscription_usage","stale":true,"availability":"unknown","routing":{"eligible":true,"pendingRefresh":true},"windows":[{"id":"codex:primary","label":"Неделя","usedPercent":97,"remainingPercent":3,"expired":false}]}"#
+    let report = try await availabilityReport(claude: claudeOK, codex: staleCodex, cursor: cursorUnknown)
+    let lines = WorkMenu.usageLines(name: "codex", usage: report.providers["codex"]!, now: availabilityNow)
+    await expect(lines.contains("Данные устарели"))
+    await expect(!lines.joined().contains("🔴") && !lines.joined().contains("Лимит почти исчерпан"))
+}
+
+await test("an older CLI (no availability fields) renders exactly as before") {
+    let report = try await decodeUsage(usageJSON)
+    await expectNil(report.providers["claude"]?.availability)
+    await expectNil(WorkMenu.sendBlock(report))
+}
+
+// MARK: - waiting-for-provider tasks
+
+func providerWaitTask(status: String, stage: String, resetsInMs: Double?, mandatory: Bool, resetsAt: String?) -> WorkTask {
+    WorkTask(workflowId: "root-aaaaaaaa-0001", status: status, submittedAt: "2026-10-03T11:58:00Z", elapsedMs: 120_000,
+             requestSummary: "Проверить релиз", currentAgent: nil, currentStage: stage, cancellable: true,
+             providerWait: ProviderWait(provider: "codex", state: status, resetsAt: resetsAt, resetsInMs: resetsInMs, intendedRecipient: "codex", mandatory: mandatory))
+}
+
+await test("a task waiting for a provider reset is NOT shown as running and names no active agent; the reset is shown") {
+    let task = providerWaitTask(status: "waiting_for_provider", stage: "Ожидает лимита Codex", resetsInMs: 41 * 60_000, mandatory: false, resetsAt: "2026-10-03T12:41:00Z")
+    let row = WorkMenu.row(task, now: workNow)
+    await expectEqual(row.detailLine.hasPrefix("Ожидает лимита Codex · Сброс через 41м"), true, row.detailLine)
+    await expect(!row.detailLine.contains("Выполняется"))
+    await expectEqual(WorkMenu.statusLabel("waiting_for_provider"), "Ожидает лимита")
+}
+
+await test("blocked by provider quota (no reset) reads «Заблокировано: лимит … исчерпан»; a mandatory review is labelled") {
+    let blocked = providerWaitTask(status: "blocked_by_provider_quota", stage: "Заблокировано: лимит Codex исчерпан", resetsInMs: nil, mandatory: false, resetsAt: nil)
+    await expect(WorkMenu.row(blocked, now: workNow).detailLine.hasPrefix("Заблокировано: лимит Codex исчерпан"))
+    await expectEqual(WorkMenu.statusLabel("blocked_by_provider_quota"), "Заблокировано: лимит исчерпан")
+    let review = providerWaitTask(status: "waiting_for_provider", stage: "Ожидает лимита Codex", resetsInMs: 600_000, mandatory: true, resetsAt: "2026-10-03T12:10:00Z")
+    let line = WorkMenu.row(review, now: workNow).detailLine
+    await expect(line.hasPrefix("Обязательная проверка ждёт Codex"), line)
+    await expect(!line.contains("Cursor") && !line.contains("Claude"), "no fallback reviewer is suggested")
+    for text in [L.taskWaitingProvider, L.taskBlockedProvider, L.mandatoryReviewWaiting] { await expect(isRussian(text), text) }
+}
+
+await test("a task snapshot with providerWait decodes from the CLI JSON, and a snapshot without it still decodes") {
+    let json = """
+    {"project":"murmur","summary":{"active":0,"queued":0,"waitingForProvider":1},"tasks":[
+      {"workflowId":"root-aaaaaaaa-0001","status":"waiting_for_provider","stalled":false,"requestSummary":"x","currentAgent":null,
+       "currentStage":"Ожидает лимита Codex","chain":[],"cancellable":true,
+       "providerWait":{"provider":"codex","state":"waiting_for_provider","resetsAt":"2026-10-03T12:41:00.000Z","resetsInMs":2460000,"intendedRecipient":"codex","mandatory":false,"workflowId":"root-aaaaaaaa-0001"}}],"recent":[]}
+    """
+    let snapshot = try JSONDecoder().decode(WorkSnapshot.self, from: Data(json.utf8))
+    await expectEqual(snapshot.summary.waitingForProvider, 1)
+    await expectEqual(snapshot.tasks.first?.providerWait?.provider, "codex")
+    let old = #"{"project":"murmur","summary":{"active":1,"queued":0},"tasks":[],"recent":[]}"#
+    await expectEqual(try JSONDecoder().decode(WorkSnapshot.self, from: Data(old.utf8)).summary.waitingForProvider, 0)
+}
+
 await test("limits are read on a SLOW cadence: a second poll inside the interval does not call `usage` again") {
     let runner = healthyRunner()
     let controller = await makeController(runner: runner)

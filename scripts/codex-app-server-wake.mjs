@@ -479,7 +479,12 @@ export class CodexAppServerClient {
           const status = message.params.turn.status;
           if (status && status !== "completed") {
             const detail = message.params.turn.error?.message || status;
-            finish(new Error(`codex-app-server-turn-${status}:${detail}`));
+            const failure = new Error(`codex-app-server-turn-${status}:${detail}`);
+            // Structured App Server error info (e.g. "usageLimitExceeded"); in-memory classification input only.
+            const info = message.params.turn.error?.codexErrorInfo;
+            const code = typeof info === "string" ? info : (info && typeof info === "object" ? Object.keys(info)[0] : null);
+            if (code) failure.providerEvidence = { code };
+            finish(failure);
             return;
           }
           if (!startedObserved) this.observe(message, { method: "turn/started", source: "missing-start-diagnostic",

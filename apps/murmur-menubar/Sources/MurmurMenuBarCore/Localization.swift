@@ -69,6 +69,9 @@ public enum L {
     public static let taskRunning = "Выполняется"
     public static let taskWaiting = "Ожидание"
     public static let taskWaitingStalled = "Ожидание (исполнитель не отвечает)"
+    public static let taskWaitingProvider = "Ожидает лимита"
+    public static let taskBlockedProvider = "Заблокировано: лимит исчерпан"
+    public static let mandatoryReviewWaiting = "Обязательная проверка ждёт"
     public static let taskCancelRequested = "Отмена запрошена"
     public static let taskCancelled = "Отменено"
     public static let taskCompleted = "Завершено"
@@ -99,6 +102,12 @@ public enum L {
     public static let refreshLimits = "Обновить лимиты"
     public static let usageUnavailable = "Данные недоступны"
     public static let usageStale = "Данные устарели"
+    public static let usageExhausted = "Лимит исчерпан"
+    public static let usageExcluded = "Автоисключён из новых задач"
+    public static let usageCoordinatorWaits = "Новые задачи ожидают сброса"
+    public static let usageResumesAfter = "Возобновление после"
+    public static let usageResetUnknown = "Время сброса неизвестно"
+    public static let providerRecovered = "снова доступен"
     public static let usageApiRateLimit = "Лимиты API (не лимит аккаунта)"
     public static let usageKindUnknown = "Тип лимита неизвестен"
     public static let remainingSuffix = "осталось"
@@ -205,6 +214,8 @@ public func describeSendFailure(_ result: SendResult) -> String {
         return "Задача пустая."
     case "cancelled":
         return L.cancelledBySystem
+    case "provider-quota-exhausted":
+        return WorkMenu.providerUnavailableMessage(provider: result.provider ?? "claude", resetsAt: result.resetsAt)
     default:
         return "Не удалось отправить задачу."
     }

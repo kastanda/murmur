@@ -99,6 +99,11 @@ export const recordCancelRequest = (db, rootMessageId, { messageIds = [], now = 
         "UPDATE agent_handoffs SET state = 'terminal', terminal_reason = ?, closed_at = ? WHERE root_message_id = ? AND state = 'open'",
       ).run(WORKFLOW_CANCELLED_REASON, now, rootMessageId).changes);
     }
+    // A delegation waiting for a provider's quota can never be released now either.
+    const hasWaits = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'provider_waits'").get();
+    if (hasWaits) {
+      db.prepare("UPDATE provider_waits SET state = 'cancelled', released_at = ? WHERE workflow_id = ? AND state = 'waiting'").run(now, rootMessageId);
+    }
     db.exec("COMMIT");
     return { newlyRequested: Number(inserted.changes) === 1, retiredDispatches: retired, closedContinuations };
   } catch (error) {

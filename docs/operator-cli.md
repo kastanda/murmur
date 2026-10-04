@@ -640,6 +640,7 @@ murmur tasks  <project> [--json]               # active + queued root tasks (+ a
 murmur task   <project> <workflow-id> [--json] # one task: request, chain, stage, result
 murmur cancel <project> <workflow-id> [--json] # cancel ONE workflow (never the project)
 murmur usage  <project> [--json] [--refresh]   # provider subscription usage windows
+murmur availability <project> [--json] [--refresh]   # routing availability per provider (available|degraded|exhausted|unknown)
 ```
 
 See [active-work.md](active-work.md) (what a task is, states, exactly what cancellation stops) and

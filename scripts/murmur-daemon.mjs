@@ -64,6 +64,12 @@ import { AgentRuntimeRegistry } from "./agent-runtime-registry.mjs";
 import { AgentHandoffStore } from "./agent-handoff-store.mjs";
 import { AgentHandoffController, admitInboundHandoff, buildHandoffFailureText } from "./agent-handoff-controller.mjs";
 import { HandoffTurnCoordinator } from "./agent-handoff-runtime.mjs";
+import { ProviderWaitStore } from "./provider-wait-store.mjs";
+import { providerOfAgent } from "./provider-availability.mjs";
+import { createAvailabilityService, withQuotaGate } from "./provider-availability-service.mjs";
+import { readProviderUsage, usageCacheFile } from "./provider-usage.mjs";
+import { defaultUsageProbes, usageIdentities } from "./operator/usage.mjs";
+import { loadProfile, profileExists } from "./operator/profile.mjs";
 import { SessionLeaseStore, createNativeLeaseGate } from "./lease.mjs";
 import { ensurePrivateDirectory, readPrivateJson, setPrivateUmask } from "./secure-state.mjs";
 import { murmurHome, projectPathsFor } from "./operator/project.mjs";
@@ -585,6 +591,35 @@ const recordHandoffAudit = async ({ continuation, envelope }) => {
 };
 
 const handoffStore = runtimeBindingStore ? new AgentHandoffStore(wakeDb) : null;
+
+/**
+ * Quota-aware routing. Only a modern operator profile (MURMUR_PROJECT_ID) maps agent ids to providers;
+ * anything else routes exactly as before. Availability comes from the provider's own usage and from
+ * positively identified provider quota errors — see provider-availability.mjs.
+ */
+const quotaProjectId = typeof process.env.MURMUR_PROJECT_ID === "string" && process.env.MURMUR_PROJECT_ID ? process.env.MURMUR_PROJECT_ID : null;
+const ownProvider = quotaProjectId ? providerOfAgent(agentId, quotaProjectId) : null;
+const quotaProjectPaths = quotaProjectId ? projectPathsFor(quotaProjectId, { home: murmurHome() }) : null;
+const quotaRefreshUsage = quotaProjectPaths ? async (provider) => {
+  if (!(await profileExists(quotaProjectPaths))) return;
+  const project = await loadProfile(quotaProjectPaths);
+  const probes = defaultUsageProbes({ project });
+  if (!probes[provider]) return;
+  await readProviderUsage({
+    probes: { [provider]: probes[provider] }, identities: usageIdentities({ project }),
+    cacheFile: usageCacheFile(), refresh: true,
+  });
+} : null;
+const quotaIdentities = quotaProjectPaths ? await (async () => {
+  try {
+    if (!(await profileExists(quotaProjectPaths))) return {};
+    return usageIdentities({ project: await loadProfile(quotaProjectPaths) });
+  } catch { return {}; }
+})() : {};
+const availabilityService = quotaProjectId
+  ? createAvailabilityService({ provider: ownProvider, identities: quotaIdentities, refreshUsage: quotaRefreshUsage, log })
+  : null;
+const providerWaits = handoffStore && availabilityService ? new ProviderWaitStore(wakeDb) : null;
 const handoffController = handoffStore
   ? new AgentHandoffController({
     store: handoffStore,
@@ -594,6 +629,13 @@ const handoffController = handoffStore
     buildHandoffEnvelope,
     recordHandoffAudit,
     log,
+    availability: availabilityService,
+    providerOf: quotaProjectId ? (id) => providerOfAgent(id, quotaProjectId) : null,
+    waits: providerWaits,
+    isMandatory: ({ to }) => {
+      const required = Array.isArray(config.routing?.mandatoryProviders) ? config.routing.mandatoryProviders : [];
+      return required.includes(providerOfAgent(to, quotaProjectId));
+    },
   })
   : null;
 const handoffCoordinator = handoffController ? new HandoffTurnCoordinator({ controller: handoffController, log }) : null;
@@ -915,7 +957,12 @@ const wakeMonitor = new WakeMonitor({
   loadBacklogAfter: loadInboundAfter,
   dispatchStore: wakeDispatchStore,
   runtimeDispatcher: activeRuntimeAdapter
-    ? (payload, dispatch) => runtimeRegistry.executeTurn(payload, dispatch)
+    ? (ownProvider && availabilityService
+      ? withQuotaGate({
+        service: availabilityService, dispatchStore: wakeDispatchStore, log,
+        executeTurn: (payload, dispatch) => runtimeRegistry.executeTurn(payload, dispatch),
+      })
+      : (payload, dispatch) => runtimeRegistry.executeTurn(payload, dispatch))
     : null,
   processingStartedTtlMs,
   retry: {
@@ -1091,6 +1138,9 @@ const flushLoop = async () => {
       handoffController?.store.reconcileCancelledContinuations();
       await runtimeRegistry.recoverCompletedReplies();
       if (handoffController) await handoffController.recoverPendingEnqueues();
+      // Delegations refused for provider quota: re-evaluated only when due (at the authoritative reset,
+      // else a bounded recheck); a recovered provider releases each exactly once.
+      if (handoffController?.waits) await handoffController.processDueWaits({ resolveFresh: (provider) => availabilityService.resolveFresh(provider) });
       await wakeMonitor.drain();
     } catch (err) {
       log("error", "Wake dispatch retry error", { error: err.message });

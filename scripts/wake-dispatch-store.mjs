@@ -377,6 +377,23 @@ export class WakeDispatchStore {
     return Number(result.changes);
   }
 
+  /**
+   * A turn failed with an authoritative provider-quota error: the work waits for the provider instead
+   * of burning its retry budget. The failed attempt is not counted against the budget (the model did
+   * no work), and the dispatch is not claimable again before `nextAttemptAt`.
+   */
+  deferForProvider(identity, reason, nextAttemptAt, now = Date.now()) {
+    const key = this.requireTransitionIdentity(identity);
+    const result = this.db.prepare(`
+      UPDATE wake_dispatch
+      SET state = 'deferred', next_attempt_at = ?, claimed_at = NULL,
+          attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+          last_error = ?, updated_at = ?
+      WHERE msg_id = ? AND recipient_id = ? AND member_slot = ? AND state IN ('failed', 'claimed', 'terminal')
+    `).run(nextAttemptAt, reason, now, key.msgId, key.recipientId, key.memberSlot);
+    return Number(result.changes);
+  }
+
   rescheduleAfterClaimLoss(identity, reason, nextAttemptAt, now = Date.now()) {
     const key = this.requireTransitionIdentity(identity);
     const result = this.db.prepare(`

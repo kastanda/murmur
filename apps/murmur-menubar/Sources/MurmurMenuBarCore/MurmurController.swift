@@ -52,6 +52,8 @@ public final class MurmurController: ObservableObject {
     @Published public private(set) var workSnapshot: WorkSnapshot?
     @Published public private(set) var usageReport: UsageReport?
     @Published public private(set) var usageRefreshing = false
+    /// «Codex снова доступен»: providers that were exhausted in the previous report and are routable now.
+    @Published public private(set) var recoveryNotices: [String] = []
     /// Workflow ids whose cancellation command is in flight (shown as «отмена…», not as cancelled).
     @Published public private(set) var cancellingTasks: Set<String> = []
     @Published public private(set) var operation: LifecycleOperation?
@@ -304,6 +306,7 @@ public final class MurmurController: ObservableObject {
         usageRefreshing = true
         defer { usageRefreshing = false }
         if let report = try? await cli.usage(project: project, refresh: force) {
+            recoveryNotices = WorkMenu.recoveredProviders(previous: usageReport, current: report)
             usageReport = report
         }
         lastUsageFetch = Date()
@@ -313,6 +316,9 @@ public final class MurmurController: ObservableObject {
 
     /// Passive low-limit lines from the last usage report (empty when none is low or the data is stale).
     public var lowLimitWarnings: [String] { WorkMenu.lowLimitWarnings(usageReport) }
+
+    /// Non-nil when the coordinator is authoritatively out of quota: a new root task would be refused.
+    public var sendBlock: String? { WorkMenu.sendBlock(usageReport) }
 
     // MARK: internals
 

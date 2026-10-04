@@ -13,6 +13,7 @@
  * originating session right now?".
  */
 import { HANDOFF_REASONS } from "@murmurv2/core";
+import { PROVIDER_REASONS } from "./provider-availability.mjs";
 import { HandoffRejection, composeContinuationPrompt } from "./agent-handoff-controller.mjs";
 import { OUTPUT_KINDS, RuntimeOutputError, classifyRuntimeOutput } from "./runtime-output.mjs";
 import {
@@ -378,6 +379,30 @@ export const settleRuntimeTurn = async ({
         if (!bindingStore.validateFence(fence, identity)) return { status: "late-result-dropped" };
         if (bindingStore.markIdle(fence, now()) !== 1) return { status: "late-result-dropped" };
         return { status: "completed-cancelled-workflow", attemptId: attempt.attemptId, reply: null };
+      }
+      if (error instanceof HandoffRejection && error.reason === PROVIDER_REASONS.quotaExhausted) {
+        // The recipient's provider is authoritatively exhausted: NOTHING durable was created for the
+        // child and no runtime was started. This is not a model failure and must never be retried
+        // (a retry would re-run the delegator's model just to hit the same refusal): the delegation
+        // intent waits durably (provider_waits) and is released exactly once after recovery. No reply
+        // is relayed and no substitute recipient is chosen.
+        dispatchStore.recordProcessingReceipt({
+          ...attempt, status: "completed", sessionId,
+          metadata: {
+            ...extraMetadata, disposition: "provider-wait", resultText,
+            provider: error.routing?.provider ?? null, waitId: error.wait?.waitId ?? null,
+          },
+        }, now());
+        dispatchStore.markHandedOffIfLatestAttemptCompleted(identity, attempt.attemptId, now());
+        log("warn", "Delegation waits for provider quota; no child created", {
+          msgId: payload.msgId, provider: error.routing?.provider ?? null, waitId: error.wait?.waitId ?? null,
+        });
+        if (!bindingStore.validateFence(fence, identity)) return { status: "late-result-dropped" };
+        if (bindingStore.markIdle(fence, now()) !== 1) return { status: "late-result-dropped" };
+        return {
+          status: "completed-provider-wait", attemptId: attempt.attemptId, reply: null,
+          routing: error.routing ?? null, waitId: error.wait?.waitId ?? null,
+        };
       }
       if (error instanceof HandoffRejection && error.reason === HANDOFF_REASONS.continuationStaleBinding) {
         log("warn", "Handoff creation refused: runtime generation is stale", {

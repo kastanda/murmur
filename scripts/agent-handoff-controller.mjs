@@ -22,6 +22,10 @@ import {
   validateHandoffEnvelope,
   validateHandoffLineage,
 } from "@murmurv2/core";
+import {
+  PROVIDER_REASONS, nextCheckAt, routingResult, waitReasonFor,
+} from "./provider-availability.mjs";
+import { isWorkflowCancelRequested } from "./workflow-control.mjs";
 
 export { HANDOFF_FEATURE_V1, HANDOFF_MAX_ACTIVE_DEPTH, HANDOFF_REASONS, HANDOFF_WIRE_VERSION };
 
@@ -46,11 +50,14 @@ export const HANDOFF_MAX_TASK_BYTES = 16 * 1024;
 
 /** A deterministic, machine-readable handoff refusal. Never downgraded to a model reply. */
 export class HandoffRejection extends Error {
-  constructor(reason, detail = null) {
+  constructor(reason, detail = null, extra = {}) {
     super(detail ? `${reason}:${detail}` : reason);
     this.name = "HandoffRejection";
     this.reason = reason;
     this.detail = detail;
+    // Structured routing refusal (provider quota): the availability result, never a substitute.
+    if (extra.routing) this.routing = extra.routing;
+    if (extra.wait) this.wait = extra.wait;
   }
 }
 
@@ -143,13 +150,27 @@ export const parseHandoffAction = (text, { maxTaskBytes = HANDOFF_MAX_TASK_BYTES
 };
 
 /** The exact control-frame contract handed to every autonomous runtime. */
-export const buildHandoffInstructions = ({ agentId, targets = [], maxDepth = HANDOFF_MAX_ACTIVE_DEPTH, activePath = [] }) => {
-  if (targets.length === 0) return "";
+export const buildHandoffInstructions = ({ agentId, targets = [], maxDepth = HANDOFF_MAX_ACTIVE_DEPTH, activePath = [], unavailable = [] }) => {
+  if (targets.length === 0 && unavailable.length === 0) return "";
+  if (targets.length === 0) {
+    return [
+      "[MURMUR HANDOFF PROTOCOL]",
+      `You are Murmur agent "${agentId}". No paired agent can accept delegated work right now:`,
+      ...unavailable.map(({ agentId: id, resetsAt }) => `- ${id}: provider quota exhausted${resetsAt ? `, resets ${resetsAt}` : ", no reset time known"}`),
+      "Do not emit a handoff frame; answer directly.",
+      "[END MURMUR HANDOFF PROTOCOL]",
+    ].join("\n");
+  }
   return [
     "[MURMUR HANDOFF PROTOCOL]",
     `You are Murmur agent "${agentId}".`,
     "You may delegate ONE bounded piece of work to exactly one paired agent and wait for its result.",
     `Delegation targets available to you right now: ${targets.join(", ")}.`,
+    ...(unavailable.length > 0 ? [
+      "Paired agents whose provider quota is exhausted (Murmur refuses new work for them; do not delegate to them,",
+      "and do not pick another agent for work that needs a specific one):",
+      ...unavailable.map(({ agentId: id, resetsAt }) => `- ${id}${resetsAt ? ` (resets ${resetsAt})` : " (no reset time known)"}`),
+    ] : []),
     ...(activePath.length > 0 ? [`Active delegation path already in flight: ${activePath.join(" -> ")}.`] : []),
     `Maximum active delegation depth: ${maxDepth}.`,
     "To delegate, your ENTIRE final answer must be exactly this JSON object and nothing else:",
@@ -241,14 +262,47 @@ export class AgentHandoffController {
     now = () => Date.now(),
     newMsgId = () => randomUUID(),
     log = () => {},
+    // Quota-aware routing (all optional; absent = every recipient is routable, as before):
+    //   availability  { resolve(provider) -> resolution }   synchronous, from durable state
+    //   providerOf    (agentId) -> "claude" | "codex" | "cursor" | null
+    //   waits         ProviderWaitStore   durable waiting_for_provider rows
+    //   isMandatory   ({ to, turn }) -> boolean   policy declared BEFORE the task started
+    availability = null,
+    providerOf = null,
+    waits = null,
+    isMandatory = () => false,
   }) {
     if (!store) throw new Error("agent-handoff-controller-store-required");
     if (typeof agentId !== "string" || !agentId) throw new Error("agent-handoff-controller-agent-id-required");
     if (typeof buildHandoffEnvelope !== "function") throw new Error("agent-handoff-controller-build-required");
     Object.assign(this, {
       store, agentId, peers, maxDepth, maxTaskBytes, buildHandoffEnvelope,
-      recordHandoffAudit, now, newMsgId, log,
+      recordHandoffAudit, now, newMsgId, log, availability, providerOf, waits, isMandatory,
     });
+  }
+
+  /**
+   * Effective routing availability of one recipient. UNKNOWN/AVAILABLE/DEGRADED are routable; only an
+   * authoritative EXHAUSTED refuses NEW work. No availability source configured = routable.
+   */
+  recipientAvailability(agentId) {
+    const provider = typeof this.providerOf === "function" ? this.providerOf(agentId) : null;
+    if (!provider || !this.availability) return null;
+    try {
+      return this.availability.resolve(provider);
+    } catch {
+      return null; // an unreadable state is UNKNOWN, which stays routable
+    }
+  }
+
+  /** Paired targets currently refused for quota, with their authoritative reset (for the coordinator). */
+  unavailableTargets() {
+    const out = [];
+    for (const peerId of this.handoffTargets()) {
+      const resolution = this.recipientAvailability(peerId);
+      if (resolution && !resolution.eligible) out.push({ agentId: peerId, provider: resolution.provider, resetsAt: resolution.resetsAt });
+    }
+    return out;
   }
 
   /**
@@ -264,9 +318,12 @@ export class AgentHandoffController {
   }
 
   instructions({ activePath = [] } = {}) {
+    const unavailable = this.unavailableTargets();
+    const refused = new Set(unavailable.map((entry) => entry.agentId));
     return buildHandoffInstructions({
       agentId: this.agentId,
-      targets: this.handoffTargets(),
+      unavailable,
+      targets: this.handoffTargets().filter((peerId) => !refused.has(peerId)),
       maxDepth: this.maxDepth,
       activePath,
     });
@@ -329,7 +386,8 @@ export class AgentHandoffController {
     const { target, ancestry } = plan;
 
     const existing = this.store.findByCause(this.agentId, turn.causedByMessageId);
-    const handoffMsgId = existing?.handoffMsgId ?? this.newMsgId();
+    const priorWait = existing ? null : this.waits?.getByCause(this.agentId, turn.causedByMessageId) ?? null;
+    const handoffMsgId = existing?.handoffMsgId ?? priorWait?.waitId ?? this.newMsgId();
     const handoffConversationId = existing?.handoffConversationId ?? derivedHandoffConversationId(handoffMsgId);
     const handoff = {
       rootMessageId: turn.rootMessageId,
@@ -371,6 +429,49 @@ export class AgentHandoffController {
       parentSenderId: turn.reply.to,
       taskText: existing ? existing.taskText : task,
     };
+
+    // QUOTA GATE — before the envelope is built, before any durable row, before any runtime or model.
+    // Only an authoritative EXHAUSTED refuses; a replay of an already-created handoff is never re-gated.
+    if (!existing) {
+      const resolution = this.recipientAvailability(target.agentId);
+      if (resolution && !resolution.eligible) {
+        const mandatory = Boolean(this.isMandatory({ to: target.agentId, turn }));
+        const routing = routingResult(resolution, { mandatory });
+        let wait = null;
+        if (this.waits) {
+          // The wait is durable AUTHORITY for a later release, so it is written in ONE transaction that
+          // re-reads the binding fence and the cancel intent: a stale generation or a cancelled workflow
+          // leaves no wait behind.
+          const outcome = this.store.transact(() => {
+            if (!this.store.fenceIsCurrent(fence, identity)) return { reason: HANDOFF_REASONS.continuationStaleBinding };
+            if (isWorkflowCancelRequested(this.store.db, turn.rootMessageId)) return { reason: "workflow-cancelled" };
+            return {
+              wait: this.waits.upsert({
+                waitId: handoffMsgId,
+                workflowId: turn.rootMessageId,
+                provider: resolution.provider,
+                intendedRecipientId: target.agentId,
+                delegatorId: this.agentId,
+                causedByMessageId: turn.causedByMessageId,
+                requiredCapability: mandatory ? "mandatory-provider" : null,
+                mandatory,
+                waitReason: waitReasonFor(resolution),
+                resetsAt: Number.isFinite(Date.parse(resolution.resetsAt)) ? Date.parse(resolution.resetsAt) : null,
+                nextCheckAt: nextCheckAt(resolution, this.now()),
+                record,
+              }, this.now()),
+            };
+          });
+          if (outcome.reason) throw new HandoffRejection(outcome.reason, "fenced-wait-lost");
+          wait = outcome.wait;
+        }
+        this.log("warn", "Handoff refused: recipient provider quota exhausted", {
+          to: target.agentId, provider: resolution.provider, rootMessageId: turn.rootMessageId,
+          waiting: Boolean(wait), resetsAt: resolution.resetsAt,
+        });
+        throw new HandoffRejection(PROVIDER_REASONS.quotaExhausted, target.agentId, { routing, wait });
+      }
+    }
 
     // Build and SIGN the envelope before opening the durable transaction: signing is
     // async and must never run inside a SQLite write lock. Nothing is persisted yet, so
@@ -419,6 +520,80 @@ export class AgentHandoffController {
       ancestry: continuation.handoffAncestry,
     });
     return { continuation, created, sent: { msgId: continuation.handoffMsgId } };
+  }
+
+  /**
+   * Perform the delegation a refused turn already decided on, exactly once, after the provider
+   * recovered. The wait row IS the committed authority (it was written under the live fence when the
+   * delegation was refused), so — like `recoverPendingEnqueues` — this claims no new fence: the
+   * `waiting -> released` CAS, the continuation row and the outbox row commit in ONE transaction, and
+   * the cause-unique continuation index makes a duplicate impossible.
+   */
+  async releaseWait(wait) {
+    const target = this.resolveTarget(wait.intendedRecipientId);
+    if (target.reason) {
+      this.waits.cancelWorkflow(wait.workflowId, this.now());
+      return { ok: false, released: false, reason: target.reason };
+    }
+    const { record } = wait;
+    const outbox = await this.buildHandoffEnvelope({
+      msgId: record.handoffMsgId,
+      to: record.recipientId,
+      subject: target.subject,
+      conversationId: record.handoffConversationId,
+      handoff: {
+        rootMessageId: record.rootMessageId,
+        rootConversationId: record.rootConversationId,
+        causedByMessageId: record.causedByMessageId,
+        ancestry: record.handoffAncestry,
+      },
+      text: record.taskText,
+    });
+    const result = this.store.transact(() => {
+      if (isWorkflowCancelRequested(this.store.db, wait.workflowId)) {
+        this.waits.cancelWorkflow(wait.workflowId, this.now());
+        return { ok: false, released: false, reason: "workflow-cancelled" };
+      }
+      if (this.waits.markReleased(wait.waitId, this.now()) !== 1) return { ok: true, released: false, reason: "already-released" };
+      const { handoff } = this.store.applyCreate(record, this.now());
+      this.store.applyOutboxEnqueue(outbox, this.now());
+      this.store.markEnqueued(handoff.handoffMsgId, this.now());
+      return { ok: true, released: true, handoff: this.store.get(handoff.handoffMsgId) };
+    });
+    if (result.released && typeof this.recordHandoffAudit === "function") {
+      try { await this.recordHandoffAudit({ continuation: result.handoff, envelope: outbox.envelope }); } catch { /* audit mirror only */ }
+    }
+    return result;
+  }
+
+  /**
+   * Re-evaluate due waits. `resolveFresh(provider)` MUST refresh the provider's usage (it is only
+   * called when a wait is due, i.e. at/after the authoritative reset or the bounded recheck), then
+   * return the effective resolution. Still exhausted -> stay waiting with the new reset; any other
+   * state (available / degraded / unknown) -> release once.
+   */
+  async processDueWaits({ resolveFresh }) {
+    const released = [];
+    const stillWaiting = [];
+    if (!this.waits) return { released, stillWaiting };
+    for (const wait of this.waits.due(this.now())) {
+      const resolution = await resolveFresh(wait.provider);
+      if (resolution && !resolution.eligible) {
+        this.waits.reschedule(wait.waitId, {
+          resetsAt: Number.isFinite(Date.parse(resolution.resetsAt)) ? Date.parse(resolution.resetsAt) : null,
+          nextCheckAt: nextCheckAt(resolution, this.now()),
+          waitReason: waitReasonFor(resolution),
+        });
+        stillWaiting.push(wait.waitId);
+        continue;
+      }
+      const result = await this.releaseWait(wait);
+      if (result.released) {
+        released.push(wait.waitId);
+        this.log("info", "Provider wait released: handoff created once", { waitId: wait.waitId, to: wait.intendedRecipientId, rootMessageId: wait.workflowId });
+      }
+    }
+    return { released, stillWaiting };
   }
 
   /** Re-enqueue handoffs whose continuation was written but whose envelope never landed. */

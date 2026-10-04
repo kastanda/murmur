@@ -138,6 +138,7 @@ struct SendTaskWindow: View {
     @State private var failure: String?
     @State private var sending = false
     @State private var lowLimitConfirm = false
+    @State private var providerBlock: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -184,6 +185,11 @@ struct SendTaskWindow: View {
         }
         .padding(20)
         .frame(minWidth: 520, minHeight: 420)
+        .alert(L.usageExhausted, isPresented: Binding(get: { providerBlock != nil }, set: { if !$0 { providerBlock = nil } })) {
+            Button(L.close, role: .cancel) {}
+        } message: {
+            Text(providerBlock ?? "")
+        }
         .confirmationDialog(L.lowLimitTitle, isPresented: $lowLimitConfirm, titleVisibility: .visible) {
             Button(L.sendAnyway) { performSend() }
             Button(L.cancel, role: .cancel) {}
@@ -194,6 +200,8 @@ struct SendTaskWindow: View {
 
     /// A low provider limit is a PASSIVE warning: sending is never blocked, only confirmed.
     private func submit() {
+        // An authoritatively exhausted coordinator cannot take a new task: say so instead of sending.
+        if let block = controller.sendBlock { providerBlock = block; return }
         if !controller.lowLimitWarnings.isEmpty { lowLimitConfirm = true } else { performSend() }
     }
 

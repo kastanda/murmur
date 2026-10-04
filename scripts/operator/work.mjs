@@ -36,9 +36,15 @@
  * refuses new work for the workflow, so a cancelled workflow can never become active again.
  */
 import { existsSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { redactSecrets } from "../notify-activity.mjs";
+import {
+  PROVIDER_REASONS, availabilityFile, readAvailabilityRecords, resolveAvailability,
+} from "../provider-availability.mjs";
+import { readUsageCache, usageCacheFile } from "../provider-usage.mjs";
+import { usageIdentities } from "./usage.mjs";
 import {
   IGNORED_DUE_TO_CANCELLED_WORKFLOW, isValidWorkflowId, recordCancelRequest,
 } from "../workflow-control.mjs";
@@ -48,7 +54,12 @@ import { locateProject, murmurHome } from "./project.mjs";
 export const WORK_STATES = Object.freeze({
   queued: "queued", running: "running", waiting: "waiting", cancelRequested: "cancel_requested",
   cancelled: "cancelled", completed: "completed", failed: "failed",
+  // The workflow cannot proceed because a provider's quota is authoritatively exhausted. Nothing is
+  // running: these are NOT `running`, and no agent is reported as the current executor.
+  waitingForProvider: "waiting_for_provider", blockedByProviderQuota: "blocked_by_provider_quota",
 });
+const PROVIDER_WAIT_STATES = new Set(["waiting_for_provider", "blocked_by_provider_quota"]);
+const PROVIDER_LABEL = { claude: "Claude", codex: "Codex", cursor: "Cursor" };
 const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);
 const LIVE_BINDING_STATES = new Set(["BOUND_IDLE", "CLAIMED", "WAKING", "RUNNING"]);
 const EXECUTING_DISPATCH = new Set(["claimed", "dispatched"]);
@@ -97,10 +108,10 @@ const iso = (ms) => (Number.isFinite(ms) ? new Date(ms).toISOString() : null);
 const maxOf = (values) => values.filter(Number.isFinite).reduce((a, b) => Math.max(a, b), -Infinity);
 
 /** Everything durable the view needs, read once from every agent database (read-only). */
-export const collectWorkRecords = ({ project, paths, now = Date.now() }) => {
+export const collectWorkRecords = ({ project, paths, now = Date.now(), providerStates = {} }) => {
   const agents = enabledAgents(project);
   const nameById = new Map(agents.map((agent) => [agent.agentId, agent.name]));
-  const records = { agents, nameById, handoffs: [], dispatches: [], bindings: new Map(), controls: new Map(), root: null };
+  const records = { agents, nameById, handoffs: [], waits: [], providerStates, dispatches: [], bindings: new Map(), controls: new Map(), root: null };
   for (const agent of agents) {
     const db = openReadOnly(paths.agentDbFile(agent.name));
     if (!db) continue;
@@ -111,7 +122,12 @@ export const collectWorkRecords = ({ project, paths, now = Date.now() }) => {
                task_text AS taskText, created_at AS createdAt, closed_at AS closedAt
           FROM agent_handoffs`) || []) records.handoffs.push(row);
       for (const row of queryAll(db, `
-        SELECT msg_id AS msgId, recipient_id AS recipientId, state, attempts, last_error AS lastError,
+        SELECT wait_id AS id, workflow_id AS workflowId, provider, intended_recipient_id AS recipientId,
+               wait_reason AS waitReason, state, first_observed_at AS firstObservedAt, resets_at AS resetsAt,
+               mandatory, required_capability AS capability
+          FROM provider_waits WHERE state = 'waiting'`) || []) records.waits.push(row);
+      for (const row of queryAll(db, `
+        SELECT msg_id AS msgId, recipient_id AS recipientId, state, attempts, last_error AS lastError, next_attempt_at AS nextAttemptAt,
                created_at AS createdAt, updated_at AS updatedAt, claimed_at AS claimedAt,
                owner_binding_id AS ownerBindingId,
                json_extract(payload_json, '$.from') AS sender,
@@ -209,12 +225,35 @@ export const buildTask = (records, task, now) => {
   const rootFailed = rootDispatch && ["terminal", "rejected"].includes(rootDispatch.state)
     && rootDispatch.lastError !== IGNORED_DUE_TO_CANCELLED_WORKFLOW;
 
+  // A delegation refused for provider quota (durable `provider_waits`), or a turn/dispatch deferred because
+  // its provider is exhausted, makes the workflow WAIT for that provider — never "running".
+  const quotaWaits = records.waits.filter((w) => w.workflowId === rootId);
+  const quotaDispatch = dispatches.find((d) => d.state === "deferred" && d.lastError === PROVIDER_REASONS.quotaExhausted);
+  let providerWait = null;
+  if (quotaWaits.length > 0 || quotaDispatch) {
+    const w = quotaWaits[0] ?? null;
+    const provider = w?.provider ?? quotaDispatch.agent;
+    const stateRow = records.providerStates?.[provider] ?? null;
+    const resetMs = w?.resetsAt != null ? Number(w.resetsAt) : asMs(stateRow?.resetsAt);
+    providerWait = {
+      provider,
+      state: Number.isFinite(resetMs) ? WORK_STATES.waitingForProvider : WORK_STATES.blockedByProviderQuota,
+      firstObservedAt: iso(w ? Number(w.firstObservedAt) : Number(quotaDispatch?.updatedAt)),
+      resetsAt: iso(resetMs),
+      resetsInMs: Number.isFinite(resetMs) ? Math.max(0, resetMs - now) : null,
+      intendedRecipient: w ? agentLabelOf(records, w.recipientId) : quotaDispatch.agent,
+      mandatory: Boolean(w && Number(w.mandatory) === 1),
+      workflowId: rootId,
+    };
+  }
+
   let status;
   if (reply) status = WORK_STATES.completed;
   // `cancel_requested` only while a turn of this workflow is genuinely executing on a LIVE runtime;
   // a `claimed` row whose runtime is gone executes nothing, so the workflow is cancelled.
   else if (cancelIntent) status = live.length > 0 ? WORK_STATES.cancelRequested : WORK_STATES.cancelled;
   else if (rootFailed || (failedHandoff && live.length === 0 && outstanding.length === 0 && openHandoffs.length === 0)) status = WORK_STATES.failed;
+  else if (providerWait && live.length === 0) status = providerWait.state;
   else if (live.length > 0) status = WORK_STATES.running;
   else if (executing.length > 0 || openHandoffs.length > 0 || handoffs.length > 0
     || (rootDispatch && !WAITING_DISPATCH.has(rootDispatch.state))) status = WORK_STATES.waiting;
@@ -233,7 +272,10 @@ export const buildTask = (records, task, now) => {
   let currentStage;
   if (status === WORK_STATES.queued) currentStage = STAGE.queued;
   else if (status === WORK_STATES.cancelRequested) currentStage = STAGE.cancelling;
-  else if (handoffOfCurrent) currentStage = redactedPreview(handoffOfCurrent.taskText, 60);
+  else if (PROVIDER_WAIT_STATES.has(status)) {
+    const label = PROVIDER_LABEL[providerWait.provider] ?? providerWait.provider;
+    currentStage = status === WORK_STATES.waitingForProvider ? `Ожидает лимита ${label}` : `Заблокировано: лимит ${label} исчерпан`;
+  } else if (handoffOfCurrent) currentStage = redactedPreview(handoffOfCurrent.taskText, 60);
   else if (currentDispatch?.replyTo) currentStage = STAGE.continuation;
   else if (status === WORK_STATES.waiting && waitedOn) currentStage = `${STAGE.waitingPrefix} ${agentLabelOf(records, waitedOn.recipientId)}`;
   else if (TERMINAL_STATES.has(status)) currentStage = null;
@@ -259,11 +301,13 @@ export const buildTask = (records, task, now) => {
   if (reply) lastActivity = "Получен итоговый ответ";
   else if (status === WORK_STATES.cancelled) lastActivity = "Задача отменена пользователем";
   else if (status === WORK_STATES.cancelRequested) lastActivity = "Запрошена отмена, текущий шаг завершается";
+  else if (PROVIDER_WAIT_STATES.has(status)) lastActivity = currentStage;
   else if (status === WORK_STATES.failed) lastActivity = rootDispatch?.lastError ? redactedPreview(rootDispatch.lastError, 100) : (failedHandoff?.terminalReason ?? "Сбой выполнения");
   else if (handoffs.length > 0) lastActivity = `${agentLabelOf(records, handoffs[handoffs.length - 1].delegatorId)} → ${agentLabelOf(records, handoffs[handoffs.length - 1].recipientId)}`;
   else lastActivity = status === WORK_STATES.queued ? "Принята, ожидает исполнителя" : "Выполняется";
 
-  const active = [WORK_STATES.queued, WORK_STATES.running, WORK_STATES.waiting, WORK_STATES.cancelRequested].includes(status);
+  const active = [WORK_STATES.queued, WORK_STATES.running, WORK_STATES.waiting, WORK_STATES.cancelRequested,
+    WORK_STATES.waitingForProvider, WORK_STATES.blockedByProviderQuota].includes(status);
   return {
     workflowId: rootId,
     rootMsgId: rootId,
@@ -273,13 +317,16 @@ export const buildTask = (records, task, now) => {
     startedAt: iso(startedMs),
     elapsedMs,
     requestSummary: redactedPreview(task.text),
-    currentAgent: TERMINAL_STATES.has(status) ? null : currentAgent,
+    // Nobody is executing a task that waits for a provider: no agent is reported as active for it.
+    currentAgent: TERMINAL_STATES.has(status) || PROVIDER_WAIT_STATES.has(status) ? null : currentAgent,
+    ...(providerWait && PROVIDER_WAIT_STATES.has(status) ? { providerWait } : {}),
     currentStage,
     currentMessageId: TERMINAL_STATES.has(status) ? null : currentMessageId,
     chain,
     lastActivityAt: iso(lastActivityMs),
     lastActivity,
-    cancellable: [WORK_STATES.queued, WORK_STATES.running, WORK_STATES.waiting].includes(status),
+    cancellable: [WORK_STATES.queued, WORK_STATES.running, WORK_STATES.waiting,
+      WORK_STATES.waitingForProvider, WORK_STATES.blockedByProviderQuota].includes(status),
     active,
     _reply: reply,
     _messageIds: [...ids],
@@ -310,6 +357,7 @@ export const buildWorkSnapshot = (records, { projectName, now = Date.now() } = {
       queued: count("queued"),
       running: count("running"),
       waiting: count("waiting"),
+      waitingForProvider: count("waiting_for_provider") + count("blocked_by_provider_quota"),
       cancelRequested: count("cancel_requested"),
     },
     tasks: active.map(stripPrivate),
@@ -347,6 +395,24 @@ the project, another agent or another task.
 Exit codes: 0 ok (idempotent), 1 usage, 2 unknown workflow, 3 no profile, 4 already finished.
 `;
 
+/** Effective availability of each provider from DURABLE state only (never probes). */
+const cachedProviderStates = async ({ env, now, project }) => {
+  try {
+    const usage = await readUsageCache(usageCacheFile(env, os.homedir()));
+    const identities = usageIdentities({ project, env });
+    const records = readAvailabilityRecords(availabilityFile(env, os.homedir()), identities);
+    const states = {};
+    for (const name of ["claude", "codex", "cursor"]) {
+      const u = usage[name] ?? null;
+      const r = resolveAvailability({ provider: name, usage: u && identities[name] && u.identity !== identities[name] ? null : u, record: records[name] ?? null, now });
+      states[name] = { availability: r.availability, resetsAt: r.resetsAt };
+    }
+    return states;
+  } catch {
+    return {};
+  }
+};
+
 const loadProjectContext = async ({ projectArg, env, home }) => {
   const { projectPath, paths } = locateProject(projectArg, { home: home ?? murmurHome(env) });
   if (!(await profileExists(paths))) return { error: "no-profile" };
@@ -375,7 +441,7 @@ export const commandWork = async ({ command, args, flags, out, err, env = proces
   }
   const { project, paths, projectPath } = ctx;
   const projectName = path.basename(projectPath);
-  const records = collectWorkRecords({ project, paths, now });
+  const records = collectWorkRecords({ project, paths, now, providerStates: await cachedProviderStates({ env, now, project }) });
 
   if (command === "tasks") {
     const snapshot = buildWorkSnapshot(records, { projectName, now });
@@ -445,7 +511,7 @@ export const commandWork = async ({ command, args, flags, out, err, env = proces
   // The intent must be in EVERY agent database for every gate to see it. A partial write is NOT
   // reported as success: the intent is idempotent, so the operator simply retries.
   if (failures.length > 0) return fail(1, failures.length === attempted ? "cancel-not-recorded" : "cancel-partially-recorded", { detail: failures });
-  const after = detailFor(collectWorkRecords({ project, paths, now }), workflowId, now);
+  const after = detailFor(collectWorkRecords({ project, paths, now, providerStates: await cachedProviderStates({ env, now, project }) }), workflowId, now);
   const result = {
     ok: true,
     workflowId,

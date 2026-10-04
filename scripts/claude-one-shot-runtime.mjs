@@ -122,11 +122,17 @@ export function runClaudeOneShot({
         // tool-use stop each get an explicit failure with bounded, redacted diagnostics.
         const verdict = classifyRuntimeOutput({ text: resultText, stopReason: parsed.stop_reason ?? null, isError: parsed.is_error === true });
         if (verdict.kind !== OUTPUT_KINDS.text && verdict.kind !== OUTPUT_KINDS.handoff) {
-          throw new RuntimeOutputError("claude-one-shot", verdict.kind, verdict.reason, safeDiagnostics({
+          const failure = new RuntimeOutputError("claude-one-shot", verdict.kind, verdict.reason, safeDiagnostics({
             exit: code, subtype: parsed.subtype, stop: parsed.stop_reason, terminal: parsed.terminal_reason,
             api: parsed.api_error_status, turns: parsed.num_turns, ms: parsed.duration_ms,
             stderr: stderr.trim().slice(0, 200),
           }));
+          // In-memory evidence for quota classification only (provider-availability.mjs); never persisted.
+          failure.providerEvidence = {
+            isError: parsed.is_error === true, status: parsed.api_error_status,
+            text: typeof resultText === "string" ? resultText.slice(0, 300) : null,
+          };
+          throw failure;
         }
         resolve({ text: resultText, sessionId: confirmedSessionId, raw: parsed });
       } catch (error) {

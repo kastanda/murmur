@@ -37,7 +37,8 @@ import {
 } from "./profile.mjs";
 import { commandClaude } from "./claude.mjs";
 import { commandWork } from "./work.mjs";
-import { commandUsage } from "./usage.mjs";
+import { commandAvailability, commandUsage, coordinatorQuotaGate } from "./usage.mjs";
+import { reviewWaitStateFor, waitReasonFor } from "../provider-availability.mjs";
 import { commandChannels } from "./channel-servers.mjs";
 import { commandCodex } from "./codex-model.mjs";
 import { commandCursor } from "./cursor.mjs";
@@ -117,6 +118,7 @@ Usage:
   murmur task     <project> <workflow-id> [--json]
   murmur cancel   <project> <workflow-id> [--json]
   murmur usage    <project> [--json] [--refresh]
+  murmur availability <project> [--json] [--refresh]
   murmur cursor   <project> config [--json]
   murmur notify  status | mode <activity|errors|default> | migrate [--from <dir>] | test
 
@@ -1256,6 +1258,30 @@ const commandSend = async ({ args, flags }) => {
     return 3;
   }
 
+  // QUOTA GATE for a NEW root task: when the coordinator's provider is authoritatively exhausted nothing
+  // is enqueued and no other agent is substituted. UNKNOWN / DEGRADED stay routable.
+  const quota = await coordinatorQuotaGate({ project, provider: coordinator.name });
+  if (!quota.eligible) {
+    const refusal = {
+      ok: false,
+      reason: "provider-quota-exhausted",
+      provider: quota.provider,
+      availability: quota.availability,
+      providerState: waitReasonFor(quota),
+      resetsAt: quota.resetsAt,
+      queued: false,
+      substituted: false,
+      ...(flags.releaseGate ? { releaseGate: { passed: false, reason: "provider-quota-exhausted", state: reviewWaitStateFor(quota) } } : {}),
+    };
+    if (flags.json) sendResult(refusal);
+    else {
+      err(`murmur: refusing to send — ${coordinator.name} is out of quota${quota.resetsAt ? ` until ${quota.resetsAt}` : " (no reset time reported)"}.`);
+      err("murmur: the task was NOT queued and no other agent was substituted. Re-send after the provider recovers.");
+      if (flags.releaseGate) err(`murmur: required review is not satisfied (${refusal.releaseGate.state}).`);
+    }
+    return 3;
+  }
+
   // Passive, NON-BLOCKING warning from the last cached usage snapshot (never a fresh provider
   // call, never an interactive prompt): the task is sent regardless.
   for (const line of await lowLimitWarnings()) err(`murmur: ${line}`);
@@ -1372,6 +1398,7 @@ const COMMANDS = {
   codex: (parsed) => commandCodex({ ...parsed, out, err }),
   channels: (parsed) => commandChannels({ ...parsed, out, err }),
   usage: (parsed) => commandUsage({ ...parsed, out, err }),
+  availability: (parsed) => commandAvailability({ ...parsed, out, err }),
   tasks: (parsed) => commandWork({ ...parsed, command: "tasks", out, err }),
   task: (parsed) => commandWork({ ...parsed, command: "task", out, err }),
   cancel: (parsed) => commandWork({ ...parsed, command: "cancel", out, err }),

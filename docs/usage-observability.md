@@ -54,3 +54,67 @@ is always rendered.
 Parsed output holds only provider, kind, plan label, window label, percentages, reset instants and
 `observedAt`. Account ids, emails, balances and headers are dropped at the parser boundary and
 never cached; diagnostics are redacted and bounded.
+
+## Quota-aware routing (availability)
+
+`murmur usage <project> --json` and `murmur availability <project> [--json] [--refresh]` also report, per
+provider, the **routing availability** Murmur uses *before* it creates a handoff or starts a runtime. One
+resolution function (`scripts/provider-availability.mjs`) serves the router, the CLI and the Menu Bar.
+
+| availability | meaning | routable |
+|---|---|---|
+| `available` | every constraining window above 10% remaining (or a real turn just succeeded) | yes |
+| `degraded` | a constraining window ≤ 10% but > 0: **warning only** | yes |
+| `exhausted` | an authoritative constraining window is 0% remaining, **or** a provider returned a positively identified quota error | **no (new work only)** |
+| `unknown` | usage unavailable / stale / malformed / refresh failed / none exposed (Cursor) | yes |
+
+Never inferred from stale or missing data, context size, token or message counts, elapsed time or a low
+percentage. *Constraining* windows are the account-level subscription windows (Claude `session`/`weekly`,
+Codex `primary`/`secondary` of the main bucket); per-model scoped windows and API-key rate limits
+(`api_rate_limit`) never exclude an agent. ANY exhausted constraining window exhausts the agent (5h 40%,
+weekly 0% ⇒ exhausted); the reset is the latest exhausted window's.
+
+**Errors.** Only structured evidence counts: Codex `codexErrorInfo` `usageLimitExceeded`; Claude `is_error` +
+HTTP 429 + the CLI's own subscription-limit wording (or a `rate_limit_event` rejection of a subscription
+window); a Cursor ACP RPC error with a string quota code. A generic 429, timeout, network, auth or 5xx
+failure is never quota. Only `provider, state, observedAt, source, resetsAt, category` are persisted
+(`~/.murmur/cache/agent-models/provider-availability.json`) — never a payload, header or identifier.
+
+**Stale / reset.** An exhausted snapshot whose `resetsAt` has passed, or that is older than 10 minutes, is
+`unknown` (refresh pending) — never a permanent block. An error-derived exhaustion without a reset is held
+at most 30 minutes, then re-checked. A later authoritative reading, or a real successful turn, recovers the
+agent automatically; no restart is needed.
+
+**Routing.** `AgentHandoffController.delegate` refuses a NEW handoff to an exhausted recipient *before* the
+envelope is built, before any durable child row or outbox row, and before any runtime/model. The refusal is a
+structured result (`reason: provider-quota-exhausted`, `resetsAt`, `waitReason`, `substitutionAllowed`); the
+router never substitutes another agent. Exhausted targets are removed from — and listed in — the coordinator's
+handoff instructions, so it can choose for optional work. A refused delegation becomes a durable
+`provider_waits` row (`waiting_for_provider` with a reset, else `blocked_by_provider_quota`) that records
+provider, `firstObservedAt`, `resetsAt`, the intended recipient and the workflow id. It is re-evaluated only
+when due (the authoritative reset + 5 s, else every 10 min), refreshes usage once, and — if the provider is
+no longer exhausted — releases the original delegation **exactly once** (CAS + cause-unique continuation in
+one transaction). Cancelling the workflow cancels the wait.
+
+**Dispatch gate.** In each provider daemon the claimed dispatch is checked before anything starts: an
+exhausted provider defers it in `wake_dispatch` to the reset (no attempt consumed, no model call). A turn
+that fails with a positively identified quota error records the exhaustion and moves the failed dispatch to
+the same wait (attempt refunded) instead of retrying. A turn the provider already accepted is never
+interrupted by usage polling.
+
+**Claude is the coordinator.** No failover: when Claude is exhausted `murmur send` exits 3 with
+`reason: provider-quota-exhausted` (`providerState`, `resetsAt`, `queued: false`, `substituted: false`) and
+nothing is enqueued. Queueing a *root* task until the reset is not implemented (the root send has no
+idempotency key, so a safe exactly-once release is not possible yet).
+
+**Mandatory reviewer.** A required provider is never substituted or waived. `--release-gate` on a refused
+send reports `releaseGate.state` `WAITING_FOR_PROVIDER_RESET` (reset known) / `BLOCKED_BY_PROVIDER_QUOTA`;
+a delegation to a provider listed in `routing.mandatoryProviders` of the daemon config is marked mandatory
+and waits for exactly that provider.
+
+**Menu Bar / Active Tasks.** Exhausted: `🔴 Лимит исчерпан` + `Автоисключён из новых задач` (Claude: `Новые
+задачи ожидают сброса`) + `Возобновление после HH:mm`; degraded: yellow + `Лимит почти исчерпан`; unknown is
+never red. Tasks waiting for a provider show `Ожидает лимита Codex · Сброс через 41м` or `Заблокировано:
+лимит Codex исчерпан`, are never `running` and name no active agent.
+
+There is no “force an exhausted agent” override; “Обновить лимиты” is the only manual action.

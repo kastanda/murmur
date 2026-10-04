@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Quota-aware agent routing
+
+- One routing availability model (`available | degraded | exhausted | unknown`) from authoritative provider
+  usage and positively identified quota errors; only `exhausted` refuses NEW work. `murmur usage --json`
+  carries `availability` + `routing`; new `murmur availability <project>`. See `docs/usage-observability.md`.
+- Handoffs to an exhausted provider are refused before any durable row/runtime/model, wait durably
+  (`provider_waits`) and release exactly once after recovery; dispatches wait in `wake_dispatch` without
+  retry storms. No substitution, no coordinator failover, no weakening of mandatory reviewers.
+- Menu Bar: exhausted/degraded/unknown rendering, waiting-for-provider tasks, send block for an exhausted coordinator.
+
 ### Channel durability and lifecycle
 
 - `murmur_send` / `murmur_request`: `status: "queued"` now means `durable: true` — the outbox
