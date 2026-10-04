@@ -16,7 +16,8 @@ const LIVE_BINDING_STATES = new Set(["STARTING", "BOUND_IDLE", "CLAIMED", "WAKIN
 // An owner binding in one of these states is doing (or about to do) the work. BOUND_IDLE /
 // OFFLINE / STOPPED / absent mean nobody is working on the row, whatever the row still says.
 const WORKING_BINDING_STATES = new Set(["CLAIMED", "WAKING", "RUNNING"]);
-// A claim that has no owner yet (claimed, not yet dispatched) is in flight only briefly.
+// A `claimed` row that has no owner yet (not yet dispatched) is in flight only briefly. An unowned
+// `dispatched` row has no fence to prove anything and is never active.
 const UNOWNED_CLAIM_GRACE_MS = 10 * 60_000;
 const PENDING_DISPATCH_STATES = new Set(["pending", "deferred", "failed"]);
 
@@ -71,7 +72,7 @@ export const readAgentRuntimeState = (dbPath, agentId, { now = Date.now() } = {}
     }
     const heldRows = queryAll(
       db,
-      `SELECT d.msg_id AS msgId, d.owner_binding_id AS ownerBindingId, d.updated_at AS updatedAt,
+      `SELECT d.msg_id AS msgId, d.state AS dispatchState, d.owner_binding_id AS ownerBindingId, d.updated_at AS updatedAt,
               d.owner_generation AS ownerGeneration, d.fencing_token AS fencingToken, d.fencing_epoch AS fencingEpoch,
               b.state AS bindingState, b.last_heartbeat AS lastHeartbeat, b.lease_ttl_ms AS leaseTtlMs,
               b.runtime_generation AS bindingGeneration, b.lease_token AS bindingToken,
@@ -94,7 +95,7 @@ export const readAgentRuntimeState = (dbPath, agentId, { now = Date.now() } = {}
           && WORKING_BINDING_STATES.has(row.bindingState)
           && Number.isFinite(Number(row.lastHeartbeat))
           && now - Number(row.lastHeartbeat) <= Number(row.leaseTtlMs || 30_000)
-        : Number.isFinite(Number(row.updatedAt)) && now - Number(row.updatedAt) <= UNOWNED_CLAIM_GRACE_MS;
+        : row.dispatchState === "claimed" && Number.isFinite(Number(row.updatedAt)) && now - Number(row.updatedAt) <= UNOWNED_CLAIM_GRACE_MS;
       if (working) dispatch.active += 1;
       else dispatch.unretired += 1;
     }

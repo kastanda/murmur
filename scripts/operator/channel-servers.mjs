@@ -76,7 +76,9 @@ export const approvedChannelServerScript = () => canonical(path.join(path.dirnam
  */
 export const isChannelServerCommand = (command, { approved = approvedChannelServerScript() } = {}) => {
   const argv = String(command).trim().split(/\s+/);
-  if (argv.length < 2 || !/(^|\/)node$/.test(argv[0]) || path.basename(argv[1]) !== CHANNEL_SERVER_SCRIPT) return false;
+  // Exactly `node <script>`: extra arguments are never part of this install's launch, and a
+  // command line with arguments could carry secrets, so it is neither classified nor echoed.
+  if (argv.length !== 2 || !/(^|\/)node$/.test(argv[0]) || path.basename(argv[1]) !== CHANNEL_SERVER_SCRIPT) return false;
   if (!approved || !path.isAbsolute(argv[1])) return false;
   const script = canonical(argv[1]);
   return script !== null && script === approved;
@@ -121,12 +123,11 @@ export const listChannelServers = ({ psImpl = ps, env = process.env, crowdedThre
     const dataDir = readDataDir(row.pid, psImpl);
     const profile = dataDir ? resolveProfileIdentity(dataDir, env) : null;
     const ownerGone = row.ppid <= 1 || !parent;
-    servers.push({
+    const server = {
       pid: row.pid,
       ppid: row.ppid,
       ageSeconds: parseEtime(row.etime),
       startedAt: row.startedAt,
-      command: row.command,
       parentKind: ownerGone ? (row.ppid === 1 ? "launchd" : "gone") : classifyParent(parent.command),
       parentPid: row.ppid,
       profileKind: profile?.kind ?? "unknown",
@@ -136,7 +137,11 @@ export const listChannelServers = ({ psImpl = ps, env = process.env, crowdedThre
       evidence: ownerGone
         ? (row.ppid === 1 ? "reparented to launchd: its owner exited" : `parent pid ${row.ppid} no longer exists`)
         : "owner process is alive",
-    });
+    };
+    // Needed to re-verify identity before a signal; deliberately NOT enumerable, so it can never
+    // reach `--json` output.
+    Object.defineProperty(server, "command", { value: row.command, enumerable: false });
+    servers.push(server);
   }
   servers.sort((a, b) => a.pid - b.pid);
 
@@ -198,6 +203,14 @@ export const cleanupOrphanedChannelServers = ({ snapshot, psImpl = ps, kill = pr
       && isChannelServerCommand(fresh.command, { approved });
     const stillOwnerless = fresh.ppid <= 1 || !table.get(fresh.ppid);
     if (!sameProcess || !stillOwnerless) {
+      results.push({ pid: server.pid, outcome: "skipped-identity-changed" });
+      continue;
+    }
+    // Narrow the check-to-signal window to one more single-pid read. Without a pidfd the gap
+    // cannot be closed completely; it is microseconds, the target must be an ownerless approved
+    // channel server both times, and the signal is SIGTERM (a clean shutdown request).
+    const last = readTable(psImpl).get(server.pid);
+    if (!last || last.startedAt !== server.startedAt || last.command !== server.command || last.ppid > 1 && table.get(last.ppid)) {
       results.push({ pid: server.pid, outcome: "skipped-identity-changed" });
       continue;
     }

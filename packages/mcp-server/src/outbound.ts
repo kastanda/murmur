@@ -92,21 +92,24 @@ export const assertRouting = (
  * the directory it was resolved from: the config's own `project.id` and `dataDir`, and the
  * message store. Otherwise the receipt could name project A while the row lands in B's outbox
  * (a mixed-up `MURMUR_STORE_PATH`, a config copied between profiles, a symlinked ancestor).
- * Legacy profiles carry no project claim, so only the project case is checked.
+ * The store check applies to legacy profiles too; the config project/dataDir checks only to project profiles.
  */
 export const assertProfileBinding = (
   profile: ProfileIdentity,
   { config, storePath }: { config: { dataDir?: string; project?: { id?: string } }; storePath: string },
 ): void => {
+  // Every profile kind: the outbox this server writes MUST be `<dataDir>/murmur.db` — the file
+  // the daemon of that profile flushes — so a receipt that names `dataDir` is true. A store
+  // redirected to another profile (or to a sibling file nothing consumes) is refused.
+  if (canonicalPath(storePath) !== path.join(profile.dataDir, "murmur.db")) {
+    throw new OutboundError("profile-binding-invalid", "the message store is not this profile's murmur.db");
+  }
   if (profile.kind !== "project") return;
   if (config.project?.id !== profile.projectId) {
     throw new OutboundError("profile-binding-invalid", "the agent config belongs to a different project than the directory it is loaded from");
   }
   if (typeof config.dataDir !== "string" || canonicalPath(config.dataDir) !== profile.dataDir) {
     throw new OutboundError("profile-binding-invalid", "the agent config's dataDir is not this profile's directory");
-  }
-  if (path.dirname(canonicalPath(storePath)) !== profile.dataDir) {
-    throw new OutboundError("profile-binding-invalid", "the message store is outside this profile's directory");
   }
 };
 

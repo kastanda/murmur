@@ -106,6 +106,31 @@ test("a pid recycled into a different command line is not signalled even if the 
   assert.deepEqual(signalled, []);
 });
 
+test("a command line with extra arguments is never classified, and no command line is ever emitted", async () => {
+  const withSecret = psRow(30, 1, `${NODE} ${SCRIPT} --token SECRET-VALUE`);
+  const plain = psRow(31, 1, `${NODE} ${SCRIPT}`);
+  const rows = [withSecret, plain];
+  const snapshot = listChannelServers({ psImpl: fakePs(rows) });
+  assert.deepEqual(snapshot.servers.map((s) => s.pid), [31], "arguments => not this install's launch");
+  const lines = [];
+  await commandChannels({ flags: { json: true }, out: (l) => lines.push(l), err: () => {}, psImpl: fakePs(rows) });
+  const text = lines.join("\n");
+  assert.ok(!text.includes("SECRET-VALUE") && !text.includes(SCRIPT) && !text.includes("--token"), "no command line in output");
+});
+
+test("cleanup re-reads the process immediately before signalling: a change in that last gap is not signalled", () => {
+  const orphan = psRow(11, 1, `${NODE} ${SCRIPT}`);
+  const snapshot = listChannelServers({ psImpl: fakePs([orphan]) });
+  let reads = 0;
+  const psImpl = () => { reads += 1; return reads >= 2 ? psRow(11, 1, "/usr/bin/other-tool", "00:01", "Sat Oct  4 12:00:00 2026") : orphan; };
+  const signalled = [];
+  // First re-verification read still looks right; the final pre-signal read does not.
+  const [result] = cleanupOrphanedChannelServers({ snapshot, psImpl, kill: (pid) => signalled.push(pid) });
+  assert.deepEqual(signalled, []);
+  assert.equal(result.outcome, "skipped-identity-changed");
+  assert.equal(reads, 2, "re-verified, then re-read once more right before the signal");
+});
+
 test("accumulation under one owner is reported as crowded but never as orphaned", () => {
   const rows = [psRow(7, 1, "codex app-server --listen stdio://")];
   for (let pid = 100; pid < 112; pid += 1) rows.push(psRow(pid, 7, `${NODE} ${SCRIPT}`, "20:00:00"));

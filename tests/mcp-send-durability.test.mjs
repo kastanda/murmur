@@ -315,3 +315,27 @@ test("e2e: a symlinked ancestor cannot make one profile impersonate another (pat
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("e2e: the store must be exactly <dataDir>/murmur.db — a redirected or sibling store is refused for legacy and project profiles", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "murmur-home-"));
+  const legacyA = path.join(home, "legacy-a");
+  const legacyB = path.join(home, "legacy-b");
+  const proj = path.join(home, "projects", "proj-s", "agents", "claude");
+  await makeProfile(legacyA);
+  await makeProfile(legacyB);
+  await makeProfile(proj, { projectId: "proj-s" });
+  const redirected = startServer(legacyA, { MURMUR_STORE_PATH: path.join(legacyB, "murmur.db") });
+  const shadow = startServer(proj, { MURMUR_HOME: home, MURMUR_STORE_PATH: path.join(proj, "shadow.db") });
+  try {
+    for (const server of [redirected, shadow]) {
+      const result = await server.call("murmur_send", { to: "b", text: "x" });
+      assert.match(result.error, /profile-binding-invalid.*murmur\.db/);
+      assert.equal(result.status, undefined);
+    }
+    const db = new DatabaseSync(path.join(legacyB, "murmur.db"), { readOnly: true });
+    try { assert.equal(db.prepare("SELECT COUNT(*) AS n FROM outbox").get().n, 0, "nothing landed in the other profile's outbox"); } finally { db.close(); }
+  } finally {
+    for (const s of [redirected, shadow]) { s.proc.stdin.end(); await s.exited; }
+    await rm(home, { recursive: true, force: true });
+  }
+});

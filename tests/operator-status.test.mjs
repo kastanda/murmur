@@ -339,3 +339,17 @@ test("dispatch accounting: a stale fence never counts as active, even when the b
     ctx.cleanup();
   }
 });
+
+test("dispatch accounting: a fresh UNOWNED dispatched row (no owner, no fence) is unretired; only an unowned claimed row gets the grace", async () => {
+  const ctx = await setup();
+  try {
+    seedAgentStore(ctx.paths, ctx.project, "claude", { dispatches: 2 });
+    const db = ctx.paths.agentDbFile("claude");
+    setDispatch(db, "msg-claude-0", { state: "dispatched", updatedAt: NOW - 1_000 });
+    setDispatch(db, "msg-claude-1", { state: "claimed", updatedAt: NOW - 1_000 });
+    const state = readAgentRuntimeState(db, ctx.project.agents.find((entry) => entry.name === "claude").agentId, { now: NOW });
+    assert.deepEqual([state.dispatch.active, state.dispatch.unretired], [1, 1]);
+  } finally {
+    ctx.cleanup();
+  }
+});
