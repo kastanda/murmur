@@ -71,15 +71,27 @@ export const readAgentRuntimeState = (dbPath, agentId, { now = Date.now() } = {}
     }
     const heldRows = queryAll(
       db,
-      `SELECT d.owner_binding_id AS ownerBindingId, d.updated_at AS updatedAt,
-              b.state AS bindingState, b.last_heartbeat AS lastHeartbeat, b.lease_ttl_ms AS leaseTtlMs
+      `SELECT d.msg_id AS msgId, d.owner_binding_id AS ownerBindingId, d.updated_at AS updatedAt,
+              d.owner_generation AS ownerGeneration, d.fencing_token AS fencingToken, d.fencing_epoch AS fencingEpoch,
+              b.state AS bindingState, b.last_heartbeat AS lastHeartbeat, b.lease_ttl_ms AS leaseTtlMs,
+              b.runtime_generation AS bindingGeneration, b.lease_token AS bindingToken,
+              b.fencing_epoch AS bindingEpoch, b.last_assigned_message_id AS bindingMessageId
          FROM wake_dispatch d LEFT JOIN runtime_bindings b ON b.binding_id = d.owner_binding_id
         WHERE d.state IN ('claimed', 'dispatched')`,
     ) || [];
     for (const row of heldRows) {
       const owned = row.ownerBindingId != null;
+      // The row is only "being worked" if the binding still holds THIS row's fence: same
+      // generation, lease token and epoch, and this message as its current assignment. A binding
+      // that is RUNNING a later message (higher token) does not make an older row active.
+      const fenceHolds = owned
+        && row.ownerGeneration != null && Number(row.ownerGeneration) === Number(row.bindingGeneration)
+        && row.fencingToken != null && Number(row.fencingToken) === Number(row.bindingToken)
+        && row.fencingEpoch != null && Number(row.fencingEpoch) === Number(row.bindingEpoch)
+        && row.bindingMessageId === row.msgId;
       const working = owned
-        ? WORKING_BINDING_STATES.has(row.bindingState)
+        ? fenceHolds
+          && WORKING_BINDING_STATES.has(row.bindingState)
           && Number.isFinite(Number(row.lastHeartbeat))
           && now - Number(row.lastHeartbeat) <= Number(row.leaseTtlMs || 30_000)
         : Number.isFinite(Number(row.updatedAt)) && now - Number(row.updatedAt) <= UNOWNED_CLAIM_GRACE_MS;

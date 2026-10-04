@@ -19,7 +19,9 @@
  * touched). It never signals anything else and never uses a pattern kill.
  */
 import { execFileSync } from "node:child_process";
+import { realpathSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { resolveProfileIdentity } from "../../packages/mcp-server/dist/src/outbound.js";
 
 export const CHANNEL_SERVER_SCRIPT = "murmur-mcp-channel-server.mjs";
@@ -55,11 +57,29 @@ export const classifyParent = (command) => {
   return "other";
 };
 
-const isChannelServerCommand = (command) => {
+const canonical = (file) => {
+  try {
+    return realpathSync(file);
+  } catch {
+    return null;
+  }
+};
+
+/** The one script this install runs as a channel server. Others, even same-named, are not ours. */
+export const approvedChannelServerScript = () => canonical(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", CHANNEL_SERVER_SCRIPT));
+
+/**
+ * `node <approved absolute script>` and nothing else. A same-named script elsewhere (a copy in
+ * /tmp, a different checkout), a relative path, or any line that merely mentions the name is NOT
+ * a channel server of this install and is never classified, so it can never be cleaned up. A
+ * script path that cannot be proven equal to the approved one fails closed.
+ */
+export const isChannelServerCommand = (command, { approved = approvedChannelServerScript() } = {}) => {
   const argv = String(command).trim().split(/\s+/);
-  // node <path>/murmur-mcp-channel-server.mjs — an exact script argv, not a grep/editor/shell
-  // line that merely mentions the name.
-  return argv.length >= 2 && /(^|\/)node$/.test(argv[0]) && path.basename(argv[1]) === CHANNEL_SERVER_SCRIPT;
+  if (argv.length < 2 || !/(^|\/)node$/.test(argv[0]) || path.basename(argv[1]) !== CHANNEL_SERVER_SCRIPT) return false;
+  if (!approved || !path.isAbsolute(argv[1])) return false;
+  const script = canonical(argv[1]);
+  return script !== null && script === approved;
 };
 
 /** One `ps -axo pid=,ppid=,etime=,lstart=,command=` row. lstart is a fixed 24-char field. */
@@ -92,11 +112,11 @@ const readDataDir = (pid, psImpl) => {
  * Snapshot every channel server with its ownership. Pure given `psImpl`.
  * @returns {{ servers: object[], parents: object[], total: number, orphaned: number }}
  */
-export const listChannelServers = ({ psImpl = ps, env = process.env, crowdedThreshold = CROWDED_PARENT_THRESHOLD } = {}) => {
+export const listChannelServers = ({ psImpl = ps, env = process.env, crowdedThreshold = CROWDED_PARENT_THRESHOLD, approved = approvedChannelServerScript() } = {}) => {
   const table = readTable(psImpl);
   const servers = [];
   for (const row of table.values()) {
-    if (!isChannelServerCommand(row.command)) continue;
+    if (!isChannelServerCommand(row.command, { approved })) continue;
     const parent = table.get(row.ppid) || null;
     const dataDir = readDataDir(row.pid, psImpl);
     const profile = dataDir ? resolveProfileIdentity(dataDir, env) : null;
@@ -106,6 +126,7 @@ export const listChannelServers = ({ psImpl = ps, env = process.env, crowdedThre
       ppid: row.ppid,
       ageSeconds: parseEtime(row.etime),
       startedAt: row.startedAt,
+      command: row.command,
       parentKind: ownerGone ? (row.ppid === 1 ? "launchd" : "gone") : classifyParent(parent.command),
       parentPid: row.ppid,
       profileKind: profile?.kind ?? "unknown",
@@ -156,7 +177,7 @@ export const summarizeChannelServers = (snapshot) => {
  * Stop exactly the orphaned servers, re-verified one by one. Anything not provably orphaned
  * is reported as skipped. `psImpl`/`kill` are injectable.
  */
-export const cleanupOrphanedChannelServers = ({ snapshot, psImpl = ps, kill = process.kill.bind(process) } = {}) => {
+export const cleanupOrphanedChannelServers = ({ snapshot, psImpl = ps, kill = process.kill.bind(process), approved = approvedChannelServerScript() } = {}) => {
   const results = [];
   for (const server of snapshot.servers) {
     if (server.state !== CHANNEL_STATE.orphaned) {
@@ -170,7 +191,11 @@ export const cleanupOrphanedChannelServers = ({ snapshot, psImpl = ps, kill = pr
       results.push({ pid: server.pid, outcome: "already-gone" });
       continue;
     }
-    const sameProcess = fresh.startedAt === server.startedAt && isChannelServerCommand(fresh.command);
+    // Same pid, same start time (ps resolves to one second — the kernel start time Murmur's
+    // other process tooling also relies on), same FULL command line, same approved script, and
+    // still ownerless. Anything that cannot be proven is skipped, never signalled.
+    const sameProcess = fresh.startedAt === server.startedAt && fresh.command === server.command
+      && isChannelServerCommand(fresh.command, { approved });
     const stillOwnerless = fresh.ppid <= 1 || !table.get(fresh.ppid);
     if (!sameProcess || !stillOwnerless) {
       results.push({ pid: server.pid, outcome: "skipped-identity-changed" });

@@ -11,7 +11,7 @@ import path from "node:path";
 import test from "node:test";
 import { watchOwner } from "../scripts/channel-server-lifecycle.mjs";
 import {
-  CHANNEL_STATE, cleanupOrphanedChannelServers, commandChannels, listChannelServers, parseEtime, parsePsRow, summarizeChannelServers,
+  CHANNEL_STATE, approvedChannelServerScript, cleanupOrphanedChannelServers, commandChannels, listChannelServers, parseEtime, parsePsRow, summarizeChannelServers,
 } from "../scripts/operator/channel-servers.mjs";
 import { createKeyPair, createSigningKeyPair } from "../packages/security/dist/src/index.js";
 import { writePrivateJson } from "../scripts/secure-state.mjs";
@@ -49,7 +49,7 @@ test("watchOwner: reparenting or a vanished owner triggers exactly once", () => 
 
 // ---- classification (pure, fake ps) ------------------------------------------------------
 const NODE = "/opt/homebrew/bin/node";
-const SCRIPT = "/Users/u/Projects/murmur/scripts/murmur-mcp-channel-server.mjs";
+const SCRIPT = approvedChannelServerScript(); // the one script this install runs
 const psRow = (pid, ppid, command, etime = "01:00:00", lstart = "Sat Oct  4 10:00:00 2026") => `${pid} ${ppid} ${etime} ${lstart} ${command}`;
 const fakePs = (rows, env = {}) => (args) => (args[0] === "eww" ? `${rows.find((r) => r.startsWith(`${args[2]} `)) ?? ""} DATA_DIR=${env[args[2]] ?? "/Users/u/Projects/murmur/.data-codex"}` : rows.join("\n"));
 
@@ -80,6 +80,30 @@ test("classification: an old server under a LIVE owner is live; only a broken ow
   assert.equal(byPid[12].state, CHANNEL_STATE.orphaned);
   assert.equal(byPid[10].profileKind, "legacy");
   assert.equal(snapshot.orphaned, 2);
+});
+
+test("a same-named script that is not THIS install's, or a relative path, is never classified (so never cleaned)", () => {
+  const rows = [
+    psRow(7, 1, "codex app-server"),
+    psRow(20, 1, `${NODE} /tmp/evil/murmur-mcp-channel-server.mjs`),
+    psRow(21, 1, `${NODE} scripts/murmur-mcp-channel-server.mjs`),
+    psRow(22, 1, `${NODE} ${SCRIPT}.bak`),
+    psRow(23, 1, `${NODE} ${SCRIPT}`),
+  ];
+  const snapshot = listChannelServers({ psImpl: fakePs(rows) });
+  assert.deepEqual(snapshot.servers.map((s) => s.pid), [23]);
+  const signalled = [];
+  cleanupOrphanedChannelServers({ snapshot, psImpl: fakePs(rows), kill: (pid) => signalled.push(pid) });
+  assert.deepEqual(signalled, [23]);
+});
+
+test("a pid recycled into a different command line is not signalled even if the start time matches", () => {
+  const snapshot = listChannelServers({ psImpl: fakePs([psRow(11, 1, `${NODE} ${SCRIPT}`)]) });
+  const swapped = psRow(11, 1, `${NODE} ${SCRIPT} --extra`);
+  const signalled = [];
+  const [result] = cleanupOrphanedChannelServers({ snapshot, psImpl: fakePs([swapped]), kill: (pid) => signalled.push(pid) });
+  assert.equal(result.outcome, "skipped-identity-changed");
+  assert.deepEqual(signalled, []);
 });
 
 test("accumulation under one owner is reported as crowded but never as orphaned", () => {

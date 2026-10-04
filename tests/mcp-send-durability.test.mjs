@@ -5,6 +5,7 @@
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import os from "node:os";
@@ -103,7 +104,7 @@ test("routing: a stale/legacy profile cannot carry a send for another project", 
 
 // ---- end to end: the real MCP server and a real SQLite outbox --------------------------
 
-const makeProfile = async (dir, { agentId = "a", peers = ["b"] } = {}) => {
+const makeProfile = async (dir, { agentId = "a", peers = ["b"], projectId = null, configDataDir = dir } = {}) => {
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const enc = await createKeyPair();
   const sig = await createSigningKeyPair();
@@ -114,7 +115,8 @@ const makeProfile = async (dir, { agentId = "a", peers = ["b"] } = {}) => {
     peerEntries[peer] = { encryption: { publicKey: pe.publicKey }, signing: { publicKey: ps.publicKey }, subject: `msg.${peer}` };
   }
   await writePrivateJson(path.join(dir, "agent-config.json"), {
-    agentId, natsUrl: "nats://127.0.0.1:1", subject: `msg.${agentId}`, dataDir: dir,
+    agentId, natsUrl: "nats://127.0.0.1:1", subject: `msg.${agentId}`, dataDir: configDataDir,
+    ...(projectId ? { project: { id: projectId, label: projectId } } : {}),
     keys: { encryption: enc, signing: sig }, peers: peerEntries,
   });
 };
@@ -161,7 +163,7 @@ test("e2e: the msgId in a queued receipt is in the outbox the instant it is retu
     assert.equal(receipt.durable, true);
     assert.equal(receipt.replyToMessageId, "orig-1");
     assert.equal(receipt.profile, "legacy");
-    assert.equal(receipt.dataDir, path.resolve(dir));
+    assert.equal(receipt.dataDir, realpathSync(dir), "the canonical directory");
     const row = outboxRow(dir, receipt.msgId);
     assert.deepEqual({ ...row }, { msg_id: receipt.msgId, subject: "msg.b", status: "pending" });
     assert.ok(!JSON.stringify(receipt).includes("privateKey"));
@@ -191,7 +193,7 @@ test("e2e: unknown recipient and project mismatches never return queued and writ
 test("e2e: a project profile accepts only its own projectId; MURMUR_REQUIRE_PROJECT_PROFILE refuses legacy", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "murmur-home-"));
   const dir = path.join(home, "projects", "proj-abc123", "agents", "claude");
-  await makeProfile(dir);
+  await makeProfile(dir, { projectId: "proj-abc123" });
   const server = startServer(dir, { MURMUR_HOME: home });
   const legacyDir = await mkdtemp(path.join(os.tmpdir(), "murmur-legacy-"));
   await makeProfile(legacyDir);
@@ -261,5 +263,55 @@ test("e2e: a send already accepted when the session closes is still committed", 
     assert.equal(outboxRow(dir, receipt.msgId).msg_id, receipt.msgId);
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("e2e: a project profile refuses a store, config project or config dataDir that is not its own", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "murmur-home-"));
+  const dirA = path.join(home, "projects", "proj-a", "agents", "claude");
+  const dirB = path.join(home, "projects", "proj-b", "agents", "claude");
+  const dirC = path.join(home, "projects", "proj-c", "agents", "claude");
+  const dirD = path.join(home, "projects", "proj-d", "agents", "claude");
+  await makeProfile(dirA, { projectId: "proj-a" });
+  await makeProfile(dirB, { projectId: "proj-b" });
+  await makeProfile(dirC, { projectId: "proj-b" }); // a B config copied under C
+  await makeProfile(dirD, { projectId: "proj-d", configDataDir: dirA }); // config points at another profile
+  const crossStore = startServer(dirA, { MURMUR_HOME: home, MURMUR_STORE_PATH: path.join(dirB, "murmur.db") });
+  const copiedConfig = startServer(dirC, { MURMUR_HOME: home });
+  const wrongDataDir = startServer(dirD, { MURMUR_HOME: home });
+  try {
+    for (const server of [crossStore, copiedConfig, wrongDataDir]) {
+      const result = await server.call("murmur_send", { to: "b", text: "x", projectId: "proj-a" });
+      assert.ok(result.error, "refused");
+      assert.equal(result.status, undefined);
+    }
+    assert.match((await crossStore.call("murmur_send", { to: "b", text: "x" })).error, /profile-binding-invalid.*store/);
+    assert.match((await copiedConfig.call("murmur_send", { to: "b", text: "x" })).error, /profile-binding-invalid.*different project/);
+    assert.match((await wrongDataDir.call("murmur_send", { to: "b", text: "x" })).error, /profile-binding-invalid.*dataDir/);
+    const db = new DatabaseSync(path.join(dirB, "murmur.db"), { readOnly: true });
+    try { assert.equal(db.prepare("SELECT COUNT(*) AS n FROM outbox").get().n, 0, "nothing landed in B's outbox"); } finally { db.close(); }
+  } finally {
+    for (const s of [crossStore, copiedConfig, wrongDataDir]) { s.proc.stdin.end(); await s.exited; }
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("e2e: a symlinked ancestor cannot make one profile impersonate another (paths are canonicalised)", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "murmur-home-"));
+  const real = path.join(home, "elsewhere", "agents", "claude");
+  await makeProfile(real, { projectId: "proj-x" });
+  const { symlink } = await import("node:fs/promises");
+  await mkdir(path.join(home, "projects"), { recursive: true });
+  await symlink(path.join(home, "elsewhere"), path.join(home, "projects", "proj-x"));
+  const viaLink = path.join(home, "projects", "proj-x", "agents", "claude");
+  const server = startServer(viaLink, { MURMUR_HOME: home });
+  try {
+    // The canonical directory is NOT under <home>/projects/<id>/agents: it is a legacy path.
+    const result = await server.call("murmur_send", { to: "b", text: "x", projectId: "proj-x" });
+    assert.match(result.error, /profile-mismatch/);
+  } finally {
+    server.proc.stdin.end();
+    await server.exited;
+    await rm(home, { recursive: true, force: true });
   }
 });

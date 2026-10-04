@@ -21,7 +21,7 @@ import {
 import { encryptPayload, signEnvelope } from "@murmurv2/security";
 import { NatsBroker, type BrokerSubscription } from "@murmurv2/broker-nats";
 import { buildReplyMatcher, waitForReply } from "./request-reply.js";
-import { assertRouting, commitOutbound, resolveProfileIdentity } from "./outbound.js";
+import { assertProfileBinding, assertRouting, commitOutbound, resolveProfileIdentity } from "./outbound.js";
 
 interface JsonRpcRequest {
   jsonrpc: "2.0";
@@ -32,6 +32,7 @@ interface JsonRpcRequest {
 
 interface AgentConfig {
   agentId: string;
+  project?: { id?: string; label?: string };
   natsUrl: string;
   natsToken?: string;
   subject: string;
@@ -268,6 +269,7 @@ const handleTool = async (name: string, args: Record<string, unknown>): Promise<
     if (!text) throw new Error("'text' is required");
 
     assertRouting(profileIdentity, { requestedProjectId: requestedProject(args), requireProject: requireProjectProfile });
+    assertProfileBinding(profileIdentity, { config: agentConfig, storePath: dbPath });
     const peer = agentConfig.peers[to];
     if (!peer) throw new Error(`unknown peer: ${to} — add to peers in agent-config.json`);
 
@@ -333,6 +335,7 @@ const handleTool = async (name: string, args: Record<string, unknown>): Promise<
     if (!text) throw new Error("'text' is required");
 
     assertRouting(profileIdentity, { requestedProjectId: requestedProject(args), requireProject: requireProjectProfile });
+    assertProfileBinding(profileIdentity, { config: agentConfig, storePath: dbPath });
     const peer = agentConfig.peers[to];
     if (!peer) throw new Error(`unknown peer: ${to} — add to peers in agent-config.json`);
 

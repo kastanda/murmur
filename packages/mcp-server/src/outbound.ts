@@ -13,6 +13,7 @@
  *
  * Nothing here reads or returns key material, tokens or message text.
  */
+import { realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { EnvelopeV1, LocalMessageRecord } from "@murmurv2/core";
@@ -34,6 +35,16 @@ export class OutboundError extends Error {
   }
 }
 
+/** Canonical path (symlinks resolved); a path that does not exist yet falls back to its lexical form. */
+export const canonicalPath = (target: string): string => {
+  const absolute = path.resolve(target);
+  try {
+    return realpathSync(absolute);
+  } catch {
+    return absolute;
+  }
+};
+
 const PROJECT_PROFILE = /[\\/]projects[\\/]([^\\/]+)[\\/]agents[\\/][^\\/]+$/;
 
 /**
@@ -46,8 +57,8 @@ export const resolveProfileIdentity = (
   env: NodeJS.ProcessEnv = process.env,
   homeDir: string = os.homedir(),
 ): ProfileIdentity => {
-  const absolute = path.resolve(dataDir);
-  const murmurHome = path.resolve(env.MURMUR_HOME?.trim() || path.join(homeDir, ".murmur"));
+  const absolute = canonicalPath(dataDir);
+  const murmurHome = canonicalPath(env.MURMUR_HOME?.trim() || path.join(homeDir, ".murmur"));
   const match = absolute.match(PROJECT_PROFILE);
   const inHome = absolute.startsWith(`${murmurHome}${path.sep}`);
   if (match && inHome) return { kind: "project", projectId: match[1], dataDir: absolute };
@@ -73,6 +84,29 @@ export const assertRouting = (
   }
   if (profile.projectId !== requestedProjectId) {
     throw new OutboundError("profile-mismatch", `this MCP server is bound to project ${profile.projectId}, not ${requestedProjectId}`);
+  }
+};
+
+/**
+ * A project profile is only trusted if everything this server will actually use agrees with
+ * the directory it was resolved from: the config's own `project.id` and `dataDir`, and the
+ * message store. Otherwise the receipt could name project A while the row lands in B's outbox
+ * (a mixed-up `MURMUR_STORE_PATH`, a config copied between profiles, a symlinked ancestor).
+ * Legacy profiles carry no project claim, so only the project case is checked.
+ */
+export const assertProfileBinding = (
+  profile: ProfileIdentity,
+  { config, storePath }: { config: { dataDir?: string; project?: { id?: string } }; storePath: string },
+): void => {
+  if (profile.kind !== "project") return;
+  if (config.project?.id !== profile.projectId) {
+    throw new OutboundError("profile-binding-invalid", "the agent config belongs to a different project than the directory it is loaded from");
+  }
+  if (typeof config.dataDir !== "string" || canonicalPath(config.dataDir) !== profile.dataDir) {
+    throw new OutboundError("profile-binding-invalid", "the agent config's dataDir is not this profile's directory");
+  }
+  if (path.dirname(canonicalPath(storePath)) !== profile.dataDir) {
+    throw new OutboundError("profile-binding-invalid", "the message store is outside this profile's directory");
   }
 };
 

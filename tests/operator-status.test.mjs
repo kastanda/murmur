@@ -230,18 +230,23 @@ test("a stale binding heartbeat makes the project unhealthy even while the daemo
 
 // ---- dispatch accounting: "active" is work a runtime is verifiably doing NOW ------------
 
-const setDispatch = (dbPath, msgId, { state, ownerBindingId = null, updatedAt = NOW }) => {
+// A row owned by `ownerBindingId` carries that binding's fence (generation, token, epoch) and the
+// binding's current assignment names the row — exactly what a real claim writes.
+const FENCE = { generation: 1, token: 7, epoch: 3 };
+const setDispatch = (dbPath, msgId, { state, ownerBindingId = null, updatedAt = NOW, fence = FENCE }) => {
   const db = new DatabaseSync(dbPath);
   try {
-    db.prepare("UPDATE wake_dispatch SET state = ?, owner_binding_id = ?, updated_at = ? WHERE msg_id = ?").run(state, ownerBindingId, updatedAt, msgId);
+    db.prepare("UPDATE wake_dispatch SET state = ?, owner_binding_id = ?, owner_generation = ?, fencing_token = ?, fencing_epoch = ?, updated_at = ? WHERE msg_id = ?")
+      .run(state, ownerBindingId, ownerBindingId ? fence.generation : null, ownerBindingId ? fence.token : null, ownerBindingId ? fence.epoch : null, updatedAt, msgId);
   } finally {
     db.close();
   }
 };
-const setBinding = (dbPath, bindingId, { state, heartbeatAt = NOW }) => {
+const setBinding = (dbPath, bindingId, { state, heartbeatAt = NOW, assigned = null, fence = FENCE }) => {
   const db = new DatabaseSync(dbPath);
   try {
-    db.prepare("UPDATE runtime_bindings SET state = ?, last_heartbeat = ? WHERE binding_id = ?").run(state, heartbeatAt, bindingId);
+    db.prepare("UPDATE runtime_bindings SET state = ?, last_heartbeat = ?, last_assigned_message_id = ?, runtime_generation = ?, lease_token = ?, fencing_epoch = ? WHERE binding_id = ?")
+      .run(state, heartbeatAt, assigned, fence.generation, fence.token, fence.epoch, bindingId);
   } finally {
     db.close();
   }
@@ -254,7 +259,7 @@ test("dispatch accounting: claimed/dispatched rows whose runtime is gone or idle
     const db = ctx.paths.agentDbFile("claude");
     const agentId = ctx.project.agents.find((entry) => entry.name === "claude").agentId;
     // 0: owner is RUNNING with a fresh heartbeat -> genuinely active
-    setBinding(db, "claude-binding", { state: "RUNNING", heartbeatAt: NOW });
+    setBinding(db, "claude-binding", { state: "RUNNING", heartbeatAt: NOW, assigned: "msg-claude-0" });
     setDispatch(db, "msg-claude-0", { state: "dispatched", ownerBindingId: "claude-binding" });
     // 1: the owner binding no longer exists (crash/restart left the row behind) -> unretired
     setDispatch(db, "msg-claude-1", { state: "dispatched", ownerBindingId: "binding-from-a-dead-runtime" });
@@ -287,7 +292,7 @@ test("dispatch accounting: an idle or stale-heartbeat owner does not make a row 
     setBinding(db, "claude-binding", { state: "BOUND_IDLE", heartbeatAt: NOW });
     let state = readAgentRuntimeState(db, agentId, { now: NOW + 1_000 });
     assert.deepEqual([state.dispatch.active, state.dispatch.unretired], [0, 2], "idle owner: nothing is being worked");
-    setBinding(db, "claude-binding", { state: "RUNNING", heartbeatAt: NOW });
+    setBinding(db, "claude-binding", { state: "RUNNING", heartbeatAt: NOW, assigned: "msg-claude-0" });
     state = readAgentRuntimeState(db, agentId, { now: NOW + 10 * 60_000 });
     assert.deepEqual([state.dispatch.active, state.dispatch.unretired], [0, 2], "a RUNNING owner whose heartbeat is stale is not alive");
   } finally {
@@ -307,6 +312,29 @@ test("the operator task view stays independent of unretired internal dispatch ro
     assert.equal(snapshot.tasks.length, 0);
     const state = readAgentRuntimeState(db, ctx.project.agents.find((entry) => entry.name === "claude").agentId, { now: NOW + 1_000 });
     assert.deepEqual([state.dispatch.active, state.dispatch.unretired], [0, 3], "and status agrees: nothing active");
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+test("dispatch accounting: a stale fence never counts as active, even when the binding is RUNNING and fresh", async () => {
+  const ctx = await setup();
+  try {
+    seedAgentStore(ctx.paths, ctx.project, "claude", { dispatches: 4 });
+    const db = ctx.paths.agentDbFile("claude");
+    const agentId = ctx.project.agents.find((entry) => entry.name === "claude").agentId;
+    // The binding is RUNNING message 3 at token 8 / epoch 4. Rows 0-2 hold OLDER fences or other messages.
+    const current = { generation: 1, token: 8, epoch: 4 };
+    setBinding(db, "claude-binding", { state: "RUNNING", heartbeatAt: NOW, assigned: "msg-claude-3", fence: current });
+    setDispatch(db, "msg-claude-0", { state: "dispatched", ownerBindingId: "claude-binding", fence: { ...current, token: 7 } }); // old token
+    setDispatch(db, "msg-claude-1", { state: "dispatched", ownerBindingId: "claude-binding", fence: { ...current, epoch: 3 } }); // old epoch
+    setDispatch(db, "msg-claude-2", { state: "dispatched", ownerBindingId: "claude-binding", fence: current }); // current fence, but binding is assigned ANOTHER message
+    setDispatch(db, "msg-claude-3", { state: "dispatched", ownerBindingId: "claude-binding", fence: current }); // the real one
+    const state = readAgentRuntimeState(db, agentId, { now: NOW + 1_000 });
+    assert.equal(state.dispatch.active, 1, "only the row the binding currently holds");
+    assert.equal(state.dispatch.unretired, 3);
+    setDispatch(db, "msg-claude-3", { state: "dispatched", ownerBindingId: "claude-binding", fence: { ...current, generation: 2 } });
+    assert.equal(readAgentRuntimeState(db, agentId, { now: NOW + 1_000 }).dispatch.active, 0, "an old runtime generation is not the live one");
   } finally {
     ctx.cleanup();
   }
