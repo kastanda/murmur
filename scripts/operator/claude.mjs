@@ -31,12 +31,16 @@ import {
 import { discoverClaudeCapabilities } from "../claude-capabilities.mjs";
 import { agentByName, loadProfile, profileExists } from "./profile.mjs";
 import { locateProject, murmurHome } from "./project.mjs";
+import { buildClaudeMcpJson, buildClaudeMcpServer, inspectClaudeRegistrations, writeProjectMcpJson } from "./claude-mcp.mjs";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { readAgentRuntimeState } from "./status.mjs";
 
 export const CLAUDE_USAGE = `murmur claude — per-project Claude model/effort preference
 
 Usage:
   murmur claude <project> config [--json] [--refresh]
+  murmur claude <project> mcp-config [--write]
   murmur claude <project> model <id|inherit>
   murmur claude <project> effort <low|medium|high|xhigh|max|inherit>
 
@@ -176,7 +180,7 @@ const renderClaudeConfigHuman = (out, report, projectArg) => {
 export const commandClaude = async ({
   args, flags, out, err, env = process.env, home = undefined,
   discoverCapabilities = discoverClaudeCapabilities,
-  settingsPath = undefined,
+  settingsPath = undefined, claudeHome = undefined,
 }) => {
   const projectArg = args[0];
   if (!projectArg) {
@@ -206,6 +210,22 @@ export const commandClaude = async ({
   if (!agentByName(project, "claude")) {
     err("murmur: this project has no Claude identity.");
     return 3;
+  }
+
+  if (subcommand === "mcp-config") {
+    const options = {
+      projectPath, home: paths.home,
+      murmurRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".."),
+    };
+    const document = buildClaudeMcpJson(options);
+    if (flags.write) out(`wrote ${await writeProjectMcpJson(projectPath, document)}`);
+    else out(JSON.stringify(document, null, 2));
+    let claudeJson = null;
+    try { claudeJson = JSON.parse(await readFile(path.join(claudeHome ?? os.homedir(), ".claude.json"), "utf8")); } catch { /* none */ }
+    for (const r of inspectClaudeRegistrations(claudeJson, { projectPath, expected: buildClaudeMcpServer(options) })) {
+      if (r.shadowing) err(`murmur: ${r.scope}-scope "murmur" registration (DATA_DIR=${r.dataDir}) overrides .mcp.json; run \`claude mcp remove murmur -s ${r.scope}\` in ${projectPath}`);
+    }
+    return 0;
   }
 
   if (subcommand === "config") {

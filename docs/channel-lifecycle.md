@@ -35,6 +35,21 @@ profile**, not to `~/.murmur/projects/<id>/agents/<agent>`. The send was durable
 `.data-claude/murmur.db`, status `acked` — it just was not where a modern-profile search
 looks. Every receipt now names the profile (`profile: "legacy" | "project"`, `dataDir`).
 
+### Binding a Claude session to its project profile
+
+Claude Code resolves a server name local > project (`.mcp.json`) > user, so a hand-made
+`claude mcp add murmur -e DATA_DIR=…/.data-claude` (local or user scope) pins every session to a
+legacy profile. The canonical registration is generated, not hand-written:
+
+```
+murmur claude <project> mcp-config [--write]   # prints / writes <project>/.mcp.json
+```
+
+It binds `DATA_DIR=~/.murmur/projects/<projectId>/agents/claude`, states `MURMUR_PROJECT_ID`, and sets
+`MURMUR_REQUIRE_PROJECT_PROFILE=1`. If a local-scope `murmur` entry still shadows it, the command says so
+and names `claude mcp remove murmur -s local`. Inside a session, `/mcp` (or `claude mcp get murmur`)
+must show the project `DATA_DIR`; a send receipt must say `profile: "project"`.
+
 ### Routing is explicit
 
 * A server is bound to exactly one profile: its resolved `DATA_DIR`. It never creates or starts

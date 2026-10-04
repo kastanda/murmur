@@ -3,6 +3,8 @@ dist/
 packages/*/dist/
 .data/
 .data-*/
+# Generated per-machine Claude MCP registration (absolute paths): murmur claude <project> mcp-config --write
+.mcp.json
 
 # Environment
 .env
