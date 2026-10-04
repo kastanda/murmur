@@ -111,7 +111,7 @@ Usage:
   murmur send    <project> "<task>" [--timeout <seconds>] [--no-wait] [--release-gate]
   murmur projects [--json]
   murmur channels [--json] [--cleanup]
-  murmur claude   <project> config [--json] [--refresh] | model <id|inherit> | effort <level>
+  murmur claude   <project> config [--json] [--refresh] | mcp-config [--write] | model <id|inherit> | effort <level>
   murmur codex    <project> config [--json] [--refresh] | model <id|inherit> | effort <level>
   murmur tasks    <project> [--json]
   murmur task     <project> <workflow-id> [--json]
@@ -149,6 +149,7 @@ export const parseArgs = (argv) => {
     else if (arg === "--timeout") flags.timeoutSeconds = Number(argv[++i]);
     else if (arg === "--from") flags.from = argv[++i];
     else if (arg === "--refresh") flags.refresh = true;
+    else if (arg === "--write") flags.write = true;
     else if (arg === "--cleanup") flags.cleanup = true;
     else if (arg === "--release-gate") flags.releaseGate = true;
     else if (arg === "--help" || arg === "-h") flags.help = true;
