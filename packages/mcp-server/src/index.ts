@@ -21,6 +21,7 @@ import {
 import { encryptPayload, signEnvelope } from "@murmurv2/security";
 import { NatsBroker, type BrokerSubscription } from "@murmurv2/broker-nats";
 import { buildReplyMatcher, waitForReply } from "./request-reply.js";
+import { assertRouting, commitOutbound, resolveProfileIdentity } from "./outbound.js";
 
 interface JsonRpcRequest {
   jsonrpc: "2.0";
@@ -53,6 +54,15 @@ interface AgentConfig {
 const dataDir = process.env.DATA_DIR || ".data";
 const configPath = path.join(dataDir, "agent-config.json");
 const dbPath = process.env.MURMUR_STORE_PATH ?? path.join(dataDir, "murmur.db");
+// The profile this server writes to, resolved once and reported in every send receipt.
+const profileIdentity = resolveProfileIdentity(dataDir);
+const requireProjectProfile = ["1", "true", "yes", "on"].includes((process.env.MURMUR_REQUIRE_PROJECT_PROFILE ?? "").trim().toLowerCase());
+const requestedProject = (args: Record<string, unknown>): string | undefined => {
+  if (args.projectId === undefined) return undefined;
+  const value = String(args.projectId).trim();
+  if (!value) throw new Error("'projectId' must be non-empty");
+  return value;
+};
 const channelRosterPath = process.env.MURMUR_CHANNEL_ROSTER_PATH ?? path.join(dataDir, "channel-roster.db");
 
 const readPrivateAgentConfig = (filePath: string): AgentConfig => {
@@ -257,6 +267,7 @@ const handleTool = async (name: string, args: Record<string, unknown>): Promise<
     const text = String(args.text ?? "").trim();
     if (!text) throw new Error("'text' is required");
 
+    assertRouting(profileIdentity, { requestedProjectId: requestedProject(args), requireProject: requireProjectProfile });
     const peer = agentConfig.peers[to];
     if (!peer) throw new Error(`unknown peer: ${to} — add to peers in agent-config.json`);
 
@@ -294,22 +305,9 @@ const handleTool = async (name: string, args: Record<string, unknown>): Promise<
       agentConfig.keys.signing.privateKey,
     );
 
-    // Enqueue to outbox — daemon will flush to NATS
-    await outbox.enqueue(peer.subject, envelope);
-
-    // Store outbound copy in message store
-    await store.append({
-      conversationId,
-      msgId,
-      ...(replyToMessageId ? { replyToMessageId } : {}),
-      direction: "outbound",
-      sender: agentConfig.agentId,
-      text,
-      createdAt: envelope.createdAt,
-      transport: "nats",
-    });
-
-    return { msgId, to, conversationId, ...(replyToMessageId ? { replyToMessageId } : {}), status: "queued" };
+    // Commit to the outbox (the daemon flushes it to NATS) and read the row back. Only a
+    // verified commit may be reported as queued.
+    return commitOutbound({ outbox, store, profile: profileIdentity, subject: peer.subject, envelope, text });
   }
 
   if (name === "murmur_inbox") {
@@ -334,6 +332,7 @@ const handleTool = async (name: string, args: Record<string, unknown>): Promise<
     const text = String(args.text ?? "").trim();
     if (!text) throw new Error("'text' is required");
 
+    assertRouting(profileIdentity, { requestedProjectId: requestedProject(args), requireProject: requireProjectProfile });
     const peer = agentConfig.peers[to];
     if (!peer) throw new Error(`unknown peer: ${to} — add to peers in agent-config.json`);
 
@@ -369,19 +368,8 @@ const handleTool = async (name: string, args: Record<string, unknown>): Promise<
       agentConfig.keys.signing.privateKey,
     );
 
-    // Enqueue to outbox
-    await outbox.enqueue(peer.subject, envelope);
-
-    // Store outbound copy
-    await store.append({
-      conversationId,
-      msgId,
-      direction: "outbound",
-      sender: agentConfig.agentId,
-      text,
-      createdAt: sentAt,
-      transport: "nats",
-    });
+    // Commit to the outbox and verify it before waiting on a reply to it.
+    await commitOutbound({ outbox, store, profile: profileIdentity, subject: peer.subject, envelope, text });
 
     // Wait for the reply. Store polling is the durable fallback and always runs;
     // an optional read-only NATS tap on our own subject accelerates the wait by
@@ -591,7 +579,7 @@ const tools = [
   {
     name: "murmur_send",
     description:
-      "Send an encrypted, signed message to another agent via NATS. Message is queued in outbox and delivered by murmur-daemon.",
+      "Send an encrypted, signed message to another agent via NATS. Returns status=queued with durable=true only after the message is committed to (and read back from) this profile's outbox; the receipt names the profile, project and recipient. Delivered by murmur-daemon.",
     inputSchema: {
       type: "object",
       properties: {
@@ -599,6 +587,7 @@ const tools = [
         text: { type: "string", description: "Message text (will be encrypted)" },
         conversationId: { type: "string", description: "Optional conversation ID" },
         replyToMessageId: { type: "string", description: "Exact msgId this message replies to" },
+        projectId: { type: "string", description: "Optional: the Murmur project this send must belong to. Refused if this MCP server is bound to a different project or to a legacy profile." },
       },
       required: ["to", "text"],
     },
@@ -615,6 +604,7 @@ const tools = [
         conversationId: { type: "string", description: "Optional conversation ID" },
         timeout_ms: { type: "number", description: "Max wait time in ms (default: 300000 = 5 min)" },
         poll_interval_ms: { type: "number", description: "Store-poll fallback interval in ms (default: 10000 = 10s)" },
+        projectId: { type: "string", description: "Optional: the Murmur project this request must belong to (refused on mismatch or a legacy profile)" },
         grace_ms: { type: "number", description: "Delay after a wake signal before re-checking the store, to let the daemon persist (default: 250)" },
       },
       required: ["to", "text"],
@@ -644,8 +634,36 @@ const tools = [
 // --- JSON-RPC stdio loop ---
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 
+// Session-scoped: this process belongs to exactly one MCP client connection. When that
+// connection ends (stdin EOF) it must not linger holding a NATS tap / SQLite handles.
+let inFlight = 0;
+const SHUTDOWN_DRAIN_MS = 30_000;
+rl.on("close", () => {
+  // Let a call that was already accepted finish (a send must not be cut between "accepted"
+  // and "committed"), but never wait forever on a client that is gone.
+  const deadline = Date.now() + SHUTDOWN_DRAIN_MS;
+  void (async () => {
+    while (inFlight > 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    try {
+      await wakeBroker?.close();
+    } catch {
+      // best effort — the process is exiting
+    }
+    process.exit(0);
+  })();
+});
+
 rl.on("line", async (line) => {
   if (!line.trim()) return;
+  inFlight += 1;
+  try {
+    await handleLine(line);
+  } finally {
+    inFlight -= 1;
+  }
+});
+
+const handleLine = async (line: string): Promise<void> => {
 
   let req: JsonRpcRequest;
   try {
@@ -683,4 +701,4 @@ rl.on("line", async (line) => {
   } catch (err) {
     fail(req.id, err instanceof Error ? err.message : "request failed");
   }
-});
+};

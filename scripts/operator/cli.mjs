@@ -38,6 +38,7 @@ import {
 import { commandClaude } from "./claude.mjs";
 import { commandWork } from "./work.mjs";
 import { commandUsage } from "./usage.mjs";
+import { commandChannels } from "./channel-servers.mjs";
 import { commandCodex } from "./codex-model.mjs";
 import { commandCursor } from "./cursor.mjs";
 import { commandNotify } from "./notify.mjs";
@@ -109,6 +110,7 @@ Usage:
   murmur logs    <project> [supervisor|root|claude|codex|cursor|codex-app-server] [-n <lines>] [--follow]
   murmur send    <project> "<task>" [--timeout <seconds>] [--no-wait] [--release-gate]
   murmur projects [--json]
+  murmur channels [--json] [--cleanup]
   murmur claude   <project> config [--json] [--refresh] | model <id|inherit> | effort <level>
   murmur codex    <project> config [--json] [--refresh] | model <id|inherit> | effort <level>
   murmur tasks    <project> [--json]
@@ -147,6 +149,7 @@ export const parseArgs = (argv) => {
     else if (arg === "--timeout") flags.timeoutSeconds = Number(argv[++i]);
     else if (arg === "--from") flags.from = argv[++i];
     else if (arg === "--refresh") flags.refresh = true;
+    else if (arg === "--cleanup") flags.cleanup = true;
     else if (arg === "--release-gate") flags.releaseGate = true;
     else if (arg === "--help" || arg === "-h") flags.help = true;
     else if (arg === "--version" || arg === "-v") flags.version = true;
@@ -817,7 +820,8 @@ const commandStart = async ({ args, flags }) => {
     out("");
   }
 
-  const results = await runDiagnostics({ projectPath, projectId, paths });
+  // `start` preflight is about this project; the host-wide process scan is `doctor`/`channels`.
+  const results = await runDiagnostics({ projectPath, projectId, paths, includeChannelServers: false });
   if (hasFatal(results)) {
     err("murmur: preflight failed — nothing was started.");
     err("");
@@ -974,7 +978,7 @@ const commandStatus = async ({ args, flags }) => {
   }
   out("");
   out(`Open continuations: ${status.totals.openContinuations}`);
-  out(`Dispatches:         active=${status.totals.activeDispatch} pending=${status.totals.pendingDispatch}`);
+  out(`Dispatches:         active=${status.totals.activeDispatch} pending=${status.totals.pendingDispatch}${status.totals.unretiredDispatch ? ` unretired=${status.totals.unretiredDispatch} (claimed by a runtime that is gone or idle; not active work)` : ""}`);
   if (!status.healthy) {
     out("");
     out(`UNHEALTHY: ${status.problems.join("; ")}`);
@@ -1365,6 +1369,7 @@ const COMMANDS = {
   notify: (parsed) => commandNotify({ ...parsed, out, err }),
   claude: (parsed) => commandClaude({ ...parsed, out, err }),
   codex: (parsed) => commandCodex({ ...parsed, out, err }),
+  channels: (parsed) => commandChannels({ ...parsed, out, err }),
   usage: (parsed) => commandUsage({ ...parsed, out, err }),
   tasks: (parsed) => commandWork({ ...parsed, command: "tasks", out, err }),
   task: (parsed) => commandWork({ ...parsed, command: "task", out, err }),
@@ -1376,7 +1381,7 @@ const COMMANDS = {
  * Commands that operate on the USER's Murmur state rather than on one project, and so
  * must not be rejected for a missing `<project>`.
  */
-const PROJECTLESS_COMMANDS = new Set(["notify", "projects"]);
+const PROJECTLESS_COMMANDS = new Set(["notify", "projects", "channels"]);
 
 export const run = async (argv = process.argv.slice(2)) => {
   let parsed;

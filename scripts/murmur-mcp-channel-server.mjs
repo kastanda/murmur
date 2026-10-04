@@ -11,6 +11,7 @@ import {
   verifyEnvelopeSignature,
 } from "../packages/security/dist/src/index.js";
 import { readPrivateJson, setPrivateUmask } from "./secure-state.mjs";
+import { watchOwner } from "./channel-server-lifecycle.mjs";
 
 setPrivateUmask();
 
@@ -252,6 +253,13 @@ const shutdown = async (signal) => {
   }
   process.exit(0);
 };
+
+// Session-scoped lifetime: stdin EOF ends a normal session; this covers an owner that died
+// while the pipe stayed open elsewhere. Never an idle timeout (see channel-server-lifecycle.mjs).
+watchOwner({
+  intervalMs: envNum("MURMUR_MCP_OWNER_POLL_MS", 5000),
+  onOwnerGone: (reason) => void shutdown(reason),
+});
 
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
 process.on("SIGINT", () => void shutdown("SIGINT"));

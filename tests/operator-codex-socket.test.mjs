@@ -173,7 +173,7 @@ test("C. an alias whose target is missing is unhealthy, but not a broken profile
     assert.match(probe.reason, /^socket-alias-broken:/);
 
     // doctor must not report "no socket present" for a dangling alias.
-    const results = await runDiagnostics({ projectPath: ctx.projectPath, projectId: ctx.projectId, paths: ctx.paths });
+    const results = await runDiagnostics({ projectPath: ctx.projectPath, projectId: ctx.projectId, paths: ctx.paths, includeChannelServers: false });
     const socketCheck = results.find((entry) => entry.name === "codex-socket");
     assert.ok(["WARN", "FAIL"].includes(socketCheck.status), JSON.stringify(socketCheck));
     assert.equal(socketCheck.detail.includes("no socket present"), false, socketCheck.detail);
@@ -199,7 +199,7 @@ test("D. an alias resolving to a regular file is rejected as unhealthy", async (
     assert.equal(probe.ok, false);
     assert.equal(probe.reason, "socket-alias-not-a-socket");
 
-    const results = await runDiagnostics({ projectPath: ctx.projectPath, projectId: ctx.projectId, paths: ctx.paths });
+    const results = await runDiagnostics({ projectPath: ctx.projectPath, projectId: ctx.projectId, paths: ctx.paths, includeChannelServers: false });
     const socketCheck = results.find((entry) => entry.name === "codex-socket");
     assert.equal(socketCheck.status, "FAIL", JSON.stringify(socketCheck));
     assert.match(socketCheck.detail, /resolves to a file, not a socket/);
@@ -288,7 +288,7 @@ test("G. a pre-existing foreign alias to a live socket blocks the start and is n
     assert.equal(existsSync(alias.target), true, "and so is its target");
 
     // doctor calls it out instead of accepting it as ours just because it resolves to a socket.
-    const results = await runDiagnostics({ projectPath: ctx.projectPath, projectId: ctx.projectId, paths: ctx.paths });
+    const results = await runDiagnostics({ projectPath: ctx.projectPath, projectId: ctx.projectId, paths: ctx.paths, includeChannelServers: false });
     const socketCheck = results.find((entry) => entry.name === "codex-socket");
     assert.equal(socketCheck.status, "FAIL");
     assert.match(socketCheck.detail, /no Murmur supervisor owns it/);
@@ -352,7 +352,7 @@ test("I. doctor reports a running alias as owned and healthy", async () => {
       supervisor: { pid: process.pid, startIdentity: readStartIdentity(process.pid) },
       children: {},
     });
-    const results = await runDiagnostics({ projectPath: ctx.projectPath, projectId: ctx.projectId, paths: ctx.paths });
+    const results = await runDiagnostics({ projectPath: ctx.projectPath, projectId: ctx.projectId, paths: ctx.paths, includeChannelServers: false });
     const socketCheck = results.find((entry) => entry.name === "codex-socket");
     assert.equal(socketCheck.status, "PASS", JSON.stringify(socketCheck));
     assert.match(socketCheck.detail, /owned by the running supervisor \(socket alias\)/);

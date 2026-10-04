@@ -6,6 +6,7 @@
  * token, or the contents of an agent config. `fatal: true` means `murmur start` refuses
  * before touching any process.
  */
+import { listChannelServers, summarizeChannelServers } from "./channel-servers.mjs";
 import { execFile } from "node:child_process";
 import { accessSync, constants, existsSync, statSync } from "node:fs";
 import os from "node:os";
@@ -588,12 +589,24 @@ export const runDiagnostics = async ({
   includeNats = true,
   includeTools = true,
   includeNotifications = true,
+  // Host-wide, read-only process inspection. Injectable; `false` skips it entirely.
+  includeChannelServers = true,
+  channelServers = listChannelServers,
   // The notification config lives in the SAME Murmur home as the profiles being
   // diagnosed, so it is derived from `paths` rather than re-read from the ambient
   // environment. A diagnostic run against one home can never inspect another's.
   notifyHome = paths?.home,
 } = {}) => {
   const results = [];
+  const channelCheck = () => {
+    if (!includeChannelServers) return [];
+    try {
+      const summary = summarizeChannelServers(channelServers({ env }));
+      return [check("channel-servers", summary.status, summary.detail)];
+    } catch (err) {
+      return [check("channel-servers", WARN, `cannot inspect processes (${err?.code || err?.message})`)];
+    }
+  };
 
   try {
     const stats = statSync(projectPath);
@@ -623,6 +636,7 @@ export const runDiagnostics = async ({
     // host-level prerequisites are exactly what the operator needs to know BEFORE the
     // first `murmur start`.
     if (includeNotifications) results.push(...await checkNotifications({ env, home: notifyHome }));
+    results.push(...channelCheck());
     if (includeNats) results.push(await checkNats({ natsUrl: DEFAULT_NATS_URL, connectImpl }));
     if (includeTools) {
       results.push(...await checkTools({
@@ -649,6 +663,7 @@ export const runDiagnostics = async ({
   results.push(...await checkCodexSocket({ project, paths, socketProbe }));
   results.push(...await checkSupervisor({ paths }));
   if (includeNotifications) results.push(...await checkNotifications({ project, paths, env, home: notifyHome }));
+  results.push(...channelCheck());
 
   if (includeNats) results.push(await checkNats({ natsUrl: project.natsUrl, natsToken: project.natsToken, connectImpl }));
 

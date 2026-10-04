@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { DatabaseSync } from "node:sqlite";
 import { AgentHandoffStore } from "../scripts/agent-handoff-store.mjs";
 import { RuntimeBindingStore } from "../scripts/runtime-binding-store.mjs";
 import { WakeDispatchStore } from "../scripts/wake-dispatch-store.mjs";
@@ -12,6 +13,7 @@ import { projectIdFor, projectPathsFor } from "../scripts/operator/project.mjs";
 import { readStartIdentity } from "../scripts/operator/proc.mjs";
 import { writeRunState } from "../scripts/operator/runstate.mjs";
 import { collectStatus, readAgentRuntimeState } from "../scripts/operator/status.mjs";
+import { buildWorkSnapshot, collectWorkRecords } from "../scripts/operator/work.mjs";
 
 const shortTmp = () => (existsSync("/tmp") ? "/tmp" : os.tmpdir());
 const NOW = 1_700_000_000_000;
@@ -222,6 +224,90 @@ test("a stale binding heartbeat makes the project unhealthy even while the daemo
       proc.child.kill("SIGKILL");
       await proc.exited;
     }
+    ctx.cleanup();
+  }
+});
+
+// ---- dispatch accounting: "active" is work a runtime is verifiably doing NOW ------------
+
+const setDispatch = (dbPath, msgId, { state, ownerBindingId = null, updatedAt = NOW }) => {
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.prepare("UPDATE wake_dispatch SET state = ?, owner_binding_id = ?, updated_at = ? WHERE msg_id = ?").run(state, ownerBindingId, updatedAt, msgId);
+  } finally {
+    db.close();
+  }
+};
+const setBinding = (dbPath, bindingId, { state, heartbeatAt = NOW }) => {
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.prepare("UPDATE runtime_bindings SET state = ?, last_heartbeat = ? WHERE binding_id = ?").run(state, heartbeatAt, bindingId);
+  } finally {
+    db.close();
+  }
+};
+
+test("dispatch accounting: claimed/dispatched rows whose runtime is gone or idle are unretired, never active", async () => {
+  const ctx = await setup();
+  try {
+    seedAgentStore(ctx.paths, ctx.project, "claude", { dispatches: 6 });
+    const db = ctx.paths.agentDbFile("claude");
+    const agentId = ctx.project.agents.find((entry) => entry.name === "claude").agentId;
+    // 0: owner is RUNNING with a fresh heartbeat -> genuinely active
+    setBinding(db, "claude-binding", { state: "RUNNING", heartbeatAt: NOW });
+    setDispatch(db, "msg-claude-0", { state: "dispatched", ownerBindingId: "claude-binding" });
+    // 1: the owner binding no longer exists (crash/restart left the row behind) -> unretired
+    setDispatch(db, "msg-claude-1", { state: "dispatched", ownerBindingId: "binding-from-a-dead-runtime" });
+    // 2: terminal -> neither active nor pending
+    setDispatch(db, "msg-claude-2", { state: "terminal" });
+    // 3: claimed, no owner yet, seconds old -> still in flight
+    setDispatch(db, "msg-claude-3", { state: "claimed", updatedAt: NOW - 5_000 });
+    // 4: claimed, no owner, a day old -> unretired
+    setDispatch(db, "msg-claude-4", { state: "claimed", updatedAt: NOW - 86_400_000 });
+    // 5 stays pending
+    const state = readAgentRuntimeState(db, agentId, { now: NOW + 1_000 });
+    assert.equal(state.dispatch.active, 2, "RUNNING-owned + fresh unowned claim");
+    assert.equal(state.dispatch.unretired, 2, "dead-owner + day-old claim");
+    assert.equal(state.dispatch.pending, 1);
+    assert.equal(state.dispatch.byState.terminal, 1, "raw per-state counts are preserved");
+    assert.equal(state.dispatch.byState.dispatched, 2);
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+test("dispatch accounting: an idle or stale-heartbeat owner does not make a row active", async () => {
+  const ctx = await setup();
+  try {
+    seedAgentStore(ctx.paths, ctx.project, "claude", { dispatches: 2 });
+    const db = ctx.paths.agentDbFile("claude");
+    const agentId = ctx.project.agents.find((entry) => entry.name === "claude").agentId;
+    setDispatch(db, "msg-claude-0", { state: "dispatched", ownerBindingId: "claude-binding" });
+    setDispatch(db, "msg-claude-1", { state: "dispatched", ownerBindingId: "claude-binding" });
+    setBinding(db, "claude-binding", { state: "BOUND_IDLE", heartbeatAt: NOW });
+    let state = readAgentRuntimeState(db, agentId, { now: NOW + 1_000 });
+    assert.deepEqual([state.dispatch.active, state.dispatch.unretired], [0, 2], "idle owner: nothing is being worked");
+    setBinding(db, "claude-binding", { state: "RUNNING", heartbeatAt: NOW });
+    state = readAgentRuntimeState(db, agentId, { now: NOW + 10 * 60_000 });
+    assert.deepEqual([state.dispatch.active, state.dispatch.unretired], [0, 2], "a RUNNING owner whose heartbeat is stale is not alive");
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+test("the operator task view stays independent of unretired internal dispatch rows", async () => {
+  const ctx = await setup();
+  try {
+    seedAgentStore(ctx.paths, ctx.project, "claude", { dispatches: 3 });
+    const db = ctx.paths.agentDbFile("claude");
+    for (let i = 0; i < 3; i += 1) setDispatch(db, `msg-claude-${i}`, { state: "dispatched", ownerBindingId: "gone" });
+    const records = collectWorkRecords({ project: ctx.project, paths: ctx.paths, now: NOW + 1_000 });
+    const snapshot = buildWorkSnapshot(records, { projectName: "p", now: NOW + 1_000 });
+    assert.equal(snapshot.summary.active, 0, "internal rows are not operator work");
+    assert.equal(snapshot.tasks.length, 0);
+    const state = readAgentRuntimeState(db, ctx.project.agents.find((entry) => entry.name === "claude").agentId, { now: NOW + 1_000 });
+    assert.deepEqual([state.dispatch.active, state.dispatch.unretired], [0, 3], "and status agrees: nothing active");
+  } finally {
     ctx.cleanup();
   }
 });

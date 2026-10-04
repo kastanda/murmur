@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Channel durability and lifecycle
+
+- `murmur_send` / `murmur_request`: `status: "queued"` now means `durable: true` — the outbox
+  row is committed and read back before it is claimed; failures are errors. Receipts name the
+  profile, project, sender, recipient and conversation (no secrets).
+- Explicit routing: optional `projectId`, `profile-mismatch` for the wrong project or a legacy
+  profile, `MURMUR_REQUIRE_PROJECT_PROFILE`.
+- MCP servers exit with their session; the channel server also exits when its owner is gone.
+- `murmur channels [--cleanup]` and a `channel-servers` doctor line (evidence-based; age is
+  never a reason to kill).
+- `murmur status`: `Dispatches` splits `active` from `unretired`; stale claimed/dispatched rows
+  are no longer shown as active. See docs/channel-lifecycle.md.
+
 ### Pending
 - **NATS transport security (TLS + per-peer auth)** — reviewed and CI-green in #103, held for a coordinated broker/peer credential cutover. It intentionally makes existing non-loopback `nats://` configurations fail closed, so it ships with a maintenance window, not as a routine merge. Two gaps to close first: the Kubernetes ACL example does not cover JetStream subjects (`$JS.API.*`, `$JS.ACK.*`, `_INBOX.*`), and the dashboard's NATS client supports a token only, no user/password or CA.
 - **Turning on `ackSecurity.requireSigned`** — a rollout step, not a code step. Until every peer runs 2.5.0+ and the flag is set, unsigned ACKs are still accepted.

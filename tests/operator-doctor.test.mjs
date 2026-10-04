@@ -65,6 +65,8 @@ const setup = async () => {
         connectImpl: okConnect,
         run: authedTools,
         socketProbe: async () => ({ ok: false, reason: "socket-absent" }),
+        // Hermetic: never read this host's real process table.
+        includeChannelServers: false,
         ...overrides,
       }),
   };
@@ -297,6 +299,7 @@ test("a profile that would live inside the repository is refused", async () => {
       env: ctx.env,
       connectImpl: okConnect,
       run: authedTools,
+      includeChannelServers: false,
     });
     const check = byName(results, "state-location");
     assert.equal(check.status, FAIL);

@@ -445,7 +445,7 @@ export const commandWork = async ({ command, args, flags, out, err, env = proces
   // The intent must be in EVERY agent database for every gate to see it. A partial write is NOT
   // reported as success: the intent is idempotent, so the operator simply retries.
   if (failures.length > 0) return fail(1, failures.length === attempted ? "cancel-not-recorded" : "cancel-partially-recorded", { detail: failures });
-  const after = detailFor(collectWorkRecords({ project, paths, now: Date.now() }), workflowId, Date.now());
+  const after = detailFor(collectWorkRecords({ project, paths, now }), workflowId, now);
   const result = {
     ok: true,
     workflowId,

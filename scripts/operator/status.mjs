@@ -13,7 +13,11 @@ import { LOCK_FREE, launchGuardReclaimable, launchGuardState, readRunState } fro
 import { CODEX_APP_SERVER_CHILD, probeUnixSocket } from "./supervisor.mjs";
 
 const LIVE_BINDING_STATES = new Set(["STARTING", "BOUND_IDLE", "CLAIMED", "WAKING", "RUNNING"]);
-const ACTIVE_DISPATCH_STATES = new Set(["claimed", "dispatched"]);
+// An owner binding in one of these states is doing (or about to do) the work. BOUND_IDLE /
+// OFFLINE / STOPPED / absent mean nobody is working on the row, whatever the row still says.
+const WORKING_BINDING_STATES = new Set(["CLAIMED", "WAKING", "RUNNING"]);
+// A claim that has no owner yet (claimed, not yet dispatched) is in flight only briefly.
+const UNOWNED_CLAIM_GRACE_MS = 10 * 60_000;
 const PENDING_DISPATCH_STATES = new Set(["pending", "deferred", "failed"]);
 
 const queryAll = (db, sql, params = []) => {
@@ -55,12 +59,32 @@ export const readAgentRuntimeState = (dbPath, agentId, { now = Date.now() } = {}
       metadata: metadataJson ? JSON.parse(metadataJson) : null,
     }));
 
+    // `active` is work some runtime is verifiably doing NOW. A `claimed`/`dispatched` row whose
+    // owner is gone or idle is `unretired`: an internal record that outlived its runtime
+    // (crash, restart, a turn whose outcome was never reconciled). It is reported, never
+    // presented as active operator work. `byState` stays the raw row count by state.
     const dispatchRows = queryAll(db, "SELECT state, COUNT(*) AS n FROM wake_dispatch GROUP BY state") || [];
-    const dispatch = { active: 0, pending: 0, byState: {} };
+    const dispatch = { active: 0, pending: 0, unretired: 0, byState: {} };
     for (const row of dispatchRows) {
       dispatch.byState[row.state] = Number(row.n);
-      if (ACTIVE_DISPATCH_STATES.has(row.state)) dispatch.active += Number(row.n);
       if (PENDING_DISPATCH_STATES.has(row.state)) dispatch.pending += Number(row.n);
+    }
+    const heldRows = queryAll(
+      db,
+      `SELECT d.owner_binding_id AS ownerBindingId, d.updated_at AS updatedAt,
+              b.state AS bindingState, b.last_heartbeat AS lastHeartbeat, b.lease_ttl_ms AS leaseTtlMs
+         FROM wake_dispatch d LEFT JOIN runtime_bindings b ON b.binding_id = d.owner_binding_id
+        WHERE d.state IN ('claimed', 'dispatched')`,
+    ) || [];
+    for (const row of heldRows) {
+      const owned = row.ownerBindingId != null;
+      const working = owned
+        ? WORKING_BINDING_STATES.has(row.bindingState)
+          && Number.isFinite(Number(row.lastHeartbeat))
+          && now - Number(row.lastHeartbeat) <= Number(row.leaseTtlMs || 30_000)
+        : Number.isFinite(Number(row.updatedAt)) && now - Number(row.updatedAt) <= UNOWNED_CLAIM_GRACE_MS;
+      if (working) dispatch.active += 1;
+      else dispatch.unretired += 1;
     }
 
     const handoffRows = queryAll(db, "SELECT COUNT(*) AS n FROM agent_handoffs WHERE state = 'open'");
@@ -150,8 +174,9 @@ export const collectStatus = async ({
       openContinuations: acc.openContinuations + (agent.openContinuations || 0),
       activeDispatch: acc.activeDispatch + (agent.dispatch?.active || 0),
       pendingDispatch: acc.pendingDispatch + (agent.dispatch?.pending || 0),
+      unretiredDispatch: acc.unretiredDispatch + (agent.dispatch?.unretired || 0),
     }),
-    { openContinuations: 0, activeDispatch: 0, pendingDispatch: 0 },
+    { openContinuations: 0, activeDispatch: 0, pendingDispatch: 0, unretiredDispatch: 0 },
   );
 
   // An unresolved launch is its own fail-closed condition, independent of the supervisor
