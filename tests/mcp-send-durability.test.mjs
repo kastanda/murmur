@@ -124,7 +124,7 @@ const makeProfile = async (dir, { agentId = "a", peers = ["b"], projectId = null
 const startServer = (dir, extraEnv = {}) => {
   const proc = spawn(process.execPath, [SERVER], {
     cwd: process.cwd(),
-    env: { ...process.env, DATA_DIR: dir, MURMUR_STORE_PATH: path.join(dir, "murmur.db"), MURMUR_CHANNEL_ROSTER_PATH: path.join(dir, "channel-roster.db"), ...extraEnv },
+    env: { ...process.env, MURMUR_ALLOW_LEGACY_PROFILE: "1", DATA_DIR: dir, MURMUR_STORE_PATH: path.join(dir, "murmur.db"), MURMUR_CHANNEL_ROSTER_PATH: path.join(dir, "channel-roster.db"), ...extraEnv },
     stdio: ["pipe", "pipe", "pipe"],
   });
   let buffer = "";

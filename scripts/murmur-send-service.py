@@ -69,6 +69,7 @@ def send(payload: dict) -> dict:
 
     env = os.environ.copy()
     env["DATA_DIR"] = DATA_DIR
+    env["MURMUR_ALLOW_LEGACY_PROFILE"] = "1"  # this service is a deliberate legacy-profile sender
     proc = subprocess.run(
         ["node", SEND_SCRIPT, "--to", payload["to"], "--conv", payload["conversation_id"], "--stdin"],
         input=payload["text"],

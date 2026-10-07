@@ -242,6 +242,8 @@ function sendMurmur(args, inbound, replyText) {
   const env = {
     ...process.env,
     DATA_DIR: path.dirname(args.db),
+    // A reply stays in the profile that received the request, whatever kind it is.
+    MURMUR_ALLOW_LEGACY_PROFILE: "1",
   };
   try {
     writeFileSync(replyFile, replyText, { mode: 0o600 });

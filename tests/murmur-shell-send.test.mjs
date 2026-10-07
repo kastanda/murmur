@@ -15,7 +15,7 @@ const script = path.join(repoRoot, "scripts", "murmur-shell-send.mjs");
 
 const runShellSend = (args, env = {}) => spawnSync(process.execPath, [script, ...args], {
   cwd: repoRoot,
-  env: { ...process.env, ...env },
+  env: { ...process.env, MURMUR_ALLOW_LEGACY_PROFILE: "1", ...env },
   encoding: "utf8",
 });
 

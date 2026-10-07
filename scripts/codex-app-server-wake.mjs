@@ -1,4 +1,5 @@
 import WebSocket from "ws";
+import { classifyProfile } from "./legacy-profile-guard.mjs";
 import { buildChannelThreadStartBinding } from "@murmurv2/core";
 import { execFile } from "node:child_process";
 import { closeSync, mkdtempSync, openSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -42,6 +43,8 @@ const buildReplyHint = (payload, peer = {}) => {
   const command = [
     `cd ${shellQuote(murmurRoot)}`,
     `DATA_DIR=${shellQuote(dataDir)}`,
+    // A reply stays in the profile that received the request; a legacy one needs the explicit opt-in.
+    ...(classifyProfile(dataDir).kind === "legacy" ? ["MURMUR_ALLOW_LEGACY_PROFILE=1"] : []),
     `MURMUR_STORE_PATH=${shellQuote(storePath)}`,
     "node scripts/murmur-shell-send.mjs",
     `--to ${shellQuote(payload.from)}`,
@@ -527,6 +530,7 @@ const sendRelayReply = (peer = {}, payload = {}, finalText = "") => new Promise(
         ...process.env,
         DATA_DIR: peer.dataDir,
         MURMUR_STORE_PATH: peer.storePath,
+        MURMUR_ALLOW_LEGACY_PROFILE: "1",
       },
       timeout: 30000,
     },

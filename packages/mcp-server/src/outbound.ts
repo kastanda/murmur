@@ -13,7 +13,7 @@
  *
  * Nothing here reads or returns key material, tokens or message text.
  */
-import { realpathSync } from "node:fs";
+import { readdirSync, readFileSync, realpathSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import os from "node:os";
 import path from "node:path";
@@ -67,17 +67,59 @@ export const resolveProfileIdentity = (
 };
 
 /**
+ * The modern project whose directory contains `cwd`, from `$MURMUR_HOME/projects/<id>/project.json`
+ * (`projectPath`). An MCP client starts its servers in the session's working directory, so a
+ * LEGACY-bound server running inside a registered project is the shadowing misconfiguration
+ * (`claude mcp add murmur -e DATA_DIR=<repo>/.data-claude`) that sends project work to the wrong profile.
+ */
+export const modernProjectForCwd = (
+  cwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+  homeDir: string = os.homedir(),
+): string | null => {
+  const here = canonicalPath(cwd);
+  const root = path.join(canonicalPath(env.MURMUR_HOME?.trim() || path.join(homeDir, ".murmur")), "projects");
+  let ids: string[];
+  try {
+    ids = readdirSync(root);
+  } catch {
+    return null;
+  }
+  for (const id of ids) {
+    try {
+      const projectPath = JSON.parse(readFileSync(path.join(root, id, "project.json"), "utf8")).projectPath;
+      if (typeof projectPath !== "string" || !projectPath) continue;
+      const base = canonicalPath(projectPath);
+      if (here === base || here.startsWith(`${base}${path.sep}`)) return id;
+    } catch {
+      // not a project profile directory
+    }
+  }
+  return null;
+};
+
+/**
  * Refuse a send that this server's profile must not carry.
  *  - `requestedProjectId` (tool argument) must equal this profile's project. A legacy
  *    profile belongs to no project, so it can never satisfy a project-scoped send.
  *  - `MURMUR_REQUIRE_PROJECT_PROFILE=1` forbids legacy-profile sends altogether.
+ *  - A legacy profile running inside a registered modern project (`cwdProjectId`) is refused
+ *    unless the operator opted in with `allowLegacy`.
  */
 export const assertRouting = (
   profile: ProfileIdentity,
-  { requestedProjectId, requireProject }: { requestedProjectId?: string; requireProject?: boolean },
+  { requestedProjectId, requireProject, cwdProjectId, allowLegacy }: {
+    requestedProjectId?: string;
+    requireProject?: boolean;
+    cwdProjectId?: string | null;
+    allowLegacy?: boolean;
+  },
 ): void => {
   if (requireProject && profile.kind !== "project") {
     throw new OutboundError("legacy-profile-rejected", "this MCP server is bound to a legacy (project-less) profile and the operator requires a project profile");
+  }
+  if (profile.kind !== "project" && cwdProjectId && !allowLegacy) {
+    throw new OutboundError("legacy-profile-in-project", `this MCP server is bound to a legacy profile but runs inside project ${cwdProjectId}; bind it to that project's profile (murmur claude <project> mcp-config) or set MURMUR_ALLOW_LEGACY_PROFILE=1`);
   }
   if (requestedProjectId === undefined) return;
   if (profile.kind !== "project") {

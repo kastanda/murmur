@@ -22,7 +22,7 @@ import { encryptPayload, signEnvelope } from "@murmurv2/security";
 import { NatsBroker, type BrokerSubscription } from "@murmurv2/broker-nats";
 import { buildReplyMatcher, waitForReply } from "./request-reply.js";
 import {
-  assertProfileBinding, assertRouting, commitOutbound, createMcpReplyOwnership, resolveProfileIdentity,
+  assertProfileBinding, assertRouting, commitOutbound, modernProjectForCwd, createMcpReplyOwnership, resolveProfileIdentity,
   type ReplyOwnershipRecorder,
 } from "./outbound.js";
 
@@ -61,6 +61,13 @@ const dbPath = process.env.MURMUR_STORE_PATH ?? path.join(dataDir, "murmur.db");
 // The profile this server writes to, resolved once and reported in every send receipt.
 const profileIdentity = resolveProfileIdentity(dataDir);
 const requireProjectProfile = ["1", "true", "yes", "on"].includes((process.env.MURMUR_REQUIRE_PROJECT_PROFILE ?? "").trim().toLowerCase());
+const allowLegacyProfile = ["1", "true", "yes", "on"].includes((process.env.MURMUR_ALLOW_LEGACY_PROFILE ?? "").trim().toLowerCase());
+const routingOptions = (args: Record<string, unknown>) => ({
+  requestedProjectId: requestedProject(args),
+  requireProject: requireProjectProfile,
+  allowLegacy: allowLegacyProfile,
+  cwdProjectId: profileIdentity.kind === "legacy" && !allowLegacyProfile ? modernProjectForCwd(process.cwd()) : null,
+});
 const requestedProject = (args: Record<string, unknown>): string | undefined => {
   if (args.projectId === undefined) return undefined;
   const value = String(args.projectId).trim();
@@ -273,7 +280,7 @@ const handleTool = async (name: string, args: Record<string, unknown>): Promise<
     const text = String(args.text ?? "").trim();
     if (!text) throw new Error("'text' is required");
 
-    assertRouting(profileIdentity, { requestedProjectId: requestedProject(args), requireProject: requireProjectProfile });
+    assertRouting(profileIdentity, routingOptions(args));
     assertProfileBinding(profileIdentity, { config: agentConfig, storePath: dbPath });
     const peer = agentConfig.peers[to];
     if (!peer) throw new Error(`unknown peer: ${to} — add to peers in agent-config.json`);
@@ -339,7 +346,7 @@ const handleTool = async (name: string, args: Record<string, unknown>): Promise<
     const text = String(args.text ?? "").trim();
     if (!text) throw new Error("'text' is required");
 
-    assertRouting(profileIdentity, { requestedProjectId: requestedProject(args), requireProject: requireProjectProfile });
+    assertRouting(profileIdentity, routingOptions(args));
     assertProfileBinding(profileIdentity, { config: agentConfig, storePath: dbPath });
     const peer = agentConfig.peers[to];
     if (!peer) throw new Error(`unknown peer: ${to} — add to peers in agent-config.json`);

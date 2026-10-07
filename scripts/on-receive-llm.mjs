@@ -161,7 +161,7 @@ async function sendReply(targetAgent, message) {
     ], {
       cwd: path.join(scriptDir, ".."),
       timeout: 15000,
-      env: { ...process.env, DATA_DIR: process.env.DATA_DIR || ".data" },
+      env: { ...process.env, DATA_DIR: process.env.DATA_DIR || ".data", MURMUR_ALLOW_LEGACY_PROFILE: "1" },
     });
     if (stdout) console.log(`[llm] send-task: ${stdout.trim()}`);
     if (stderr) console.error(`[llm] send-task stderr: ${stderr.trim()}`);
