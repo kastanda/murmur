@@ -7,11 +7,12 @@ import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, 
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { symlinkSync } from "node:fs";
 import test from "node:test";
 import { createHash } from "node:crypto";
 import { createKeyPair, createSigningKeyPair } from "../packages/security/dist/src/index.js";
 import { SQLiteDedupeOutboxStore } from "../packages/core/dist/src/index.js";
-import { assertRouting, modernProjectForCwd, resolveProfileIdentity } from "../packages/mcp-server/dist/src/outbound.js";
+import { assertProfileBinding, assertRouting, modernProjectForCwd, resolveProfileIdentity } from "../packages/mcp-server/dist/src/outbound.js";
 import { classifyProfile, legacyProfileRefusal } from "../scripts/legacy-profile-guard.mjs";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
@@ -162,5 +163,54 @@ test("a git worktree of a registered project is still inside that project", asyn
     const other = path.join(w.base, "_worktrees", "elsewhere");
     mkdirSync(other, { recursive: true });
     assert.equal(modernProjectForCwd(other, env), null);
+  } finally { w.cleanup(); }
+});
+
+test("a symlinked murmur.db (live or dangling) is refused and nothing is written through it", async () => {
+  for (const dangling of [false, true]) {
+    const w = await world();
+    try {
+      const target = path.join(w.legacy, "murmur.db");
+      if (dangling) rmSync(target, { force: true });
+      else writeFileSync(target, "");
+      symlinkSync(target, path.join(w.projectDir, "murmur.db"));
+      const before = fingerprint(w.legacy);
+      for (const env of [{}, { MURMUR_STORE_PATH: path.join(w.projectDir, "murmur.db") }]) {
+        const result = send(w.projectDir, "ribambelle-x-1-claude", { MURMUR_HOME: w.home, ...env });
+        assert.equal(result.status, 3, result.stderr);
+        assert.match(result.stderr, /profile-binding-invalid/);
+      }
+      assert.equal(fingerprint(w.legacy), before);
+      const identity = resolveProfileIdentity(w.projectDir, { MURMUR_HOME: w.home });
+      assert.throws(() => assertProfileBinding(identity, {
+        config: { dataDir: w.projectDir, project: { id: "ribambelle-x-1" } }, storePath: path.join(w.projectDir, "murmur.db"),
+      }), (e) => e.code === "profile-binding-invalid");
+    } finally { w.cleanup(); }
+  }
+});
+
+test("a backslash-named directory is not a project profile on POSIX", async () => {
+  const w = await world();
+  try {
+    const fake = path.join(w.home, "projects\\p-1\\agents\\codex");
+    mkdirSync(fake, { recursive: true });
+    assert.equal(classifyProfile(fake, { MURMUR_HOME: w.home }).kind, process.platform === "win32" ? "project" : "legacy");
+    assert.equal(resolveProfileIdentity(fake, { MURMUR_HOME: w.home }).kind, process.platform === "win32" ? "project" : "legacy");
+  } finally { w.cleanup(); }
+});
+
+test("a worktree of a --separate-git-dir checkout is still inside its project", async () => {
+  const w = await world();
+  try {
+    const projectPath = path.join(w.base, "Sep Project");
+    const common = path.join(w.base, "sep-common.git");
+    mkdirSync(path.join(common, "worktrees", "feat"), { recursive: true });
+    mkdirSync(projectPath, { recursive: true });
+    writeFileSync(path.join(projectPath, ".git"), `gitdir: ${common}\n`);
+    writeFileSync(path.join(w.home, "projects", "ribambelle-x-1", "project.json"), JSON.stringify({ projectId: "ribambelle-x-1", projectPath }));
+    const wt = path.join(w.base, "_worktrees", "Sep Project", "feat");
+    mkdirSync(wt, { recursive: true });
+    writeFileSync(path.join(wt, ".git"), `gitdir: ${path.join(common, "worktrees", "feat")}\n`);
+    assert.equal(modernProjectForCwd(wt, { MURMUR_HOME: w.home }), "ribambelle-x-1");
   } finally { w.cleanup(); }
 });

@@ -13,7 +13,7 @@
  *
  * Nothing here reads or returns key material, tokens or message text.
  */
-import { readdirSync, readFileSync, realpathSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import os from "node:os";
 import path from "node:path";
@@ -46,7 +46,6 @@ export const canonicalPath = (target: string): string => {
   }
 };
 
-const PROJECT_PROFILE = /^projects[\\/]([^\\/]+)[\\/]agents[\\/][^\\/]+$/;
 
 /**
  * A modern profile lives at `<murmur-home>/projects/<projectId>/agents/<agent>`. Anything
@@ -61,8 +60,11 @@ export const resolveProfileIdentity = (
   const absolute = canonicalPath(dataDir);
   const murmurHome = canonicalPath(env.MURMUR_HOME?.trim() || path.join(homeDir, ".murmur"));
   // Exactly `<MURMUR_HOME>/projects/<id>/agents/<name>` — nothing nested or prefixed.
-  const match = path.relative(murmurHome, absolute).match(PROJECT_PROFILE);
-  if (match) return { kind: "project", projectId: match[1], dataDir: absolute };
+  // Split on the platform separator only: a backslash is an ordinary filename character on POSIX.
+  const parts = path.relative(murmurHome, absolute).split(path.sep);
+  if (parts.length === 4 && parts[0] === "projects" && parts[2] === "agents" && parts.every((part) => part && part !== "..")) {
+    return { kind: "project", projectId: parts[1], dataDir: absolute };
+  }
   return { kind: "legacy", projectId: null, dataDir: absolute };
 };
 
@@ -72,23 +74,28 @@ export const resolveProfileIdentity = (
  * LEGACY-bound server running inside a registered project is the shadowing misconfiguration
  * (`claude mcp add murmur -e DATA_DIR=<repo>/.data-claude`) that sends project work to the wrong profile.
  */
-/** The main checkout a git worktree belongs to (from its `.git` file), or null when `cwd` is not in one. */
-const worktreeOwner = (cwd: string): string | null => {
-  let dir = cwd;
+/**
+ * The canonical git common dir of the checkout containing `dir` (nearest `.git` upward), or null.
+ * A linked worktree's `.git` file points at `<common>/worktrees/<name>`; a checkout made with
+ * `--separate-git-dir` points straight at its common dir. Two directories share a repository
+ * exactly when their common dirs are equal.
+ */
+const gitCommonDir = (dir: string): string | null => {
+  let here = dir;
   for (;;) {
+    const gitPath = path.join(here, ".git");
     try {
-      const gitPath = path.join(dir, ".git");
-      const text = readFileSync(gitPath, "utf8");
-      const gitdir = /^gitdir:\s*(.+)$/m.exec(text)?.[1]?.trim();
-      const marker = `${path.sep}.git${path.sep}worktrees${path.sep}`;
-      const at = gitdir ? path.resolve(dir, gitdir).indexOf(marker) : -1;
-      return gitdir && at > 0 ? canonicalPath(path.resolve(dir, gitdir).slice(0, at)) : null;
+      if (statSync(gitPath).isDirectory()) return canonicalPath(gitPath);
+      const pointer = /^gitdir:\s*(.+)$/m.exec(readFileSync(gitPath, "utf8"))?.[1]?.trim();
+      if (!pointer) return null;
+      const gitdir = path.resolve(here, pointer);
+      return canonicalPath(path.basename(path.dirname(gitdir)) === "worktrees" ? path.dirname(path.dirname(gitdir)) : gitdir);
     } catch {
-      // no `.git` file here (a directory, or nothing): keep climbing
+      // no `.git` here: keep climbing
     }
-    const parent = path.dirname(dir);
-    if (parent === dir) return null;
-    dir = parent;
+    const parent = path.dirname(here);
+    if (parent === here) return null;
+    here = parent;
   }
 };
 
@@ -98,7 +105,7 @@ export const modernProjectForCwd = (
   homeDir: string = os.homedir(),
 ): string | null => {
   const here = canonicalPath(cwd);
-  const owner = worktreeOwner(here);
+  const common = gitCommonDir(here);
   const root = path.join(canonicalPath(env.MURMUR_HOME?.trim() || path.join(homeDir, ".murmur")), "projects");
   let ids: string[];
   try {
@@ -111,7 +118,7 @@ export const modernProjectForCwd = (
       const projectPath = JSON.parse(readFileSync(path.join(root, id, "project.json"), "utf8")).projectPath;
       if (typeof projectPath !== "string" || !projectPath) continue;
       const base = canonicalPath(projectPath);
-      if (here === base || here.startsWith(`${base}${path.sep}`) || owner === base) return id;
+      if (here === base || here.startsWith(`${base}${path.sep}`) || (common !== null && common === gitCommonDir(base))) return id;
     } catch {
       // not a project profile directory
     }
@@ -165,6 +172,13 @@ export const assertProfileBinding = (
   // Every profile kind: the outbox this server writes MUST be `<dataDir>/murmur.db` — the file
   // the daemon of that profile flushes — so a receipt that names `dataDir` is true. A store
   // redirected to another profile (or to a sibling file nothing consumes) is refused.
+  for (const candidate of [storePath, path.join(profile.dataDir, "murmur.db")]) {
+    try {
+      if (lstatSync(candidate).isSymbolicLink()) throw new OutboundError("profile-binding-invalid", "the message store is a symlink");
+    } catch (error) {
+      if (error instanceof OutboundError) throw error;
+    }
+  }
   if (canonicalPath(storePath) !== path.join(profile.dataDir, "murmur.db")) {
     throw new OutboundError("profile-binding-invalid", "the message store is not this profile's murmur.db");
   }

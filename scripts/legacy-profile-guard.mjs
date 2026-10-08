@@ -9,11 +9,10 @@
  * Everything else is legacy and is refused unless `MURMUR_ALLOW_LEGACY_PROFILE=1`
  * (explicit opt-in) — and always refused under `MURMUR_REQUIRE_PROJECT_PROFILE=1`.
  */
-import { realpathSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const PROJECT_PROFILE = /^projects[\\/]([^\\/]+)[\\/]agents[\\/][^\\/]+$/;
 const truthy = (value) => ["1", "true", "yes", "on"].includes(String(value ?? "").trim().toLowerCase());
 
 const canonical = (target) => {
@@ -30,8 +29,11 @@ export const classifyProfile = (dataDir, env = process.env, homeDir = os.homedir
   const absolute = canonical(dataDir);
   const murmurHome = canonical(env.MURMUR_HOME?.trim() || path.join(homeDir, ".murmur"));
   // Exactly `<MURMUR_HOME>/projects/<id>/agents/<name>` — nothing nested or prefixed.
-  const match = path.relative(murmurHome, absolute).match(PROJECT_PROFILE);
-  if (match) return { kind: "project", projectId: match[1], dataDir: absolute };
+  // Split on the platform separator only: a backslash is an ordinary filename character on POSIX.
+  const parts = path.relative(murmurHome, absolute).split(path.sep);
+  if (parts.length === 4 && parts[0] === "projects" && parts[2] === "agents" && parts.every((part) => part && part !== "..")) {
+    return { kind: "project", projectId: parts[1], dataDir: absolute };
+  }
   return { kind: "legacy", projectId: null, dataDir: absolute };
 };
 
@@ -54,7 +56,20 @@ export const legacyProfileRefusal = (dataDir, env = process.env, homeDir = os.ho
  * DATA_DIR paired with `MURMUR_STORE_PATH=<legacy>/murmur.db` would otherwise put the row in a
  * legacy archive while the receipt names the project.
  */
+const isSymlink = (target) => {
+  try {
+    return lstatSync(target).isSymbolicLink();
+  } catch {
+    return false;
+  }
+};
+
 export const storePathRefusal = (dataDir, storePath) => {
+  // A symlinked murmur.db would let SQLite follow the profile's own file into another profile.
+  const own = path.join(canonical(dataDir), "murmur.db");
+  if (isSymlink(own) || (storePath && isSymlink(storePath))) {
+    return { code: "profile-binding-invalid", message: "the profile's murmur.db is a symlink" };
+  }
   if (storePath === undefined || storePath === "") return null;
   // canonicalise the directory: the file itself may not exist yet, and /var -> /private/var must not matter
   if (path.join(canonical(path.dirname(storePath)), path.basename(storePath)) === path.join(canonical(dataDir), "murmur.db")) return null;
