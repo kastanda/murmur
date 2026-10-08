@@ -75,26 +75,32 @@ export const resolveProfileIdentity = (
  * (`claude mcp add murmur -e DATA_DIR=<repo>/.data-claude`) that sends project work to the wrong profile.
  */
 /**
- * The canonical git common dir of the checkout containing `dir` (nearest `.git` upward), or null.
+ * The canonical git common dirs of EVERY checkout enclosing `dir` (each `.git` upward, so a
+ * submodule or nested repo inside a worktree also reports the worktree's repository).
  * A linked worktree's `.git` file points at `<common>/worktrees/<name>`; a checkout made with
  * `--separate-git-dir` points straight at its common dir. Two directories share a repository
- * exactly when their common dirs are equal.
+ * exactly when a common dir is shared.
  */
-const gitCommonDir = (dir: string): string | null => {
+const gitCommonDirs = (dir: string): string[] => {
+  const found: string[] = [];
   let here = dir;
   for (;;) {
     const gitPath = path.join(here, ".git");
     try {
-      if (statSync(gitPath).isDirectory()) return canonicalPath(gitPath);
-      const pointer = /^gitdir:\s*(.+)$/m.exec(readFileSync(gitPath, "utf8"))?.[1]?.trim();
-      if (!pointer) return null;
-      const gitdir = path.resolve(here, pointer);
-      return canonicalPath(path.basename(path.dirname(gitdir)) === "worktrees" ? path.dirname(path.dirname(gitdir)) : gitdir);
+      if (statSync(gitPath).isDirectory()) {
+        found.push(canonicalPath(gitPath));
+      } else {
+        const pointer = /^gitdir:\s*(.+)$/m.exec(readFileSync(gitPath, "utf8"))?.[1]?.trim();
+        if (pointer) {
+          const gitdir = path.resolve(here, pointer);
+          found.push(canonicalPath(path.basename(path.dirname(gitdir)) === "worktrees" ? path.dirname(path.dirname(gitdir)) : gitdir));
+        }
+      }
     } catch {
-      // no `.git` here: keep climbing
+      // no `.git` here
     }
     const parent = path.dirname(here);
-    if (parent === here) return null;
+    if (parent === here) return found;
     here = parent;
   }
 };
@@ -105,7 +111,7 @@ export const modernProjectForCwd = (
   homeDir: string = os.homedir(),
 ): string | null => {
   const here = canonicalPath(cwd);
-  const common = gitCommonDir(here);
+  const commons = gitCommonDirs(here);
   const root = path.join(canonicalPath(env.MURMUR_HOME?.trim() || path.join(homeDir, ".murmur")), "projects");
   let ids: string[];
   try {
@@ -118,7 +124,7 @@ export const modernProjectForCwd = (
       const projectPath = JSON.parse(readFileSync(path.join(root, id, "project.json"), "utf8")).projectPath;
       if (typeof projectPath !== "string" || !projectPath) continue;
       const base = canonicalPath(projectPath);
-      if (here === base || here.startsWith(`${base}${path.sep}`) || (common !== null && common === gitCommonDir(base))) return id;
+      if (here === base || here.startsWith(`${base}${path.sep}`) || gitCommonDirs(base).some((dir) => commons.includes(dir))) return id;
     } catch {
       // not a project profile directory
     }

@@ -214,3 +214,23 @@ test("a worktree of a --separate-git-dir checkout is still inside its project", 
     assert.equal(modernProjectForCwd(wt, { MURMUR_HOME: w.home }), "ribambelle-x-1");
   } finally { w.cleanup(); }
 });
+
+test("a submodule nested inside a linked worktree is still inside the registered project", async () => {
+  const w = await world();
+  try {
+    const projectPath = path.join(w.base, "Sub Project");
+    mkdirSync(path.join(projectPath, ".git", "worktrees", "feat"), { recursive: true });
+    writeFileSync(path.join(w.home, "projects", "ribambelle-x-1", "project.json"), JSON.stringify({ projectId: "ribambelle-x-1", projectPath }));
+    const wt = path.join(w.base, "_worktrees", "Sub Project", "feat");
+    const sub = path.join(wt, "vendor", "lib");
+    mkdirSync(path.join(sub, "deep"), { recursive: true });
+    writeFileSync(path.join(wt, ".git"), `gitdir: ${path.join(projectPath, ".git", "worktrees", "feat")}\n`);
+    mkdirSync(path.join(w.base, "modules", "lib"), { recursive: true });
+    writeFileSync(path.join(sub, ".git"), `gitdir: ${path.join(w.base, "modules", "lib")}\n`);
+    assert.equal(modernProjectForCwd(path.join(sub, "deep"), { MURMUR_HOME: w.home }), "ribambelle-x-1");
+    const unrelated = path.join(w.base, "unrelated", "deep");
+    mkdirSync(unrelated, { recursive: true });
+    writeFileSync(path.join(w.base, "unrelated", ".git"), `gitdir: ${path.join(w.base, "modules", "lib")}\n`);
+    assert.equal(modernProjectForCwd(unrelated, { MURMUR_HOME: w.home }), null);
+  } finally { w.cleanup(); }
+});
