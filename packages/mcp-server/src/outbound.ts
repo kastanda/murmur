@@ -46,7 +46,7 @@ export const canonicalPath = (target: string): string => {
   }
 };
 
-const PROJECT_PROFILE = /[\\/]projects[\\/]([^\\/]+)[\\/]agents[\\/][^\\/]+$/;
+const PROJECT_PROFILE = /^projects[\\/]([^\\/]+)[\\/]agents[\\/][^\\/]+$/;
 
 /**
  * A modern profile lives at `<murmur-home>/projects/<projectId>/agents/<agent>`. Anything
@@ -60,9 +60,9 @@ export const resolveProfileIdentity = (
 ): ProfileIdentity => {
   const absolute = canonicalPath(dataDir);
   const murmurHome = canonicalPath(env.MURMUR_HOME?.trim() || path.join(homeDir, ".murmur"));
-  const match = absolute.match(PROJECT_PROFILE);
-  const inHome = absolute.startsWith(`${murmurHome}${path.sep}`);
-  if (match && inHome) return { kind: "project", projectId: match[1], dataDir: absolute };
+  // Exactly `<MURMUR_HOME>/projects/<id>/agents/<name>` — nothing nested or prefixed.
+  const match = path.relative(murmurHome, absolute).match(PROJECT_PROFILE);
+  if (match) return { kind: "project", projectId: match[1], dataDir: absolute };
   return { kind: "legacy", projectId: null, dataDir: absolute };
 };
 
@@ -72,12 +72,33 @@ export const resolveProfileIdentity = (
  * LEGACY-bound server running inside a registered project is the shadowing misconfiguration
  * (`claude mcp add murmur -e DATA_DIR=<repo>/.data-claude`) that sends project work to the wrong profile.
  */
+/** The main checkout a git worktree belongs to (from its `.git` file), or null when `cwd` is not in one. */
+const worktreeOwner = (cwd: string): string | null => {
+  let dir = cwd;
+  for (;;) {
+    try {
+      const gitPath = path.join(dir, ".git");
+      const text = readFileSync(gitPath, "utf8");
+      const gitdir = /^gitdir:\s*(.+)$/m.exec(text)?.[1]?.trim();
+      const marker = `${path.sep}.git${path.sep}worktrees${path.sep}`;
+      const at = gitdir ? path.resolve(dir, gitdir).indexOf(marker) : -1;
+      return gitdir && at > 0 ? canonicalPath(path.resolve(dir, gitdir).slice(0, at)) : null;
+    } catch {
+      // no `.git` file here (a directory, or nothing): keep climbing
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+};
+
 export const modernProjectForCwd = (
   cwd: string,
   env: NodeJS.ProcessEnv = process.env,
   homeDir: string = os.homedir(),
 ): string | null => {
   const here = canonicalPath(cwd);
+  const owner = worktreeOwner(here);
   const root = path.join(canonicalPath(env.MURMUR_HOME?.trim() || path.join(homeDir, ".murmur")), "projects");
   let ids: string[];
   try {
@@ -90,7 +111,7 @@ export const modernProjectForCwd = (
       const projectPath = JSON.parse(readFileSync(path.join(root, id, "project.json"), "utf8")).projectPath;
       if (typeof projectPath !== "string" || !projectPath) continue;
       const base = canonicalPath(projectPath);
-      if (here === base || here.startsWith(`${base}${path.sep}`)) return id;
+      if (here === base || here.startsWith(`${base}${path.sep}`) || owner === base) return id;
     } catch {
       // not a project profile directory
     }

@@ -123,3 +123,44 @@ test("a legacy-bound MCP server inside a registered project is refused unless op
     assert.throws(() => assertRouting(project, { requestedProjectId: "saby-1" }), (e) => e.code === "profile-mismatch");
   } finally { w.cleanup(); }
 });
+
+test("a project DATA_DIR cannot be paired with a legacy MURMUR_STORE_PATH", async () => {
+  const w = await world();
+  try {
+    const before = fingerprint(w.legacy);
+    const result = send(w.projectDir, "ribambelle-x-1-claude", { MURMUR_HOME: w.home, MURMUR_STORE_PATH: path.join(w.legacy, "murmur.db") });
+    assert.equal(result.status, 3);
+    assert.match(result.stderr, /profile-binding-invalid/);
+    assert.equal(fingerprint(w.legacy), before);
+    assert.equal(fingerprint(w.projectDir), "absent");
+    const own = send(w.projectDir, "ribambelle-x-1-claude", { MURMUR_HOME: w.home, MURMUR_STORE_PATH: path.join(w.projectDir, "murmur.db") });
+    assert.equal(own.status, 0, own.stderr);
+  } finally { w.cleanup(); }
+});
+
+test("only the exact <home>/projects/<id>/agents/<name> shape is a project profile", async () => {
+  const w = await world();
+  try {
+    const nested = path.join(w.home, "archive", "projects", "p", "agents", "codex");
+    assert.equal(classifyProfile(nested, { MURMUR_HOME: w.home }).kind, "legacy");
+    assert.equal(resolveProfileIdentity(nested, { MURMUR_HOME: w.home }).kind, "legacy");
+    assert.equal(resolveProfileIdentity(w.projectDir, { MURMUR_HOME: w.home }).kind, "project");
+  } finally { w.cleanup(); }
+});
+
+test("a git worktree of a registered project is still inside that project", async () => {
+  const w = await world();
+  try {
+    const projectPath = path.join(w.base, "Ribambelle Operations");
+    mkdirSync(path.join(projectPath, ".git", "worktrees", "feat"), { recursive: true });
+    writeFileSync(path.join(w.home, "projects", "ribambelle-x-1", "project.json"), JSON.stringify({ projectId: "ribambelle-x-1", projectPath }));
+    const wt = path.join(w.base, "_worktrees", "Ribambelle Operations", "feat");
+    mkdirSync(path.join(wt, "src"), { recursive: true });
+    writeFileSync(path.join(wt, ".git"), `gitdir: ${path.join(projectPath, ".git", "worktrees", "feat")}\n`);
+    const env = { MURMUR_HOME: w.home };
+    assert.equal(modernProjectForCwd(path.join(wt, "src"), env), "ribambelle-x-1");
+    const other = path.join(w.base, "_worktrees", "elsewhere");
+    mkdirSync(other, { recursive: true });
+    assert.equal(modernProjectForCwd(other, env), null);
+  } finally { w.cleanup(); }
+});

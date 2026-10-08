@@ -10,7 +10,7 @@ import { encryptPayload, signEnvelope } from "@murmurv2/security";
 import { readPrivateJson } from "./secure-state.mjs";
 import { REPLY_ORIGINS, ReplyOwnershipStore } from "./reply-ownership-store.mjs";
 import { DatabaseSync } from "node:sqlite";
-import { legacyProfileRefusal } from "./legacy-profile-guard.mjs";
+import { legacyProfileRefusal, storePathRefusal } from "./legacy-profile-guard.mjs";
 
 const args = process.argv.slice(2);
 const opt = {};
@@ -70,7 +70,7 @@ if (!text) {
 }
 
 const dataDir = process.env.DATA_DIR || ".data";
-const refusal = legacyProfileRefusal(dataDir);
+const refusal = legacyProfileRefusal(dataDir) ?? storePathRefusal(dataDir, process.env.MURMUR_STORE_PATH);
 if (refusal) {
   process.stderr.write(`error: ${refusal.code}: ${refusal.message}\n`);
   process.exit(3);
